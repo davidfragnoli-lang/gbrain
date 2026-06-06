@@ -2014,7 +2014,17 @@ export async function runCycle(
         phases.includes('calibration_profile')) {
       if (engine) {
         const cfgMod = await import('./config.ts');
-        const calibrationConfig = cfgMod.loadConfig() ?? ({} as ReturnType<typeof cfgMod.loadConfig> & object);
+        const calibrationConfig = {
+          ...(cfgMod.loadConfig() ?? {}),
+        } as ReturnType<typeof cfgMod.loadConfig> & Record<string, unknown>;
+        for (const key of [
+          'cycle.propose_takes.budget_usd',
+          'cycle.grade_takes.budget_usd',
+          'cycle.calibration_profile.budget_usd',
+        ]) {
+          const value = await engine.getConfig(key).catch(() => null);
+          if (value != null) calibrationConfig[key] = value;
+        }
         const calibrationSourceId = cycleSourceId;
         const calibrationCtx = {
           engine,
