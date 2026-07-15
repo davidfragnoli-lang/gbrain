@@ -49,6 +49,7 @@ export interface ChronicleExtractResult {
 const KIND_VOCAB = new Set([
   'meeting', 'call', 'meal', 'solo', 'travel', 'work',
   'commitment', 'decision', 'intro', 'conflict', 'milestone', 'event',
+  'email', // FRA-1316 — mail → timeline event
 ]);
 
 function normalizeKind(k: string): string {
@@ -124,16 +125,29 @@ export async function runChronicleExtract(
     : null;
   const attendees = collectAttendees(fm);
 
-  const judge = opts.judge ?? defaultJudge(engine);
   let result: ChronicleJudgeResult;
-  try {
-    result = await judge({
-      slug: opts.slug, type: page.type, title: page.title,
-      body: page.compiled_truth ?? '', effectiveDate, attendees,
+  const isMail = page.type === 'email' || opts.slug.startsWith('emails/') || opts.slug.startsWith('email/');
+  if (isMail && !opts.judge) {
+    // FRA-1316 — mail → exactly one deterministic event (no LLM). Header-derived:
+    // when=received, who=from/to, what=subject. High-volume + mechanical, so a
+    // judge call per mail would be wasteful and non-deterministic. An injected
+    // judge (tests) still overrides. The shared write path below is unchanged.
+    const { buildMailEventProposal } = await import('./mail-event.ts');
+    const proposal = buildMailEventProposal({
+      slug: opts.slug, title: page.title, frontmatter: fm, effectiveDate,
     });
-  } catch (e) {
-    if ((e as Error)?.name === 'AbortError') throw e;
-    return { slug: opts.slug, status: 'skipped', events_written: 0, reason: 'judge_error' };
+    result = { events: proposal ? [proposal] : [] };
+  } else {
+    const judge = opts.judge ?? defaultJudge(engine);
+    try {
+      result = await judge({
+        slug: opts.slug, type: page.type, title: page.title,
+        body: page.compiled_truth ?? '', effectiveDate, attendees,
+      });
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') throw e;
+      return { slug: opts.slug, status: 'skipped', events_written: 0, reason: 'judge_error' };
+    }
   }
 
   // #2606: a truncated or unparseable judge response is a FAILURE, not an

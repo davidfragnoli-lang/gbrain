@@ -5883,8 +5883,9 @@ const volunteer_chronicle: Operation = {
 const chronicle_backfill: Operation = {
   name: 'chronicle_backfill',
   description:
-    'Life Chronicle: sweep existing meeting/conversation/calendar pages into timeline events by ' +
-    'enqueuing chronicle_extract jobs (one per eligible page). --dry-run counts without enqueuing. ' +
+    'Life Chronicle: sweep existing meeting/conversation/calendar/email pages into timeline events by ' +
+    'enqueuing chronicle_extract jobs (one per eligible page; mail emits a deterministic header event). ' +
+    '--dry-run counts without enqueuing. ' +
     'Local-only bulk op. CLI: `gbrain chronicle-backfill [--since YYYY-MM-DD] [--limit N] [--dry-run]`.',
   scope: 'admin',
   mutating: true,
@@ -5896,7 +5897,9 @@ const chronicle_backfill: Operation = {
   },
   handler: async (ctx, p) => {
     const { isChronicleEligible } = await import('./chronicle/eligibility.ts');
-    const TYPES = ['meeting', 'conversation', 'calendar-event'] as const;
+    // email (FRA-1316): mail is an event source too — sweep it into deterministic
+    // header events alongside transcript-shaped pages.
+    const TYPES = ['meeting', 'conversation', 'calendar-event', 'email'] as const;
     const limit = typeof p.limit === 'number' ? p.limit : 1000;
     const updated_after = typeof p.since === 'string' ? p.since : undefined;
     const dryRun = p.dry_run === true;
