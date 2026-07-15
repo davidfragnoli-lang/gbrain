@@ -136,6 +136,24 @@ export async function runChronicleExtract(
     const proposal = buildMailEventProposal({
       slug: opts.slug, title: page.title, frontmatter: fm, effectiveDate,
     });
+    if (proposal) {
+      // FRA-1426 — resolve raw from/to/cc participants to canonical entity
+      // slugs so the event links to person pages (and last-seen/who-match
+      // works). Unresolved participants are kept verbatim. Falls back to the
+      // raw proposal.who on any resolver hiccup — resolution is a bonus, never
+      // a blocker for the timeline write.
+      try {
+        const { buildEntityIndex, resolveMailWho } = await import('./mail-participants.ts');
+        // Cross-source: mail may live in its own source while person pages live
+        // in `default`.
+        const index = await buildEntityIndex(engine);
+        const { who, entitySlugs } = resolveMailWho(fm, index);
+        if (who.length) proposal.who = who;
+        const tagged = proposal as ChronicleEventProposal & { _entitySlugs?: string[]; _slugSource?: Map<string, string> };
+        tagged._entitySlugs = entitySlugs;
+        tagged._slugSource = index.slugSource;
+      } catch { /* keep raw who */ }
+    }
     result = { events: proposal ? [proposal] : [] };
   } else {
     const judge = opts.judge ?? defaultJudge(engine);
@@ -188,6 +206,16 @@ export async function runChronicleExtract(
     await engine.upsertEventProjection({
       depthSlug: opts.slug, eventSlug, date: day, summary: ev.what, sourceId,
     });
+    // FRA-1426 — fan out a contact row onto each resolved participant entity
+    // page so timeline coverage counts them (metric keys on page_id = entity).
+    const tagged = ev as ChronicleEventProposal & { _entitySlugs?: string[]; _slugSource?: Map<string, string> };
+    if (tagged._entitySlugs && tagged._entitySlugs.length) {
+      const { fanOutContactRows } = await import('./project-participants.ts');
+      await fanOutContactRows(engine, {
+        entitySlugs: tagged._entitySlugs, day, summary: ev.what, eventSlug, sourceId,
+        slugSource: tagged._slugSource,
+      });
+    }
     written++;
   }
   return { slug: opts.slug, status: 'extracted', events_written: written };
