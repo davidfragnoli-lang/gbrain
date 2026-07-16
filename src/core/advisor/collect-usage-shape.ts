@@ -40,12 +40,18 @@ export const collectUsageShape: AdvisorCollector = {
           ask_user: true,
         });
       }
-      if (health.orphan_pages > 0) {
+      // FRA-1459: count only CANONICAL orphans (linkable_orphan_pages excludes
+      // raw chronicle/source pages — email/event/…). The raw orphan_pages count
+      // includes a nightly ingest batch of thousands of unlinked source pages
+      // that are unlinked BY DESIGN, which produced a false "11353 pages have no
+      // links" advisor + alarming recap. `gbrain orphans` applies the same
+      // exclusion, so the fix command and this count agree.
+      if (health.linkable_orphan_pages > 0) {
         findings.push({
           id: 'orphan_pages',
           severity: 'info',
-          title: `${health.orphan_pages} page${health.orphan_pages === 1 ? ' has' : 's have'} no links in or out.`,
-          detail: 'Orphaned pages do not surface through graph traversal — connect or review them.',
+          title: `${health.linkable_orphan_pages} page${health.linkable_orphan_pages === 1 ? ' has' : 's have'} no links in or out.`,
+          detail: 'Orphaned pages do not surface through graph traversal — connect or review them. Raw chronicle/source pages (email, event, …) are excluded — they are unlinked by design.',
           fix: { command_argv: ['gbrain', 'orphans'] },
           collector: 'usage-shape',
           ask_user: true,

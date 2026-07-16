@@ -15,6 +15,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { isChronicleSourceType } from '../core/types.ts';
 
 // --- Types ---
 
@@ -58,10 +59,21 @@ const FIRST_SEGMENT_EXCLUSIONS = new Set(['scratch', 'thoughts', 'catalog', 'ent
 // --- Filter logic ---
 
 /**
- * Returns true if a slug should be excluded from orphan reporting by default.
+ * Returns true if a page should be excluded from orphan reporting by default.
  * These are pages where having no inbound links is expected / not a content problem.
+ *
+ * FRA-1459: exclusion now also considers page `type`. Raw chronicle/source
+ * types (email, event, calendar-event, meeting, conversation, slack, source,
+ * diary, extract_receipt — see CHRONICLE_SOURCE_PAGE_TYPES) are excluded
+ * regardless of slug: a large legitimate ingest batch of raw source pages
+ * must not be counted as orphans, since the canonical graph never links most
+ * of them (the gazetteer holds only ~dozens of entity buckets). `type` is
+ * optional so existing slug-only callers keep working unchanged.
  */
-export function shouldExclude(slug: string): boolean {
+export function shouldExclude(slug: string, type?: string | null): boolean {
+  // Raw chronicle/source page types — excluded by type, independent of slug.
+  if (isChronicleSourceType(type)) return true;
+
   // Pseudo-pages (exact match)
   if (PSEUDO_SLUGS.has(slug)) return true;
 
@@ -145,7 +157,7 @@ export async function findOrphans(
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('orphans.scan');
   const stopHb = startHeartbeat(progress, 'scanning pages for missing inbound links…');
-  let allOrphans: { slug: string; title: string; domain: string | null }[];
+  let allOrphans: { slug: string; title: string; domain: string | null; type: string }[];
   let total: number;
   let excludedAll: number;
   try {
@@ -169,14 +181,18 @@ export async function findOrphans(
       liveParams.push(sourceId);
       scopeClause = ` AND source_id = $${liveParams.length}`;
     }
-    const liveRows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL${scopeClause}`,
+    // FRA-1459: select `type` too so the denominator can drop raw
+    // chronicle/source pages (email/event/…) via the same shouldExclude
+    // predicate as the orphan numerator — else a large ingest batch stays
+    // in `total_linkable` and inflates the orphan ratio.
+    const liveRows = await engine.executeRaw<{ slug: string; type: string }>(
+      `SELECT slug, type FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, r.type) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -184,7 +200,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug));
+    : allOrphans.filter(row => !shouldExclude(row.slug, row.type));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,

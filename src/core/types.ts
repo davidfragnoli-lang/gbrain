@@ -67,6 +67,61 @@ export const ALL_PAGE_TYPES: readonly string[] = [
 ] as const;
 
 /**
+ * FRA-1459: Raw chronicle / source page types — pages materialized directly
+ * from an ingest source (mail, calendar, chat transcripts, life-chronicle
+ * events) rather than authored/synthesized into the canonical knowledge graph.
+ *
+ * These pages are structurally NOT expected to carry inbound wikilinks: they
+ * ARE the raw source material the canonical graph (person/company/concept/wiki
+ * pages) is distilled FROM, and the gazetteer only holds ~dozens of entity
+ * buckets, so a large legitimate ingest batch (e.g. thousands of emails +
+ * timeline events materialized overnight) leaves them all "orphaned" by the
+ * strict no-inbound-link definition.
+ *
+ * The brain-score orphan component and the `orphan_ratio` doctor check EXCLUDE
+ * these types from BOTH the orphan numerator AND the linkable denominator, so
+ * health reflects the canonical graph, not raw ingest volume. Without this, a
+ * nightly chronicle ingest collapses brain_score to ~0/100 and fires a false
+ * "unhealthy" recap despite the canonical graph being fine.
+ *
+ * Membership rationale (mirrors chronicle/eligibility.ts ELIGIBLE_TYPES +
+ * the temporal chronicle OUTPUT + private interiority + extraction receipts):
+ *   - email, slack, calendar-event, meeting, conversation, source — raw
+ *     ingest / transcript source pages.
+ *   - event — life-chronicle timeline atoms (the extraction OUTPUT).
+ *   - diary — first-person interiority, never mined into the graph.
+ *   - extract_receipt — extraction-run receipts, already demoted / loop-excluded.
+ *
+ * NOT included (canonical graph members that SHOULD accrue links): person,
+ * company, deal, concept, wiki types, note, atom, media, etc.
+ */
+export const CHRONICLE_SOURCE_PAGE_TYPES: ReadonlySet<string> = new Set([
+  'email',
+  'slack',
+  'calendar-event',
+  'meeting',
+  'conversation',
+  'source',
+  'event',
+  'diary',
+  'extract_receipt',
+]);
+
+/**
+ * Sorted array form of {@link CHRONICLE_SOURCE_PAGE_TYPES}, for SQL `type IN (...)`
+ * / `type = ANY(...)` clauses and stable test output. Derived from the Set so
+ * the two can never drift.
+ */
+export const CHRONICLE_SOURCE_PAGE_TYPE_LIST: readonly string[] = [
+  ...CHRONICLE_SOURCE_PAGE_TYPES,
+].sort();
+
+/** True when a page type is a raw chronicle/source type (see {@link CHRONICLE_SOURCE_PAGE_TYPES}). */
+export function isChronicleSourceType(type: string | null | undefined): boolean {
+  return type != null && CHRONICLE_SOURCE_PAGE_TYPES.has(type);
+}
+
+/**
  * v0.38: PageType is now `string`. The pre-v0.38 `assertNever` helper used
  * to enforce exhaustive switches over the closed PageType union; with the
  * open-type model, that pattern moves to per-primitive switches (the
@@ -1411,8 +1466,27 @@ export interface BrainHealth {
    * aims at "pages I forgot to connect to anything", not the stricter
    * graph-theory "no inbound" definition. Both engines share this
    * semantics after Bug 11 doc-drift fix.
+   *
+   * FRA-1459: this raw count still includes chronicle/source pages (email,
+   * event, …) so nothing is hidden from inspection. The brain-score orphan
+   * component, however, is derived from {@link linkable_orphan_pages} /
+   * {@link linkable_page_count} below, which exclude those types — so a
+   * legitimate raw-ingest batch no longer collapses brain_score.
    */
   orphan_pages: number;
+  /**
+   * FRA-1459: pages eligible to be considered orphans for scoring — total
+   * pages MINUS raw chronicle/source types (see CHRONICLE_SOURCE_PAGE_TYPES).
+   * Denominator of the brain-score orphan component.
+   */
+  linkable_page_count: number;
+  /**
+   * FRA-1459: islanded pages (zero inbound AND zero outbound links) among
+   * {@link linkable_page_count} only — i.e. excluding raw chronicle/source
+   * types. Numerator of the brain-score orphan component. Always <=
+   * {@link orphan_pages}.
+   */
+  linkable_orphan_pages: number;
   missing_embeddings: number;
   /**
    * Composite quality score, 0-100. Weighted sum of five components: embed
