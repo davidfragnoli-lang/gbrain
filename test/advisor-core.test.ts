@@ -87,7 +87,7 @@ describe('collect-usage-shape', () => {
     const engine = {
       getStats: async () => ({ page_count: 100, chunk_count: 0, embedded_count: 0, link_count: 0, tag_count: 0, timeline_entry_count: 0, pages_by_type: {} }),
       getHealth: async () => ({
-        page_count: 100, embed_coverage: 0.4, stale_pages: 0, orphan_pages: 5, missing_embeddings: 60,
+        page_count: 100, embed_coverage: 0.4, stale_pages: 0, orphan_pages: 5, linkable_page_count: 100, linkable_orphan_pages: 5, missing_embeddings: 60,
         brain_score: 50, dead_links: 0, link_coverage: 0, timeline_coverage: 0, most_connected: [],
         embed_coverage_score: 0, link_density_score: 0, timeline_coverage_score: 0, no_orphans_score: 0, no_dead_links_score: 0,
       }),

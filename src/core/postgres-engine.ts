@@ -3729,7 +3729,7 @@ export class PostgresEngine implements BrainEngine {
   async findOrphanPages(opts?: {
     sourceId?: string;
     sourceIds?: string[];
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+  }): Promise<Array<{ slug: string; title: string; domain: string | null; type: string }>> {
     const sql = this.sql;
     // Soft-delete filter on BOTH sides:
     //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
@@ -3752,7 +3752,8 @@ export class PostgresEngine implements BrainEngine {
       SELECT
         p.slug,
         COALESCE(p.title, p.slug) AS title,
-        p.frontmatter->>'domain' AS domain
+        p.frontmatter->>'domain' AS domain,
+        p.type AS type
       FROM pages p
       WHERE p.deleted_at IS NULL
         ${sourceFilter}
@@ -3765,7 +3766,7 @@ export class PostgresEngine implements BrainEngine {
         )
       ORDER BY p.slug
     `;
-    return rows as unknown as Array<{ slug: string; title: string; domain: string | null }>;
+    return rows as unknown as Array<{ slug: string; title: string; domain: string | null; type: string }>;
   }
 
   // Tags
@@ -5510,6 +5511,10 @@ export class PostgresEngine implements BrainEngine {
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         0 as stale_pages,
         0 as orphan_pages,
+        (SELECT count(*) FROM pages p
+         WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
+        ) as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
@@ -5558,8 +5563,9 @@ export class PostgresEngine implements BrainEngine {
     // Archive (raw/), generated, and daily-log pages are not expected to
     // participate in the curated graph. Filtered in TS because the policy
     // includes per-brain config overrides. PGLite path has the same logic.
-    const pageScopeRows = await sql<{ slug: string; islanded: boolean; has_timeline: boolean }[]>`
+    const pageScopeRows = await sql<{ slug: string; type: string | null; islanded: boolean; has_timeline: boolean }[]>`
       SELECT p.slug,
+             p.type,
              (NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
               AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
@@ -5571,9 +5577,10 @@ export class PostgresEngine implements BrainEngine {
     const embedCoverage = Number(h.embed_coverage);
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = pageScopeRows.filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const orphanPages = Number(h.orphan_pages);
+    const linkablePages = pageScopeRows.filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type));
     const linkablePageCount = linkablePages.length;
-    const orphanPages = linkablePages.filter(row => row.islanded).length;
+    const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
     const deadLinks = Number(h.dead_links);
     const linkCount = Number(h.link_count);
@@ -5585,7 +5592,7 @@ export class PostgresEngine implements BrainEngine {
     // an all-archive brain has no curated graph to penalize.
     const timelineCoverageWhole =
       linkablePageCount > 0 ? Math.min(linkableTimelinePages / linkablePageCount, 1) : 1;
-    const noOrphans = linkablePageCount > 0 ? 1 - (orphanPages / linkablePageCount) : 1;
+    const noOrphans = linkablePageCount > 0 ? 1 - (linkableOrphanPages / linkablePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Per-component points. Sum equals brainScore by construction.
     //
@@ -5604,10 +5611,11 @@ export class PostgresEngine implements BrainEngine {
 
     return {
       page_count: pageCount,
-      linkable_page_count: linkablePageCount,
       embed_coverage: embedCoverage,
       stale_pages: stalePages,
       orphan_pages: orphanPages,
+      linkable_page_count: linkablePageCount,
+      linkable_orphan_pages: linkableOrphanPages,
       missing_embeddings: Number(h.missing_embeddings),
       brain_score: brainScore,
       dead_links: deadLinks,

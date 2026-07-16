@@ -1,3 +1,5 @@
+import { isChronicleSourceType } from './types.ts';
+
 /**
  * Shared orphan-reporting exclusion policy.
  *
@@ -96,7 +98,10 @@ export async function loadOrphanPolicyOverrides(
 export function shouldExcludeFromOrphanReporting(
   slug: string,
   overrides?: OrphanPolicyOverrides,
+  type?: string | null,
 ): boolean {
+  if (isChronicleSourceType(type)) return true;
+
   if (PSEUDO_SLUGS.has(slug)) return true;
 
   for (const suffix of AUTO_SUFFIX_PATTERNS) {

@@ -3564,7 +3564,7 @@ export class PGLiteEngine implements BrainEngine {
   async findOrphanPages(opts?: {
     sourceId?: string;
     sourceIds?: string[];
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+  }): Promise<Array<{ slug: string; title: string; domain: string | null; type: string }>> {
     // Soft-delete filter on BOTH sides:
     //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
     //   - link source: src.deleted_at IS NULL — links FROM soft-deleted pages don't count as inbound
@@ -3589,7 +3589,8 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug,
          COALESCE(p.title, p.slug) AS title,
-         p.frontmatter->>'domain' AS domain
+         p.frontmatter->>'domain' AS domain,
+         p.type AS type
        FROM pages p
        WHERE p.deleted_at IS NULL
          ${sourceFilter}
@@ -3603,7 +3604,7 @@ export class PGLiteEngine implements BrainEngine {
        ORDER BY p.slug`,
       params
     );
-    return rows as Array<{ slug: string; title: string; domain: string | null }>;
+    return rows as Array<{ slug: string; title: string; domain: string | null; type: string }>;
   }
 
   // Tags
@@ -5411,9 +5412,13 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         0 as stale_pages,
-        -- Bug 11 — orphan = islanded (no inbound AND no outbound). The raw
-        -- list is filtered in TS using the shared orphan-reporting policy.
-        0 as orphan_pages,
+        -- Bug 11 — orphan = islanded (no inbound AND no outbound).
+        -- See BrainHealth.orphan_pages docstring; docs updated to match this.
+        (SELECT count(*) FROM pages p
+         WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
+        ) as orphan_pages,
+        0 as stale_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
@@ -5456,6 +5461,7 @@ export class PGLiteEngine implements BrainEngine {
     // includes per-brain config overrides.
     const { rows: pageScopeRows } = await this.db.query(`
       SELECT p.slug,
+             p.type,
              (NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
               AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
@@ -5468,10 +5474,11 @@ export class PGLiteEngine implements BrainEngine {
     const embedCoverage = Number(r.embed_coverage);
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const orphanPages = Number(r.orphan_pages);
+    const linkablePages = (pageScopeRows as { slug: string; type: string | null; islanded: boolean; has_timeline: boolean }[])
+      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type));
     const linkablePageCount = linkablePages.length;
-    const orphanPages = linkablePages.filter(row => row.islanded).length;
+    const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
     const deadLinks = Number(r.dead_links);
     const linkCount = Number(r.link_count);
@@ -5482,7 +5489,7 @@ export class PGLiteEngine implements BrainEngine {
     // an all-archive brain has no curated graph to penalize.
     const timelineCoverageDensity =
       linkablePageCount > 0 ? Math.min(linkableTimelinePages / linkablePageCount, 1) : 1;
-    const noOrphans = linkablePageCount > 0 ? 1 - (orphanPages / linkablePageCount) : 1;
+    const noOrphans = linkablePageCount > 0 ? 1 - (linkableOrphanPages / linkablePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Bug 11 — per-component points. Sum equals brainScore by construction
     // so `doctor` can render a breakdown that adds up to the total.
@@ -5502,10 +5509,11 @@ export class PGLiteEngine implements BrainEngine {
 
     return {
       page_count: pageCount,
-      linkable_page_count: linkablePageCount,
       embed_coverage: embedCoverage,
       stale_pages: stalePages,
       orphan_pages: orphanPages,
+      linkable_page_count: linkablePageCount,
+      linkable_orphan_pages: linkableOrphanPages,
       missing_embeddings: Number(r.missing_embeddings),
       brain_score: brainScore,
       dead_links: deadLinks,
