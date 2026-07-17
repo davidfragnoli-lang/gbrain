@@ -475,6 +475,61 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       // covers the whole request. A mid-call renewal loop would add
       // complexity; for v0.15 we lean on the 120s TTL + abort-on-signal.
       try {
+        // --- Patch B (borrow-ahead, hand-authored): rolling conversation prompt-cache ---
+        // Direct path marks cache_control only on static system(485)+last-tool(498) ~5.2K;
+        // the growing anthroMessages conversation is re-billed every turn (6/18 v0.42.51
+        // regression). Anthropic caches up to the last cache_control block, so mark the last
+        // content block of the last message and keep the 4-breakpoint API limit
+        // (system + last-tool + 2 rolling = 4).
+        //
+        // Two rolling markers, not one: Anthropic's automatic cache lookup only walks
+        // back up to 20 content blocks from a breakpoint to find a prior cached prefix
+        // (see prompt-caching docs, "20-block lookback window"). A turn that adds more
+        // than 20 blocks since the last marker (e.g. a large parallel tool_use/tool_result
+        // round) would make a freshly-placed single marker miss the previous cache
+        // entirely. Keeping the immediately-preceding rolling marker in place — and only
+        // evicting anything older than that — guarantees at least that marker's prefix is
+        // still a valid, already-written cache read even when this turn's new marker's
+        // lookback comes up empty.
+        if (anthroMessages.length > 0) {
+          const markerIndices: number[] = [];
+          for (let i = 0; i < anthroMessages.length; i++) {
+            const m = anthroMessages[i] as any;
+            if (Array.isArray(m.content)) {
+              for (const b of m.content) {
+                if (b && typeof b === 'object' && 'cache_control' in b) {
+                  markerIndices.push(i);
+                  break;
+                }
+              }
+            }
+          }
+          const keepIdx = markerIndices.length > 0 ? markerIndices[markerIndices.length - 1] : -1;
+          for (const i of markerIndices) {
+            if (i === keepIdx) continue;
+            const m = anthroMessages[i] as any;
+            for (const b of m.content) {
+              if (b && typeof b === 'object' && 'cache_control' in b) delete b.cache_control;
+            }
+          }
+          const lastMsg = anthroMessages[anthroMessages.length - 1] as any;
+          // A fresh job's seed message has string content (see the
+          // `[{ role: 'user', content: data.prompt }]` init above), which
+          // the array-only check below would silently skip — leaving the
+          // very first call, and thus the common single-tool round-trip,
+          // with no rolling breakpoint at all. Normalize to a one-block
+          // array first so it gets the marker like every later turn.
+          if (typeof lastMsg.content === 'string') {
+            lastMsg.content = [{ type: 'text', text: lastMsg.content }];
+          }
+          if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+            const lastBlock = lastMsg.content[lastMsg.content.length - 1];
+            if (lastBlock && typeof lastBlock === 'object') {
+              lastBlock.cache_control = { type: 'ephemeral' };
+            }
+          }
+        }
+        // --- end Patch B ---
         const params: Anthropic.MessageCreateParamsNonStreaming = {
           // v0.41 Bug 3: strip `provider:` prefix at the SDK call site only.
           // `model` stays qualified everywhere else (persistence, recipe

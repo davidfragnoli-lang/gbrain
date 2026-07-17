@@ -2315,7 +2315,14 @@ BRAIN (capture / ideate / explore — v0.37/v0.38)
 SOURCES (multi-repo / multi-brain)
   sources list                       Show registered sources
   sources add <id> --path <p>        Register a source (id = short name, e.g. 'wiki')
-  sources remove <id>                Remove a source + its pages
+  sources remove <id>                Remove a source + its pages (--confirm-destructive)
+  sources archive <id>               Soft-delete: hide from search, recoverable for 72h
+  sources restore <id>               Un-archive a soft-deleted source
+  sources archived                   List soft-deleted sources and their purge expiry
+  sources purge [<id>]               Permanently delete archived sources
+  sources status                     Per-source dashboard (sync lag, embed coverage)
+  sources --help                     Full subcommand list (rename, default, attach,
+                                     current, federate, set-cr-mode, webhook, harden, ...)
   sync --all                         Sync all sources with a local_path
   sync --source <id>                 Sync one specific source
   repos ...                          DEPRECATED alias for 'sources' (v0.19.0)
