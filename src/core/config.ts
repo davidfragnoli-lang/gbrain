@@ -986,11 +986,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'embed.backfill_cooldown_min',
   'embed.backfill_max_usd_per_source_24h',
   'embed.backfill_max_usd',
-  // Life Chronicle (v0.42.56, #2390). Auto-emission of timeline events is OFF
-  // by default; the changelog's "To take advantage" step is `gbrain config set
-  // auto_chronicle true`, so the key must be settable without --force. The
-  // when→date projection timezone rides the `chronicle.` prefix below.
-  'auto_chronicle',
+  // NOTE (FRA-1537, upstream merge 2026-07-18): the Fragno `auto_chronicle`
+  // registration (FRA-1310, eb644be8) was upstreamed verbatim by #2390 above —
+  // the duplicate entry here is removed and upstream's canonical registration
+  // is kept. See KNOWN_CONFIG_KEYS `auto_chronicle` earlier in this array.
 ];
 
 /**
