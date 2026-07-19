@@ -5125,7 +5125,10 @@ export class PGLiteEngine implements BrainEngine {
     const linkCount = Number(r.link_count);
     const pagesWithTimeline = Number(r.pages_with_timeline);
 
-    const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
+    // FRA-1572: link density scored over the LINKABLE universe (mirrors the
+    // FRA-1459 orphan fix + the PostgresEngine sibling), so a large raw
+    // chronicle/source ingest can't collapse the links component.
+    const linkDensity = linkablePageCount > 0 ? Math.min(linkCount / linkablePageCount, 1) : 0;
     const timelineCoverageDensity = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
     // FRA-1459: orphan avoidance is scored over the LINKABLE universe (raw
     // chronicle/source pages excluded from both numerator and denominator).

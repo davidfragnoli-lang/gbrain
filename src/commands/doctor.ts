@@ -22,6 +22,7 @@ import { loadCompletedMigrations } from '../core/preferences.ts';
 import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { categorizeCheck, type CheckCategory } from '../core/doctor-categories.ts';
+import { CHRONICLE_SOURCE_PAGE_TYPE_LIST } from '../core/types.ts';
 import { rankIssues, type RankedIssue } from '../core/doctor-cause-rank.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
@@ -1862,16 +1863,27 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
       };
     }
 
-    // Compute global inbound-link density. Counts DISTINCT pages with
-    // at least one inbound edge / total pages.
-    const totalRows = await engine.executeRaw(`SELECT COUNT(*)::int AS n FROM pages WHERE deleted_at IS NULL`);
+    // Compute inbound-link density over the LINKABLE universe. Counts
+    // DISTINCT linkable pages with >=1 inbound edge / linkable pages.
+    //
+    // FRA-1572: scope to the canonical graph, excluding raw chronicle/source
+    // types (email/event/…) — the same exclusion FRA-1459 applied to the
+    // brain-score orphan component. A large raw ingest (the FRA-1469 mail
+    // mining — thousands of email/event pages that carry no inbound links BY
+    // DESIGN) otherwise buries the metric to ~2%, firing a false "graph too
+    // sparse" warn even though the canonical graph is ~90% inbound-linked and
+    // graph signals fire fine on knowledge queries. graph_signals only boost
+    // canonical pages during search, so the canonical inbound density is the
+    // meaningful proxy for whether the signal fires.
+    const chronicleExclusion = `type <> ALL(ARRAY[${CHRONICLE_SOURCE_PAGE_TYPE_LIST.map(t => `'${t}'`).join(',')}]::text[])`;
+    const totalRows = await engine.executeRaw(`SELECT COUNT(*)::int AS n FROM pages WHERE deleted_at IS NULL AND ${chronicleExclusion}`);
     const totalPages = Number((totalRows as any)[0]?.n ?? 0);
 
     if (totalPages === 0) {
       return {
         name: 'graph_signals_coverage',
         status: 'ok',
-        message: 'Empty brain — no pages to compute coverage against',
+        message: 'Empty brain — no linkable pages to compute coverage against',
       };
     }
 
@@ -1879,7 +1891,7 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
       `SELECT COUNT(DISTINCT l.to_page_id)::int AS n
        FROM links l
        JOIN pages p ON p.id = l.to_page_id
-       WHERE p.deleted_at IS NULL`
+       WHERE p.deleted_at IS NULL AND p.${chronicleExclusion}`
     );
     const linkedPages = Number((linkedRows as any)[0]?.n ?? 0);
     const pct = (linkedPages / totalPages) * 100;
@@ -1889,7 +1901,7 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
       return {
         name: 'graph_signals_coverage',
         status: 'warn',
-        message: `graph_signals enabled but only ${pctStr}% of pages have inbound links (<10%). Signal will rarely fire. Fix: \`gbrain extract all\` to populate the link graph from frontmatter + markdown.`,
+        message: `graph_signals enabled but only ${pctStr}% of canonical pages have inbound links (<10%). Signal will rarely fire. Fix: \`gbrain extract all\` to populate the link graph from frontmatter + markdown.`,
       };
     }
 
@@ -1897,8 +1909,8 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
       name: 'graph_signals_coverage',
       status: 'ok',
       message: pct >= 30
-        ? `${pctStr}% of pages have inbound links (>=30% — graph signals fire on most queries)`
-        : `${pctStr}% of pages have inbound links (10-29% — graph signals fire occasionally)`,
+        ? `${pctStr}% of canonical pages have inbound links (>=30% — graph signals fire on most queries)`
+        : `${pctStr}% of canonical pages have inbound links (10-29% — graph signals fire occasionally)`,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

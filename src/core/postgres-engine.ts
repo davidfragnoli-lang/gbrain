@@ -5218,7 +5218,15 @@ export class PostgresEngine implements BrainEngine {
     const pagesWithTimeline = Number(h.pages_with_timeline);
 
     // brain_score: 0-100 weighted average
-    const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
+    // FRA-1572: link DENSITY is scored over the LINKABLE universe too (same
+    // exclusion FRA-1459 applied to orphans). Dividing linkCount by the full
+    // pageCount let a large raw chronicle/source ingest (e.g. the FRA-1469 mail
+    // mining — thousands of email/event pages that carry no wikilinks BY DESIGN)
+    // collapse the links component from 25/25 to ~5/25 overnight, even though
+    // the canonical graph stayed richly connected (~10 links per linkable page).
+    // linkablePageCount === 0 → no canonical graph to score → density 0 (the
+    // pageCount===0 empty-brain guard below still awards full marks).
+    const linkDensity = linkablePageCount > 0 ? Math.min(linkCount / linkablePageCount, 1) : 0;
     const timelineCoverageWhole = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
     // FRA-1459: orphan avoidance is scored over the LINKABLE universe (raw
     // chronicle/source pages excluded from both numerator and denominator).
