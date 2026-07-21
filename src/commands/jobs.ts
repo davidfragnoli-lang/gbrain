@@ -1497,7 +1497,7 @@ export async function registerBuiltinHandlers(
     }
     const types = Array.isArray(job.data.types)
       ? (job.data.types as string[]).filter((t) =>
-          ['conversation', 'meeting', 'slack', 'email'].includes(t),
+          ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'].includes(t),
         )
       : undefined;
     const result = await runExtractConversationFactsCore(engine, {
@@ -1807,6 +1807,7 @@ export async function registerBuiltinHandlers(
       brainDir: effectiveBrainDir,
       pull,
       signal: job.signal, // propagate abort so cycle bails on timeout/cancel
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       ...(sourceId ? { sourceId } : {}),
       ...(requestedPhases && requestedPhases.length > 0 ? { phases: requestedPhases as any } : {}),
       yieldBetweenPhases: async () => {
@@ -1844,6 +1845,7 @@ export async function registerBuiltinHandlers(
       brainDir: repoPath,
       pull: false, // brain-wide DB/maintenance work never git-pulls
       signal: job.signal,
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       phases,
       yieldBetweenPhases: async () => { await new Promise<void>((r) => setImmediate(r)); },
     });
@@ -1989,6 +1991,7 @@ export async function registerBuiltinHandlers(
       brainDir: repoPath,
       phases: [phase as any],
       signal: job.signal,
+      deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
     });
     return { phase, status: report.status, report };
   };
