@@ -35,6 +35,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { getFtsLanguage } from './fts-language.ts';
+import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
@@ -1097,7 +1098,7 @@ export class PostgresEngine implements BrainEngine {
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
     const rows = await sql`
       INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, 1), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
@@ -3826,12 +3827,18 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     // "Seen" = the entity's own page has a timeline row, OR an event's `who`
     // array references the entity (exact slug or wikilink-substring match).
+    // "Last seen" is a PAST relation: the chronicle legitimately stores
+    // future events (calendar-event is eligibility-eligible), so bound to
+    // <= asof/today or a scheduled event reads as "seen today". Mirrors
+    // getOnThisDay's `te.date < target` bound.
+    const seenThrough = opts?.asof ? sql`${opts.asof}::date` : sql`current_date`;
     const rows = await sql`
       SELECT te.date::text AS last_date, ep.slug AS last_event_slug
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
       LEFT JOIN pages ep ON ep.id = te.event_page_id
       WHERE (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
+        AND te.date <= ${seenThrough}
         AND (
           p.slug = ${entitySlug}
           OR (ep.id IS NOT NULL AND EXISTS (
