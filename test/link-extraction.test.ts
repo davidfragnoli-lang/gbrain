@@ -234,6 +234,29 @@ describe('extractEntityRefs', () => {
     expect(refs.length).toBe(1);
     expect(refs[0].needsResolution).toBe(true);
   });
+
+  // FRA-788: `ideas` and `operations` are canonical top-level homes in the
+  // brain's README taxonomy; README links to them via the same `[[brain/...]]`
+  // form. They must resolve through the gated pass (multi-segment slugs the
+  // generic basename pass cannot rescue), keeping the `brain/` prefix + real dir.
+  test('extracts brain/ideas and brain/operations wikilinks via the gated pass', () => {
+    const refs = extractEntityRefs(
+      'See [[brain/ideas/maiteam-agent-platform|MaiTeam]] and [[brain/operations/wms-warehouse-standards]].',
+    );
+    expect(refs.map(r => r.slug)).toEqual([
+      'brain/ideas/maiteam-agent-platform',
+      'brain/operations/wms-warehouse-standards',
+    ]);
+    expect(refs.map(r => r.dir)).toEqual(['ideas', 'operations']);
+    // Gated pass, not the generic basename pass.
+    expect(refs.every(r => r.needsResolution === undefined)).toBe(true);
+  });
+
+  test('unprefixed ideas/operations slugs also resolve (dir whitelist, not just brain/)', () => {
+    const refs = extractEntityRefs('See [[ideas/maiteam-agent-platform]] and [[operations/lean-qc-methodology]].');
+    expect(refs.map(r => r.dir)).toEqual(['ideas', 'operations']);
+    expect(refs.every(r => r.needsResolution === undefined)).toBe(true);
+  });
 });
 
 // ─── extractPageLinks ──────────────────────────────────────────

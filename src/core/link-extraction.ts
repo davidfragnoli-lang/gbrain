@@ -88,7 +88,7 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  * Directory prefix whitelist. These are the top-level slug dirs the extractor
  * recognizes as entity references. Upstream canonical + our extensions:
  *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
- *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
+ *   - Our domain extensions: tech, finance, personal, openclaw, ideas, operations (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  *
  * FRA-788: our canonical brain stores entity pages under a `brain/` source
@@ -98,8 +98,16 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  * links match; the captured slug keeps the `brain/` prefix (it must, to equal
  * the stored slug on resolution), while `entityDir()` derives the entity dir
  * from the segment AFTER the prefix so downstream dir logic is unaffected.
+ *
+ * FRA-788: `ideas` and `operations` were added because the brain's own README
+ * taxonomy (`## Current Top-Level Taxonomy`) now declares both as canonical
+ * primary homes, and README links to them via the same `[[brain/ideas/<slug>]]`
+ * / `[[brain/operations/<slug>]]` form. Without them ~40% of README's wikilinks
+ * fell through the gated pass; the generic basename pass could not rescue them
+ * (it matches bare tails, not a multi-segment `brain/ideas/<slug>` literal), so
+ * README-only idea/operations pages stayed false orphans — the exact bug here.
  */
-const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|ideas|operations|entities)';
 
 /**
  * FRA-788: the entity directory of a (possibly `brain/`-prefixed) slug —
