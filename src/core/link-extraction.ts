@@ -82,8 +82,28 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
  *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
+ *
+ * FRA-788: our canonical brain stores entity pages under a `brain/` source
+ * root (DB slugs are `brain/<dir>/<slug>`, e.g. `brain/concepts/foo`), and the
+ * canonical README references them with the matching `[[brain/<dir>/<slug>]]`
+ * wikilink form. An optional leading `brain/` segment is admitted so those
+ * links match; the captured slug keeps the `brain/` prefix (it must, to equal
+ * the stored slug on resolution), while `entityDir()` derives the entity dir
+ * from the segment AFTER the prefix so downstream dir logic is unaffected.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+
+/**
+ * FRA-788: the entity directory of a (possibly `brain/`-prefixed) slug —
+ * the first path segment, skipping an optional leading `brain/` source-root
+ * prefix. `brain/companies/acme` → `companies`; `companies/acme` → `companies`.
+ * Returns '' for a bare basename with no `/`.
+ */
+function entityDir(slug: string): string {
+  const parts = slug.split('/');
+  if (parts[0] === 'brain') return parts[1] ?? '';
+  return parts[0] ?? '';
+}
 
 /**
  * Match `[Name](path)` markdown links pointing to entity directories.
@@ -313,7 +333,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     const name = match[1];
     const fullPath = match[2];
     const slug = fullPath;
-    const dir = fullPath.split('/')[0];
+    const dir = entityDir(fullPath);
     refs.push({ name, slug, dir });
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
@@ -330,7 +350,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[3] || slug).trim();
-    const dir = slug.split('/')[0];
+    const dir = entityDir(slug);
     refs.push({ name: displayName, slug, dir, sourceId });
     qualifiedRanges.push([match.index, match.index + match[0].length]);
   }
@@ -346,7 +366,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
-    const dir = slug.split('/')[0];
+    const dir = entityDir(slug);
     refs.push({ name: displayName, slug, dir });
     unqualifiedRanges.push([match.index, match.index + match[0].length]);
   }
@@ -378,7 +398,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes(':')) continue; // qualified-syntax token; 2a owns these
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
-    const dir = slug.includes('/') ? slug.split('/')[0] : '';
+    const dir = slug.includes('/') ? entityDir(slug) : '';
     refs.push({ name: displayName, slug, dir, needsResolution: true });
   }
 
@@ -715,7 +735,10 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   // also sit on boards ("board seat at portfolio company") which a naive
   // employee/advisor match would mis-classify; keep investor first so those
   // phrasings resolve correctly.
-  if (pageType === 'person' && globalContext && targetSlug?.startsWith('companies/')) {
+  // FRA-788: strip an optional `brain/` source-root prefix so the prior fires
+  // for both `companies/acme` and canonical `brain/companies/acme` slugs.
+  const targetEntity = targetSlug?.replace(/^brain\//, '');
+  if (pageType === 'person' && globalContext && targetEntity?.startsWith('companies/')) {
     if (PARTNER_ROLE_RE.test(globalContext)) return 'invested_in';
     if (ADVISOR_ROLE_RE.test(globalContext)) return 'advises';
     if (EMPLOYEE_ROLE_RE.test(globalContext)) return 'works_at';

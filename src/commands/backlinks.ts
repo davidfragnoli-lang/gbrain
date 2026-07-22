@@ -41,11 +41,14 @@ export function extractEntityRefs(content: string, _pagePath: string): { name: s
   const refs = canonicalExtractEntityRefs(content);
   return refs
     .filter(r => r.dir === 'people' || r.dir === 'companies')
-    .map(r => ({
-      name: r.name,
-      slug: r.slug.startsWith(`${r.dir}/`) ? r.slug.slice(r.dir.length + 1) : r.slug,
-      dir: r.dir,
-    }));
+    .map(r => {
+      // FRA-788: canonical slugs may carry a `brain/` source-root prefix
+      // (`brain/people/alice`); strip it, then the legacy dir prefix, so the
+      // filesystem walker's `${dir}/${slug}` reconstruction stays correct.
+      let slug = r.slug.startsWith('brain/') ? r.slug.slice('brain/'.length) : r.slug;
+      if (slug.startsWith(`${r.dir}/`)) slug = slug.slice(r.dir.length + 1);
+      return { name: r.name, slug, dir: r.dir };
+    });
 }
 
 /** Extract title from page (first H1 or frontmatter title) */
