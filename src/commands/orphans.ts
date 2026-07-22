@@ -16,6 +16,11 @@ import type { BrainEngine } from '../core/engine.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { isChronicleSourceType } from '../core/types.ts';
+import {
+  shouldExcludeFromOrphanReporting,
+  loadOrphanPolicyOverrides,
+  type OrphanPolicyOverrides,
+} from '../core/orphan-policy.ts';
 
 // --- Types ---
 
@@ -33,37 +38,6 @@ export interface OrphanResult {
   excluded: number;
 }
 
-// --- Filter constants ---
-
-/** Slug suffixes that are always auto-generated root files */
-const AUTO_SUFFIX_PATTERNS = ['/_index', '/log'];
-
-/** Page slugs that are pseudo-pages by convention */
-const PSEUDO_SLUGS = new Set(['_atlas', '_index', '_stats', '_orphans', '_scratch', 'claude']);
-
-/** Slug segment that marks raw sources */
-const RAW_SEGMENT = '/raw/';
-
-/** Slug prefixes where no inbound links is expected */
-const DENY_PREFIXES = [
-  'output/',
-  'dashboards/',
-  'scripts/',
-  'templates/',
-  'openclaw/config/',
-];
-
-/** First slug segments where no inbound links is expected */
-const FIRST_SEGMENT_EXCLUSIONS = new Set([
-  'scratch',
-  'thoughts',
-  'catalog',
-  'entities',
-  'raw',
-  'atoms',
-  'skills',
-]);
-
 // --- Filter logic ---
 
 /**
@@ -78,31 +52,18 @@ const FIRST_SEGMENT_EXCLUSIONS = new Set([
  * of them (the gazetteer holds only ~dozens of entity buckets). `type` is
  * optional so existing slug-only callers keep working unchanged.
  */
-export function shouldExclude(slug: string, type?: string | null): boolean {
-  // Raw chronicle/source page types — excluded by type, independent of slug.
+export function shouldExclude(
+  slug: string,
+  type?: string | null,
+  overrides?: OrphanPolicyOverrides,
+): boolean {
+  // FRA-1459: raw chronicle/source page types (email/event/…) are excluded by
+  // `type`, independent of slug — a large legitimate ingest batch of raw source
+  // pages must not be counted as orphans. Slug-based exclusions delegate to the
+  // shared upstream policy (orphan-policy.ts), which also honors per-brain
+  // config overrides (orphans.exclude_prefixes / orphans.exclude_slugs).
   if (isChronicleSourceType(type)) return true;
-
-  // Pseudo-pages (exact match)
-  if (PSEUDO_SLUGS.has(slug)) return true;
-
-  // Auto-generated suffix patterns
-  for (const suffix of AUTO_SUFFIX_PATTERNS) {
-    if (slug.endsWith(suffix)) return true;
-  }
-
-  // Raw source slugs
-  if (slug.includes(RAW_SEGMENT)) return true;
-
-  // Deny-prefix slugs
-  for (const prefix of DENY_PREFIXES) {
-    if (slug.startsWith(prefix)) return true;
-  }
-
-  // First-segment exclusions
-  const firstSegment = slug.split('/')[0];
-  if (FIRST_SEGMENT_EXCLUSIONS.has(firstSegment)) return true;
-
-  return false;
+  return shouldExcludeFromOrphanReporting(slug, overrides);
 }
 
 /**
@@ -168,6 +129,7 @@ export async function findOrphans(
   let allOrphans: { slug: string; title: string; domain: string | null; type: string }[];
   let total: number;
   let excludedAll: number;
+  const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
   try {
     allOrphans = await engine.findOrphanPages(
       sourceIds ? { sourceIds } : sourceId ? { sourceId } : undefined,
@@ -200,7 +162,7 @@ export async function findOrphans(
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, r.type) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, r.type, overrides) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -208,7 +170,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug, row.type));
+    : allOrphans.filter(row => !shouldExclude(row.slug, row.type, overrides));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,
