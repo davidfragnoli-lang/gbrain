@@ -810,12 +810,20 @@ async function makeContext(engine: BrainEngine, params: Record<string, unknown>)
   // 'default'. Wrapped in try/catch so a doctor / single-source brain that
   // never set up sources still returns 'default' silently.
   let sourceId: string | undefined;
+  // #2561: when the source resolved via a NON-explicit tier (path-match /
+  // brain default / sole-non-default / seed default), unqualified search-shaped
+  // reads span every `config.federated = true` source. Computed here (the
+  // trusted local boundary) and consumed by federatedSearchScope in
+  // operations.ts, which additionally gates on ctx.remote === false.
+  let localFederated: string[] | undefined;
   try {
-    const { resolveSourceId } = await import('./core/source-resolver.ts');
+    const { resolveSourceWithTier, localFederatedSourceIds } = await import('./core/source-resolver.ts');
     // params.source is set when a CLI flag was parsed for the op (rare; most
     // CLI ops don't take --source). Falls through to env/dotfile/path-match.
     const explicit = (params.source as string | undefined) ?? null;
-    sourceId = await resolveSourceId(engine, explicit);
+    const resolved = await resolveSourceWithTier(engine, explicit);
+    sourceId = resolved.source_id;
+    localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
   } catch {
     // Source resolution failed (e.g. sources table doesn't exist on a fresh
     // pre-init brain). Leave sourceId unset; engine read methods fall through
@@ -836,6 +844,7 @@ async function makeContext(engine: BrainEngine, params: Record<string, unknown>)
     // table). Matches dispatch.ts's auto-fill so the contract holds across
     // every transport.
     sourceId: sourceId ?? 'default',
+    ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
   };
 }
 
@@ -937,7 +946,10 @@ export function formatResult(opName: string, result: unknown): string {
         lines.push(`Link coverage (entities): ${(h.link_coverage * 100).toFixed(1)}%`);
       }
       if (h.timeline_coverage !== undefined) {
-        lines.push(`Timeline coverage (entities): ${(h.timeline_coverage * 100).toFixed(1)}%`);
+        lines.push(`Timeline coverage (entity pages): ${(h.timeline_coverage * 100).toFixed(1)}%`);
+      }
+      if (h.timeline_coverage_score !== undefined) {
+        lines.push(`Timeline density (all pages): ${h.timeline_coverage_score}/15 (whole-brain brain-score component)`);
       }
       if (Array.isArray(h.most_connected) && h.most_connected.length > 0) {
         lines.push('Most connected entities:');

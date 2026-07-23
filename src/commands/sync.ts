@@ -910,6 +910,25 @@ export function buildAutoEmbedArgs(slugs: string[], sourceId?: string): string[]
 }
 
 /**
+ * Resolve sync's effective no-embed mode from CLI args + config.
+ *
+ * The deferred-setup sentinel (`embedding_disabled: true`, written by
+ * `gbrain init --no-embedding`) is an implicit `--no-embed`: without this,
+ * the embed credential preflight demands provider credentials the user
+ * deliberately deferred at init, and every `gbrain sync` on a keyless
+ * brain exits 1. See embed-preflight.ts's skip protocol — the sentinel is
+ * meant to be honored before the credential check ever runs.
+ *
+ * Exported for `test/sync-no-embed-sentinel.test.ts`.
+ */
+export function resolveNoEmbed(
+  args: string[],
+  cfg: { embedding_disabled?: boolean } | null,
+): boolean {
+  return args.includes('--no-embed') || cfg?.embedding_disabled === true;
+}
+
+/**
  * Shell out to git with a generous maxBuffer.
  *
  * Node's default maxBuffer is 1 MiB.  `git diff --name-status -M` on a
@@ -2456,6 +2475,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   };
 
   const pagesAffected: string[] = [];
+  // #1284: slugs deleted this run (delete loop, or renamed-away old slugs are
+  // NOT pushed — only confirmed deletes land here). pagesAffected stays the
+  // full manifest for extract/report paths, but the auto-embed at the end
+  // must NOT be handed deleted slugs: embedPage throws 'Page not found' for
+  // each one and serr-logs noise. A slug re-imported later in the same run
+  // (delete + re-add) is removed from this set at its push site.
+  const deletedSlugs = new Set<string>();
   // issue #1939: file paths that imported cleanly this run. The failure-ledger
   // gate clears these so a previously-failing file's `attempts` streak resets
   // on success (consecutive-failure semantics for the auto-skip valve).
@@ -2616,6 +2642,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // slugs (paths in filtered.deleted but with no DB row) so
           // downstream extract/embed don't waste lookups.
           pagesAffected.push(...deleted);
+          for (const s of deleted) deletedSlugs.add(s);
           // v0.42.x (#1794): the whole batch is handled (deleted or already
           // gone); checkpoint every path so a resume skips it.
           for (const p of batch) await markCompleted(p);
@@ -2628,6 +2655,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             try {
               await engine.deletePage(slugs[j], deleteScopedOpts);
               pagesAffected.push(slugs[j]);
+              deletedSlugs.add(slugs[j]);
               await markCompleted(batch[j]);
             } catch (perSlugErr) {
               failedFiles.push({
@@ -2655,6 +2683,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         try {
           await engine.deletePage(slug, deleteOpts);
           pagesAffected.push(slug);
+          deletedSlugs.add(slug);
           await markCompleted(path);
         } catch (err) {
           failedFiles.push({
@@ -2755,6 +2784,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
       }
       pagesAffected.push(newSlug);
+      deletedSlugs.delete(newSlug); // #1284: rename landed on a previously-deleted slug → embeddable again
       await markCompleted(to);
       progress.tick(1, newSlug);
     }
@@ -2955,6 +2985,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
+          deletedSlugs.delete(result.slug); // #1284: deleted-then-re-added in the same run → embeddable again
           // issue #1939: record the file path (not slug) so the gate clears any
           // prior failure-ledger row — success resets the auto-skip attempt streak.
           succeededPaths.push(path);
@@ -3129,6 +3160,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //     pin..HEAD diff. Advance to pin.
   //   - pin NOT an ancestor of HEAD (history REWRITE / reset / force-push) →
   //     the tree we imported against is gone. Block; do not advance.
+  let headVerificationSucceeded = false;
   try {
     const currentHead = git(gitContextRoot, ['rev-parse', 'HEAD']);
     if (currentHead !== pin) {
@@ -3144,8 +3176,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           path: '<head>',
           error: `git history rewritten during sync: pinned target ${pin.slice(0, 8)} is no longer an ancestor of HEAD ${currentHead.slice(0, 8)}`,
         });
+      } else {
+        headVerificationSucceeded = true;
       }
       // else: forward progress (enrich committed on top) — safe, advance to pin.
+    } else {
+      headVerificationSucceeded = true;
     }
   } catch (e) {
     // rev-parse failure is itself a drift signal (worktree disappeared).
@@ -3191,6 +3227,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     ...succeededPaths,
     ...filtered.deleted,
     ...filtered.renamed.map(r => r.from),
+    // A prior transient rev-parse timeout records a hard-blocking sentinel that
+    // operators cannot acknowledge manually. Once pin ancestry is verified on
+    // a later run, clear that stale sentinel through the ordinary success path.
+    ...(headVerificationSucceeded ? ['<head>'] : []),
   ];
 
   const gate = await applySyncFailureGate({
@@ -3368,14 +3408,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // sync. Non-mismatch errors stay best-effort (rate limits, transient
   // network) — those shouldn't break sync.
   let embedded = 0;
-  if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
+  // #1284: never hand deleted slugs to the embedder — embedPage throws
+  // 'Page not found' per deleted slug and logs one error line each. Filter
+  // against this run's confirmed-deleted set (slugs re-imported later in the
+  // run were removed from it at their push sites).
+  const embedSlugs = pagesAffected.filter((s) => !deletedSlugs.has(s));
+  if (!noEmbed && embedSlugs.length > 0 && pagesAffected.length <= 100) {
     try {
       const { runEmbedCore } = await import('./embed.ts');
       const embedOpts = opts.sourceId
-        ? { slugs: pagesAffected, sourceId: opts.sourceId }
-        : { slugs: pagesAffected };
+        ? { slugs: embedSlugs, sourceId: opts.sourceId }
+        : { slugs: embedSlugs };
       await runEmbedCore(engine, embedOpts);
-      embedded = pagesAffected.length;
+      embedded = embedSlugs.length;
     } catch (e: unknown) {
       const { EmbeddingDimMismatchError } = await import('./embed.ts');
       if (e instanceof EmbeddingDimMismatchError) {
@@ -4014,7 +4059,7 @@ See also:
   const dryRun = args.includes('--dry-run');
   const full = args.includes('--full');
   const noPull = args.includes('--no-pull');
-  const noEmbed = args.includes('--no-embed');
+  const noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');
   const retryFailed = args.includes('--retry-failed');

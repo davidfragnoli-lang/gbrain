@@ -1338,10 +1338,6 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       throw new AIConfigError(
         `Anthropic has no embedding model. Use openai or google for embeddings.`,
       );
-    case 'claude-cli':
-      throw new AIConfigError(
-        `claude-cli has no embedding model. Use openai or google for embeddings.`,
-      );
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'embedding');
@@ -2284,15 +2280,6 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       const baseURL = resolveNativeBaseUrl('anthropic', cfg);
       return createAnthropic({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
-    case 'claude-cli': {
-      // The CLI handles its own auth (OAuth session); spawn the subprocess
-      // directly via the same LanguageModelV2 implementation chat uses. There
-      // is no separate expansion path because claude-cli does not declare a
-      // separate expansion touchpoint — but routing here keeps the switch
-      // exhaustive and lets a future expansion touchpoint use the same code.
-      const { ClaudeCliLanguageModel } = require('./providers/claude-cli-language-model.ts');
-      return new ClaudeCliLanguageModel(modelId);
-    }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'expansion');
@@ -2780,15 +2767,6 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
       if (!apiKey) throw new AIConfigError(`Anthropic chat requires ANTHROPIC_API_KEY.`, recipe.setup_hint);
       const baseURL = resolveNativeBaseUrl('anthropic', cfg);
       return createAnthropic({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
-    }
-    case 'claude-cli': {
-      // The CLI handles its own auth (OAuth session managed by `claude`
-      // login). Subprocess-based LanguageModelV2 dispatches via the recipe
-      // path so per-call routing works: `claude-cli:claude-sonnet-4-6` lands
-      // here, while sibling `litellm:gpt-5.4` continues through the
-      // openai-compatible path below. No env-var switch, no global flag.
-      const { ClaudeCliLanguageModel } = require('./providers/claude-cli-language-model.ts');
-      return new ClaudeCliLanguageModel(modelId);
     }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
@@ -3704,7 +3682,15 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // whose request/response shape differs from ZE/llama.cpp (e.g. Voyage with
   // `top_k` / `data[]`) needs separate adapter hooks in a follow-up plan.
   const url = `${compat.baseURL.replace(/\/$/, '')}${tp.path ?? '/models/rerank'}`;
-  const auth = applyResolveAuth(recipe, cfg, 'reranker');
+  let auth: { apiKey?: string; headers?: Record<string, string> };
+  try {
+    auth = applyResolveAuth(recipe, cfg, 'reranker');
+  } catch (err) {
+    if (err instanceof AIConfigError) {
+      throw new RerankError(err.message, 'auth');
+    }
+    throw err;
+  }
   // applyResolveAuth returns { apiKey } for Bearer-style auth (SDK's native
   // path) or { headers } for custom-header providers (Azure). v0.37.6.0:
   // recipes can ALSO declare default_headers (attribution etc.) which flow

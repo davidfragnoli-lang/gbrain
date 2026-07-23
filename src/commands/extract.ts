@@ -1025,6 +1025,10 @@ async function extractForSlugs(
   let linksCreated = 0;
   let timelineCreated = 0;
   let pagesProcessed = 0;
+  // #2636: successfully processed pages get their extraction watermark
+  // stamped after the final flush (mode 'all' only — a partial-mode run
+  // hasn't done the full extraction the watermark asserts).
+  const processedRefs: Array<{ slug: string; source_id: string }> = [];
 
   // Issue #972: read the basename flag once per extract run.
   const globalBasename = await isGlobalBasenameEnabled(engine);
@@ -1113,6 +1117,7 @@ async function extractForSlugs(
         }
 
         pagesProcessed++;
+        if (!dryRun) processedRefs.push({ slug, source_id: sourceId ?? 'default' });
       } catch { /* skip unreadable */ }
       progress.tick(1);
     },
@@ -1120,6 +1125,13 @@ async function extractForSlugs(
 
   await flushLinks();
   await flushTimeline();
+  // #2636: the Dream cycle disables sync's inline extraction and routes
+  // changed slugs through this incremental path — without a stamp here,
+  // those pages never get links_extracted_at and stay permanently visible
+  // to `extract --stale` / doctor. Stamp only after BOTH batches flushed.
+  if (!dryRun && mode === 'all') {
+    await stampExtracted(engine, processedRefs);
+  }
   progress.finish();
 
   if (!jsonMode) {
@@ -1684,9 +1696,17 @@ export async function extractStaleFromDB(
   // Batch mode = pg_trgm + exact only, NO per-name search fallback. The
   // resolution map sees ALL sources so qualified cross-source wikilinks resolve
   // even when --source-id scopes the stale SCAN.
-  const resolver = makeResolver(engine, { mode: 'batch' });
-  const nullResolver = { resolve: async () => null as string | null };
-  const activeResolver = includeFrontmatter ? resolver : nullResolver;
+  //
+  // #2576 bug 1: ALWAYS the real resolver — extractPageLinks's opts gate which
+  // pass runs (`skipFrontmatter` for the frontmatter pass, `globalBasename` for
+  // the issue-#972 bare-wikilink pass). The former `includeFrontmatter ?
+  // resolver : nullResolver` ternary predates #972; the synthetic resolver has
+  // no `resolveBasenameMatches`, so the --stale sweep silently skipped basename
+  // resolution even with `link_resolution.global_basename` enabled, stamping
+  // pages as extracted with their bare wikilinks dropped. Mirrors
+  // extractLinksFromDB (including the codex-[P1] `sourceId` scoping).
+  const resolver = makeResolver(engine, { mode: 'batch', sourceId: sourceIdFilter });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
   const allRefs = await engine.listAllPageRefs();
   const allSlugs = new Set<string>();
   const slugToSources = new Map<string, string[]>();
@@ -1718,7 +1738,8 @@ export async function extractStaleFromDB(
     for (const page of rows) {
       const fullContent = page.compiled_truth + '\n' + page.timeline;
       const extracted = await extractPageLinks(
-        page.slug, fullContent, page.frontmatter, page.type, activeResolver,
+        page.slug, fullContent, page.frontmatter, page.type, resolver,
+        { skipFrontmatter: !includeFrontmatter, globalBasename },
       );
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);

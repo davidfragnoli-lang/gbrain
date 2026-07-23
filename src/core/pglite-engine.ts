@@ -1048,6 +1048,7 @@ export class PGLiteEngine implements BrainEngine {
          frontmatter = EXCLUDED.frontmatter,
          content_hash = EXCLUDED.content_hash,
          updated_at = now(),
+         deleted_at = NULL,
          effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
          effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
          import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
@@ -1648,6 +1649,10 @@ export class PGLiteEngine implements BrainEngine {
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
            p.effective_date, p.effective_date_source,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
@@ -1892,6 +1897,10 @@ export class PGLiteEngine implements BrainEngine {
            SELECT
              p.slug, p.id as page_id, p.title, p.type, p.source_id,
              p.effective_date, p.effective_date_source,
+             CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+               THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+             CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+               THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
              cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
              ${scoreExpr} AS score,
              CASE WHEN p.updated_at < (
@@ -1917,6 +1926,10 @@ export class PGLiteEngine implements BrainEngine {
         `SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
            p.effective_date, p.effective_date_source,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ${scoreExpr} AS score,
            CASE WHEN p.updated_at < (
@@ -2013,6 +2026,10 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug, p.id as page_id, p.title, p.type, p.source_id,
          p.effective_date, p.effective_date_source,
+         CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+           THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+         CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+           THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
          ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
          CASE WHEN p.updated_at < (
@@ -2125,6 +2142,10 @@ export class PGLiteEngine implements BrainEngine {
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id, p.updated_at,
            p.effective_date, p.effective_date_source,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            1 - (cc.${col} <=> ${castSql}) AS raw_score
          FROM content_chunks cc
@@ -2147,6 +2168,7 @@ export class PGLiteEngine implements BrainEngine {
        SELECT
          bpp.slug, bpp.page_id, bpp.title, bpp.type, bpp.source_id,
          bpp.effective_date, bpp.effective_date_source,
+         bpp.message_id, bpp.thread_id, bpp.source_subject,
          bpp.chunk_id, bpp.chunk_index, bpp.chunk_text, bpp.chunk_source,
          bpp.score,
          CASE WHEN bpp.updated_at < (
@@ -2247,6 +2269,9 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string }): Promise<void> {
+    // Normalize the same way putPage does — pages.slug is stored lowercased,
+    // so a raw mixed-case slug here would miss the row it just wrote (#430).
+    slug = validateSlug(slug);
     const sourceId = opts?.sourceId ?? 'default';
 
     // Source-scope the page-id lookup so duplicate slugs in different sources
@@ -5370,11 +5395,16 @@ export class PGLiteEngine implements BrainEngine {
     );
   }
 
-  async getIngestLog(opts?: { limit?: number }): Promise<IngestLogEntry[]> {
+  async getIngestLog(opts?: { limit?: number; sourceIds?: string[] }): Promise<IngestLogEntry[]> {
     const limit = opts?.limit || 50;
+    // Source-scope for remote / federated callers; unscoped only for trusted
+    // local callers (mirrors the postgres engine).
+    const scoped = opts?.sourceIds && opts.sourceIds.length > 0;
     const { rows } = await this.db.query(
-      `SELECT * FROM ingest_log ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+      scoped
+        ? `SELECT * FROM ingest_log WHERE source_id = ANY($2::text[]) ORDER BY created_at DESC LIMIT $1`
+        : `SELECT * FROM ingest_log ORDER BY created_at DESC LIMIT $1`,
+      scoped ? [limit, opts?.sourceIds] : [limit]
     );
     // Belt-and-suspenders source_id fallback for any pre-v50 row that
     // somehow survived without the backfill.
