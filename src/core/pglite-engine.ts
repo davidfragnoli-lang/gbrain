@@ -52,7 +52,7 @@ import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts'
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
 import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
-import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL, CHRONICLE_SOURCE_PAGE_TYPE_LIST } from './types.ts';
+import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL, CHRONICLE_SOURCE_PAGE_TYPE_LIST, isChronicleSourceType } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
@@ -5331,7 +5331,7 @@ export class PGLiteEngine implements BrainEngine {
     // participate in the curated graph. Filtered in TS because the policy
     // includes per-brain config overrides.
     const { rows: pageScopeRows } = await this.db.query(`
-      SELECT p.slug,
+      SELECT p.slug, p.type,
              (NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
               AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
@@ -5345,16 +5345,30 @@ export class PGLiteEngine implements BrainEngine {
     // linkable_* stay from SQL (FRA-1459/FRA-1572) and drive the score.
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const scopeRows = pageScopeRows as { slug: string; type: string | null; islanded: boolean; has_timeline: boolean }[];
+    // orphan_pages (raw inspection count, FRA-1459 "nothing hidden"): islanded
+    // pages that are EITHER a raw chronicle/source TYPE (email/event/… — always
+    // surfaced so a large ingest volume stays visible for inspection) OR a
+    // non-chronicle page the slug policy keeps in scope. NOT the actionable
+    // audit count: `gbrain orphans` / doctor orphan_ratio (getOrphansData) AND
+    // the advisor drop chronicle types via {@link linkable_orphan_pages}; only
+    // this reported field keeps them visible. Slug policy still applies to
+    // non-chronicle pages (raw/, archive, generated, daily-log, life/events
+    // #2264 + per-brain overrides).
+    const orphanPages = scopeRows
+      .filter(row => row.islanded
+        && (isChronicleSourceType(row.type) || !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides))).length;
+    // Linkable universe (SCORE + advisor scope) additionally excludes raw
+    // chronicle/source TYPES (FRA-1459/FRA-1572) so a large mail/event ingest —
+    // pages that carry no wikilinks by design — can't collapse the orphan/link/
+    // timeline components or fire a false orphan alert.
+    const linkablePages = scopeRows
+      .filter(row => !isChronicleSourceType(row.type) && !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
     const linkablePageCount = linkablePages.length;
-    const orphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
-    // FRA-1459: linkable_orphan_pages (consumed by advisor/collect-usage-shape)
-    // is the orphan count within the linkable universe. Upstream #3015's
-    // pageScopeRows + shared orphan-policy filter supersedes the old SQL
-    // linkable_orphan_pages column, so it equals orphanPages here.
-    const linkableOrphanPages = orphanPages;
+    // linkable_orphan_pages (consumed by advisor/collect-usage-shape + noOrphans):
+    // islanded pages within the chronicle-type-excluded linkable universe.
+    const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
     const deadLinks = Number(r.dead_links);
     const linkCount = Number(r.link_count);
 
@@ -5368,7 +5382,7 @@ export class PGLiteEngine implements BrainEngine {
     // an all-archive brain has no curated graph to penalize.
     const timelineCoverageDensity =
       linkablePageCount > 0 ? Math.min(linkableTimelinePages / linkablePageCount, 1) : 1;
-    const noOrphans = linkablePageCount > 0 ? 1 - (orphanPages / linkablePageCount) : 1;
+    const noOrphans = linkablePageCount > 0 ? 1 - (linkableOrphanPages / linkablePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Bug 11 — per-component points. Sum equals brainScore by construction
     // so `doctor` can render a breakdown that adds up to the total.
