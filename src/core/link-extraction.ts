@@ -87,7 +87,7 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
 /**
  * Directory prefix whitelist. These are the top-level slug dirs the extractor
  * recognizes as entity references. Upstream canonical + our extensions:
- *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
+ *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects, reference
  *   - Our domain extensions: tech, finance, personal, openclaw, ideas, operations (domain-organized wikis)
  *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
  *
@@ -108,10 +108,10 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
  * README-only idea/operations pages stayed false orphans — the exact bug here.
  */
 // FRA-788 overlay: our `brain/`-prefix, `ideas`/`operations` extensions, and the
-// `entityDir()` helper are preserved. Upstream reverted #2071 (recognize reference
-// wikilinks) in origin/master; we follow that revert and drop `reference` here too
-// (our brain has no `reference/` dir or wikilinks, so nothing depends on it).
-const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|ideas|operations|entities)';
+// `entityDir()` helper are preserved. Upstream relanded #2071 (recognize reference
+// wikilinks, #3303) after its earlier revert; we track that reland and re-admit
+// `reference` here too (harmless to us — additive dir, no brain/ `reference/` yet).
+const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|ideas|operations|entities|reference)';
 
 /**
  * FRA-788: the entity directory of a (possibly `brain/`-prefixed) slug —
@@ -607,7 +607,7 @@ export async function extractPageLinks(
   // path needed `resolveBasenameMatches` on the real resolver.
   let fmUnresolved: UnresolvedFrontmatterRef[] = [];
   if (!opts.skipFrontmatter) {
-    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
+    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver, opts.globalBasename);
     candidates.push(...fm.candidates);
     fmUnresolved = fm.unresolved;
   }
@@ -1118,6 +1118,7 @@ export async function extractFrontmatterLinks(
   pageType: PageType,
   frontmatter: Record<string, unknown>,
   resolver: SlugResolver,
+  globalBasename = false,
 ): Promise<FrontmatterExtractResult> {
   const candidates: LinkCandidate[] = [];
   const unresolved: UnresolvedFrontmatterRef[] = [];
@@ -1155,7 +1156,22 @@ export async function extractFrontmatterLinks(
         // through unchanged; the original `name` is preserved for the
         // unresolved report and edge context.
         const linkTarget = unwrapWikilink(name);
-        const resolved = await resolver.resolve(linkTarget, mapping.dirHint);
+        let resolved = await resolver.resolve(linkTarget, mapping.dirHint);
+        if (!resolved && globalBasename && typeof resolver.resolveBasenameMatches === 'function') {
+          // Issue #972 follow-up: extend global_basename resolution to
+          // frontmatter link fields. resolve() can't reach a bare-title
+          // wikilink value (e.g. `sources: "[[2025-12-25_mentor-extraction]]"`)
+          // — it has no '/', so the slug-direct getPage is skipped, and the
+          // field's dirHint may name folders that don't exist in this brain,
+          // so the dir-scoped exact + fuzzy steps miss too. When
+          // link_resolution.global_basename is on, fall back to the SAME
+          // basename index the body bare-wikilink pass uses. Unique-match-only:
+          // ambiguous basenames (e.g. archive duplicates, generic hubs like
+          // `_index`) stay unresolved rather than create a wrong edge.
+          const matches = (await resolver.resolveBasenameMatches(linkTarget))
+            .filter((s) => s !== slug);
+          if (matches.length === 1) resolved = matches[0];
+        }
         if (!resolved) {
           unresolved.push({ field, name });
           continue;
