@@ -433,20 +433,25 @@ export interface OperationContext {
    */
   sourceId: string;
   /**
-   * #2561 — federated read scope for UNQUALIFIED local CLI reads.
+   * #2561 / #3242 — federated read scope for UNQUALIFIED reads.
    *
-   * Set ONLY by the local CLI's context builder (src/cli.ts makeContext), and
-   * only when the source resolved via a non-explicit tier (local_path /
-   * brain_default / sole_non_default / seed_default — NOT --source, NOT
-   * GBRAIN_SOURCE, NOT a .gbrain-source dotfile). Contains the resolved
-   * source first, then every other `config.federated = true` source, so an
-   * unqualified `gbrain search "X"` spans federated sources as
-   * docs/guides/multi-source-brains.md promises.
+   * Set ONLY by trusted server-side context builders — never from caller
+   * params — and only when the caller carries no explicit source scope:
+   *   - local CLI (src/cli.ts makeContext) when the source resolved via a
+   *     non-explicit tier (local_path / brain_default / sole_non_default /
+   *     seed_default — NOT --source, NOT GBRAIN_SOURCE, NOT a dotfile);
+   *   - stdio MCP (src/mcp/server.ts) when GBRAIN_SOURCE is unset;
+   *   - HTTP MCP (src/mcp/http-transport.ts) for legacy bearer tokens with
+   *     NO operator-set `permissions.source_id` grant (the historical
+   *     'default' floor). Tokens WITH an explicit grant never widen.
    *
-   * Consumed exclusively by `federatedSearchScope` and ONLY when
-   * `ctx.remote === false` — a remote caller's scope stays governed by
-   * `ctx.auth.allowedSources` / scalar `ctx.sourceId` (source-isolation
-   * invariant, fail-closed).
+   * Contains the resolved source first, then every other
+   * `config.federated = true` source, so an unqualified read/search spans
+   * federated sources as docs/guides/multi-source-brains.md promises.
+   *
+   * Consumed exclusively by `federatedSearchScope`. Fail-closed remains:
+   * a grant (`ctx.auth.allowedSources`) or a per-call `source_id` always
+   * wins, and a context without this field never widens.
    */
   localFederatedSourceIds?: string[];
 }
@@ -565,25 +570,26 @@ export function resolveRequestedScope(
 }
 
 /**
- * #2561 — source scope for the search-shaped read ops (`search`, `query`).
+ * #2561 / #3242 — source scope for the page-visibility read ops (`search`,
+ * `query`, `get_page`, `list_pages`, `resolve_slugs`).
  *
  * Delegates to `resolveRequestedScope` (the single trust+grant resolver), then
- * widens an UNQUALIFIED trusted-local scalar scope to the CLI-computed
- * federated set (`ctx.localFederatedSourceIds`, resolved source first). This is
- * what makes `sources add --federated` mean something for local search: a
- * federated source participates in unqualified `gbrain search "X"` results.
+ * widens an UNQUALIFIED scalar scope to the transport-computed federated set
+ * (`ctx.localFederatedSourceIds`, resolved source first). This is what makes
+ * `sources add --federated` mean something: a federated source participates in
+ * unqualified reads (#3242 — pages ingested into a `federated: true` source
+ * were invisible to get_page/search/list_pages while resolve_slugs leaked them).
  *
  * The expansion NEVER applies when:
- *   - the caller is not strictly trusted-local (`ctx.remote !== false`) —
- *     remote scope stays grant-governed (fail-closed source isolation);
  *   - a per-call `source_id` was passed (explicit wins, including `__all__`);
- *   - the resolver already produced a federated array (OAuth grant);
- *   - the CLI resolved the source from an explicit signal (--source / env /
- *     dotfile) — makeContext leaves `localFederatedSourceIds` unset then.
+ *   - the resolver already produced a federated array (OAuth grant governs);
+ *   - the transport didn't populate `localFederatedSourceIds` (see that
+ *     field's doc: it is only set for callers with NO explicit source scope,
+ *     and never from caller-controlled params — so trust stays fail-closed).
  *
  * Deliberately NOT inside `sourceScopeOpts`: code-intel ops collapse a
- * multi-element scope to an error (`resolveCodeIntelScope`), and non-search
- * reads (get_page, get_links, …) keep their long-standing scalar behavior.
+ * multi-element scope to an error (`resolveCodeIntelScope`), and the remaining
+ * scalar reads (get_links, get_chunks, …) keep their long-standing behavior.
  */
 export function federatedSearchScope(
   ctx: OperationContext,
@@ -591,7 +597,6 @@ export function federatedSearchScope(
 ): { sourceId?: string; sourceIds?: string[] } {
   const scope = resolveRequestedScope(ctx, sourceIdParam);
   if (
-    ctx.remote === false &&
     sourceIdParam === undefined &&
     scope.sourceId !== undefined &&
     scope.sourceIds === undefined &&
@@ -748,7 +753,9 @@ const get_page: Operation = {
     // with a federated `allowedSources` grant (and no single ctx.sourceId) got
     // an UNSCOPED exact lookup — a cross-source read of any page by slug. getPage
     // now honors sourceIds[] (both engines), so the same scope closes both paths.
-    const sourceOpts = sourceScopeOpts(ctx);
+    // #3242: federatedSearchScope (not bare sourceScopeOpts) so an unqualified
+    // read sees pages in `federated: true` sources, matching search/query.
+    const sourceOpts = federatedSearchScope(ctx);
     const fuzzyScope = sourceOpts;
 
     let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
@@ -1503,7 +1510,9 @@ const list_pages: Operation = {
     // enumerate src-B pages. Pre-fix, ctx.sourceId / ctx.auth?.allowedSources
     // were ignored at this op handler and the engine returned every source's
     // pages indiscriminately.
-    const scope = sourceScopeOpts(ctx);
+    // #3242: federatedSearchScope so unqualified listing spans federated
+    // sources (same visibility set as search / get_page). Grants still win.
+    const scope = federatedSearchScope(ctx);
     const pages = await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
@@ -1515,6 +1524,7 @@ const list_pages: Operation = {
     });
     return pages.map(pg => ({
       slug: pg.slug,
+      source_id: pg.source_id,
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
@@ -2736,7 +2746,11 @@ const resolve_slugs: Operation = {
     partial: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.resolveSlugs(p.partial as string);
+    // #3242: was fully UNSCOPED — the one read that leaked every source's
+    // slugs to any caller (the reporter's "resolve_slugs sees them but
+    // get_page doesn't" matrix). Route through the same visibility set as
+    // get_page/search: grant > federated set > scalar source.
+    return ctx.engine.resolveSlugs(p.partial as string, federatedSearchScope(ctx));
   },
   scope: 'read',
 };
@@ -3822,7 +3836,7 @@ const whoami: Operation = {
   name: 'whoami',
   description:
     'Introspect the calling identity. Returns one of three transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
+    '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
     '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
     '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
     'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
@@ -3864,6 +3878,10 @@ const whoami: Operation = {
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
         scopes: ctx.auth.scopes,
         expires_at: ctx.auth.expiresAt ?? null,
+        // Read-only self-introspection of the token's source grants —
+        // widens nothing; absent grants serialize fail-closed (null / []).
+        source_id: ctx.auth.sourceId ?? null,
+        federated_read: ctx.auth.allowedSources ?? [],
       };
     }
     return {
@@ -4531,14 +4549,10 @@ const search_by_image: Operation = {
       throw new Error('search_by_image accepts only one of: image_path, image_url, image_data');
     }
 
-    // D23-#6 — pre-flight daily-budget check for remote OAuth clients.
-    // Local CLI callers (ctx.remote=false) bypass the cap (clientId="").
+    // D23-#6 — remote OAuth clients are charged through the durable
+    // reserve-then-settle ledger below. Local CLI callers bypass the cap
+    // (clientId="") because they use their own provider credentials.
     const clientId = (ctx.remote === true ? (ctx.auth?.clientId ?? '') : '');
-    if (clientId) {
-      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
-      const { checkBudget } = await import('./spend-log.ts');
-      await checkBudget(ctx.engine, clientId, Math.round(budgetUsd * 100));
-    }
 
     // Resolve image bytes via the SSRF-defended loader. For remote callers,
     // tighter byte cap.
@@ -4558,33 +4572,75 @@ const search_by_image: Operation = {
     // one spread — `__all__` spans the brain only for trusted local callers.
     const imageSourceScope = resolveRequestedScope(ctx, sourceIdParam);
 
-    const { searchByImage } = await import('./search/by-image.ts');
-    const results = await searchByImage(
-      ctx.engine,
-      { base64: loaded.base64, mime: loaded.contentType },
-      {
-        limit: (p.limit as number) || 20,
-        offset: (p.offset as number) || 0,
-        query: queryRefinement,
-        ...imageSourceScope,
-      },
-    );
-
-    // D23-#6 — record successful Voyage call. Best-effort; failures don't
-    // block the response.
+    // Reserve immediately before entering the paid search routine. Validation,
+    // image loading, and scope resolution happen first so known no-charge
+    // failures do not strand reservations. An ambiguous provider failure is
+    // settled at this operation's fixed-price upper bound below; pessimistic
+    // accounting is safer than reopening daily headroom after the TTL.
+    let spendReservationId: string | null = null;
+    let estimatedSpendCents = 0;
     if (clientId) {
-      const { recordSpend, VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
-      // Approximate: 1 image embed + (query ? 1 text embed : 0). Both are
-      // billed at the same per-call rate by Voyage.
+      const { VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
+      const { reserve } = await import('./minions/budget-meter.ts');
       const calls = 1 + (queryRefinement ? 1 : 0);
-      void recordSpend(ctx.engine, {
+      estimatedSpendCents = VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls;
+      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
+      const reservation = await reserve(ctx.engine, {
         clientId,
-        tokenName: ctx.auth?.clientName ?? null,
-        operation: 'search_by_image',
-        spendCents: VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls,
+        estimatedCents: estimatedSpendCents,
+        capCents: budgetUsd * 100,
         provider: 'voyage',
         model: 'voyage-multimodal-3',
       });
+      spendReservationId = reservation.reservationId;
+    }
+
+    const { searchByImage } = await import('./search/by-image.ts');
+    let results: Awaited<ReturnType<typeof searchByImage>>;
+    try {
+      results = await searchByImage(
+        ctx.engine,
+        { base64: loaded.base64, mime: loaded.contentType },
+        {
+          limit: (p.limit as number) || 20,
+          offset: (p.offset as number) || 0,
+          query: queryRefinement,
+          ...imageSourceScope,
+        },
+      );
+    } catch (providerError) {
+      if (spendReservationId) {
+        const { settle } = await import('./minions/budget-meter.ts');
+        try {
+          await settle(
+            ctx.engine,
+            spendReservationId,
+            estimatedSpendCents,
+            'search_by_image_error_pessimistic',
+            ctx.auth?.clientName ?? null,
+          );
+        } catch (accountingError) {
+          throw new AggregateError(
+            [providerError, accountingError],
+            'search_by_image provider call failed and its spend reservation could not be settled',
+          );
+        }
+      }
+      throw providerError;
+    }
+
+    // Settlement and the spend-log mirror commit in one transaction. A
+    // database/accounting failure blocks the response and leaves the pending
+    // reservation holding headroom rather than returning an unmetered success.
+    if (spendReservationId) {
+      const { settle } = await import('./minions/budget-meter.ts');
+      await settle(
+        ctx.engine,
+        spendReservationId,
+        estimatedSpendCents,
+        'search_by_image',
+        ctx.auth?.clientName ?? null,
+      );
     }
 
     return results;
@@ -4680,7 +4736,8 @@ const list_schema_packs: Operation = {
     const { existsSync, readdirSync } = await import('node:fs');
     const { join } = await import('node:path');
     const { gbrainPath } = await import('./config.ts');
-    const bundled = ['gbrain-base', 'gbrain-recommended'];
+    const { BUNDLED_PACK_NAMES } = await import('./schema-pack/bundled.ts');
+    const bundled = [...BUNDLED_PACK_NAMES];
     const installedDir = gbrainPath('schema-packs');
     const installed: string[] = [];
     if (existsSync(installedDir)) {

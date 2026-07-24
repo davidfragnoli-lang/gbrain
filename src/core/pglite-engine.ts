@@ -2312,6 +2312,18 @@ export class PGLiteEngine implements BrainEngine {
     const params: unknown[] = [];
     let paramIdx = 1;
 
+    // Provenance fallback for chunks without an explicit `model`: resolve the
+    // gateway's runtime model, not the compile-time DEFAULT_EMBEDDING_MODEL.
+    // See postgres-engine.ts _upsertChunksOnce for the full rationale — pglite
+    // mirrors it for parity.
+    let resolvedModel: string = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const gw = await import('./ai/gateway.ts');
+      resolvedModel = gw.getEmbeddingModel() || resolvedModel;
+    } catch {
+      // Gateway unconfigured (unit tests / pre-connect): keep the default.
+    }
+
     for (const chunk of chunks) {
       const embeddingStr = chunk.embedding
         ? '[' + Array.from(chunk.embedding).join(',') + ']'
@@ -2344,7 +2356,7 @@ export class PGLiteEngine implements BrainEngine {
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
+        chunk.model || resolvedModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
@@ -4836,11 +4848,11 @@ export class PGLiteEngine implements BrainEngine {
     const { rows } = await this.db.query(
       `SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, t.row_num,
               t.claim, t.kind, t.holder, t.weight,
-              similarity(t.claim, $1)::real AS score
+              word_similarity($1, t.claim)::real AS score
        FROM takes t
        JOIN pages p ON p.id = t.page_id
        WHERE t.active
-         AND t.claim % $1
+         AND $1 <% t.claim
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
          AND ($4::text[] IS NULL OR p.source_id = ANY($4::text[]))
          AND ($5::text IS NULL OR p.source_id = $5::text)
@@ -5262,7 +5274,7 @@ export class PGLiteEngine implements BrainEngine {
     // dashboard, v0.10.3 metrics give entity-page-level granularity.
     const { rows: [h] } = await this.db.query(`
       WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company')
       )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -5292,7 +5304,6 @@ export class PGLiteEngine implements BrainEngine {
         ) as dead_links,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
@@ -5306,16 +5317,25 @@ export class PGLiteEngine implements BrainEngine {
       SELECT p.slug,
              (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
       FROM pages p
-      WHERE p.type IN ('person', 'company')
+      WHERE p.type IN ('entity', 'person', 'company')
       ORDER BY link_count DESC
       LIMIT 5
     `);
 
-    const { rows: islandedRows } = await this.db.query(`
-      SELECT p.slug
+    // Per-page flags for the linkable scope: orphan_pages and the
+    // no-orphans / timeline-coverage DENOMINATORS are all computed over
+    // pages the shared orphan-reporting policy considers linkable (the same
+    // scope `gbrain orphans` and doctor's orphan_ratio use), so one doctor
+    // report cannot carry two contradictory orphan/coverage numbers.
+    // Archive (raw/), generated, and daily-log pages are not expected to
+    // participate in the curated graph. Filtered in TS because the policy
+    // includes per-brain config overrides.
+    const { rows: pageScopeRows } = await this.db.query(`
+      SELECT p.slug,
+             (NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
+              AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
+             EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
-      WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
-        AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
     `);
 
     const r = h as Record<string, unknown>;
@@ -5325,23 +5345,30 @@ export class PGLiteEngine implements BrainEngine {
     // linkable_* stay from SQL (FRA-1459/FRA-1572) and drive the score.
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const orphanPages = (islandedRows as { slug: string }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides)).length;
-    const linkablePageCount = Number(r.linkable_page_count);
-    const linkableOrphanPages = Number(r.linkable_orphan_pages);
+    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
+      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const linkablePageCount = linkablePages.length;
+    const orphanPages = linkablePages.filter(row => row.islanded).length;
+    const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
+    // FRA-1459: linkable_orphan_pages (consumed by advisor/collect-usage-shape)
+    // is the orphan count within the linkable universe. Upstream #3015's
+    // pageScopeRows + shared orphan-policy filter supersedes the old SQL
+    // linkable_orphan_pages column, so it equals orphanPages here.
+    const linkableOrphanPages = orphanPages;
     const deadLinks = Number(r.dead_links);
     const linkCount = Number(r.link_count);
-    const pagesWithTimeline = Number(r.pages_with_timeline);
 
-    // FRA-1572: link density scored over the LINKABLE universe (mirrors the
-    // FRA-1459 orphan fix + the PostgresEngine sibling), so a large raw
-    // chronicle/source ingest can't collapse the links component.
+    // FRA-1572: link density scored over the LINKABLE universe (not raw
+    // pageCount) so a large raw chronicle/source ingest can't collapse the
+    // links component. Re-applied over upstream #3015, which reverted this
+    // denominator to pageCount; orphan + timeline already scope to linkable.
     const linkDensity = linkablePageCount > 0 ? Math.min(linkCount / linkablePageCount, 1) : 0;
-    const timelineCoverageDensity = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
-    // FRA-1459: orphan avoidance is scored over the LINKABLE universe (raw
-    // chronicle/source pages excluded from both numerator and denominator).
-    // linkablePageCount === 0 → full marks (no canonical graph to orphan).
-    const noOrphans = linkablePageCount > 0 ? 1 - (linkableOrphanPages / linkablePageCount) : 1;
+    // linkablePageCount === 0 gets full marks for the orphan / timeline
+    // components (same vacuous-truth rule as the empty-brain fix below):
+    // an all-archive brain has no curated graph to penalize.
+    const timelineCoverageDensity =
+      linkablePageCount > 0 ? Math.min(linkableTimelinePages / linkablePageCount, 1) : 1;
+    const noOrphans = linkablePageCount > 0 ? 1 - (orphanPages / linkablePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Bug 11 — per-component points. Sum equals brainScore by construction
     // so `doctor` can render a breakdown that adds up to the total.
@@ -5361,10 +5388,10 @@ export class PGLiteEngine implements BrainEngine {
 
     return {
       page_count: pageCount,
+      linkable_page_count: linkablePageCount,
       embed_coverage: embedCoverage,
       stale_pages: stalePages,
       orphan_pages: orphanPages,
-      linkable_page_count: linkablePageCount,
       linkable_orphan_pages: linkableOrphanPages,
       missing_embeddings: Number(r.missing_embeddings),
       brain_score: brainScore,
@@ -6019,6 +6046,9 @@ export class PGLiteEngine implements BrainEngine {
         `NOT (p.frontmatter ->> 'enriched_at' IS NOT NULL AND p.frontmatter ->> 'enriched_at' > $${params.length})`,
       );
     }
+
+    // Exclude dream/synthesize-generated pages (parity with postgres-engine).
+    where.push(`(p.frontmatter ->> 'dream_generated') IS DISTINCT FROM 'true'`);
 
     const orderKey = ENRICH_ORDER_SQL[opts.order] ? opts.order : 'inbound-links';
     const orderBy = ENRICH_ORDER_SQL[orderKey];

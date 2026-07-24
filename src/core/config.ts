@@ -48,6 +48,21 @@ export interface GBrainConfig {
    * reads OPENROUTER_API_KEY.
    */
   openrouter_api_key?: string;
+  /**
+   * Voyage AI API key (#2662). File-plane slot so `~/.gbrain/config.json`'s
+   * `voyage_api_key` reaches the voyage recipe the same way
+   * zeroentropy_api_key/openrouter_api_key do: file plane →
+   * buildGatewayConfig env dict → recipe reads VOYAGE_API_KEY. Before this,
+   * launchd/daemon/MCP contexts without a process-env export silently
+   * failed multimodal embeds despite config.json looking complete.
+   *
+   * NOTE (scoped to what this fix covers): `gbrain config set
+   * voyage_api_key X` writes the DB plane, which `loadConfigWithEngine()`
+   * does NOT merge for any `*_api_key` field (zeroentropy_api_key /
+   * openrouter_api_key have the same pre-existing gap) — only the
+   * config.json file-plane route is wired through today.
+   */
+  voyage_api_key?: string;
   /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -131,6 +146,18 @@ export interface GBrainConfig {
       /** Daily spend cap (USD); bounds drains/day = floor(cap / ~$0.30). Default 2.0. */
       max_usd_per_day?: number;
     };
+    /**
+     * v0.42 — keep frontmatter links fresh on the incremental cycle. The cycle's
+     * extract phase re-extracts only the slugs a sync changed, but `extractForSlugs`
+     * extracts BODY links only — frontmatter (`sources:`/`related:` etc.) link edges
+     * silently drift stale when a page's YAML is edited externally and synced in.
+     * Set true to also extract frontmatter links per changed page each cycle, keeping
+     * externally-edited YAML edges fresh without a full rescan. Default false
+     * (preserves current behavior). Read via the file/env/DB plane in the cycle's
+     * extract dispatch. Disable/enable with
+     * `gbrain config set autopilot.incremental_extract_include_frontmatter <bool>`.
+     */
+    incremental_extract_include_frontmatter?: boolean;
   };
   eval?: {
     /** false disables capture entirely. Defaults to true. */
@@ -885,6 +912,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'anthropic_api_key',
   'zeroentropy_api_key',
   'openrouter_api_key',
+  'voyage_api_key',
   'embedding_model',
   'embedding_dimensions',
   'embedding_disabled',
@@ -946,6 +974,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.subagent',
   'models.expansion',
   'models.chat',
+  'models.brainstorm.judge',
   'models.eval.longmemeval',
   'facts.extraction_model',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).

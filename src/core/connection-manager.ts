@@ -167,6 +167,33 @@ export function deriveDirectUrl(url: string): string | null {
   }
 }
 
+/** True when the URL targets Supavisor transaction mode (port 6543). */
+function isTransactionPoolerUrl(url: string): boolean {
+  try {
+    return new URL(url.replace(/^postgres(ql)?:\/\//, 'http://')).port === '6543';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the direct-pool URL from an explicit/env override + the primary URL.
+ *
+ * A direct override still pointing at the TRANSACTION-mode pooler (port 6543,
+ * usually a copy-paste of the primary URL) is a misconfiguration: the manager
+ * would believe DDL/bulk work runs on a long-timeout direct connection while
+ * still routing through Supavisor transaction mode (short timeouts, no
+ * prepared statements). Normalize it via deriveDirectUrl. Session-mode pooler
+ * URLs (pooler host, port 5432) pass through — they are a legitimate
+ * direct-ish target when the db.<ref> host is unreachable.
+ */
+export function normalizeDirectUrl(primaryUrl: string, override?: string | null): string | null {
+  const candidate = override ?? deriveDirectUrl(primaryUrl);
+  if (!candidate) return null;
+  if (!isTransactionPoolerUrl(candidate)) return candidate;
+  return deriveDirectUrl(candidate) ?? deriveDirectUrl(primaryUrl);
+}
+
 /**
  * Error codes that mean "the direct host is unreachable from this network"
  * (#1641). The auto-derived db.<ref>.supabase.co host is IPv6-only without
@@ -232,9 +259,10 @@ export class ConnectionManager {
     } else {
       this._killSwitch = readKillSwitchEnv();
       this._isSupabase = isSupabasePoolerUrl(opts.url);
-      // Direct URL: explicit override > env > derive > null
+      // Direct URL: explicit override > env > derive > null. Pooler-shaped
+      // overrides are normalized to a real direct host (or dropped).
       const envOverride = process.env.GBRAIN_DIRECT_DATABASE_URL;
-      this._directUrl = opts.directUrl ?? envOverride ?? deriveDirectUrl(opts.url);
+      this._directUrl = normalizeDirectUrl(opts.url, opts.directUrl ?? envOverride);
     }
   }
 
