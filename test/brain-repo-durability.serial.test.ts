@@ -86,6 +86,30 @@ describe('hardenBrainRepo', () => {
     expect(r.needs_attention).toEqual([]);
   });
 
+  test('FRA-22754 — taxonomy paths get gbrain.yml content-root prefix (brain/)', async () => {
+    // A nested brain: durable pages live under brain/<cat>/ per db_tracked.
+    writeFileSync(join(work, 'gbrain.yml'),
+      'storage:\n  db_tracked:\n    - brain/people/\n    - brain/companies/\n    - brain/concepts/\n    - sources/\n  db_only:\n    - brain/media/\n');
+    git(work, 'add', 'gbrain.yml'); git(work, 'commit', '-qm', 'gbrain.yml');
+    await harden();
+    const agents = readFileSync(join(work, 'AGENTS.md'), 'utf-8');
+    // Bare `people/` must NOT be emitted as a filing target — it resolves to repo
+    // root, not the indexed brain/people/ tree (the FRA-22753 root-write bug).
+    expect(agents).toContain('`brain/people/` — person');
+    expect(agents).toContain('`brain/companies/` — company');
+    // Even a rule dir absent from db_tracked inherits the derived root.
+    expect(agents).toContain('`brain/daily/` — daily');
+    expect(agents).not.toContain('`people/` — person');
+  });
+
+  test('FRA-22754 — flat brain (no gbrain.yml) keeps bare taxonomy paths', async () => {
+    await harden();
+    const agents = readFileSync(join(work, 'AGENTS.md'), 'utf-8');
+    // No gbrain.yml → no content root → backward-compatible bare paths.
+    expect(agents).toContain('`people/` — person');
+    expect(agents).not.toContain('`brain/people/`');
+  });
+
   test('is idempotent — second run adds NO new commit', async () => {
     await harden();
     const after1 = commitCount(work);
