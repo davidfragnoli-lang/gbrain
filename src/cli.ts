@@ -319,6 +319,30 @@ async function main() {
     return;
   }
 
+  // v0.41 LOOP wiring (FRA-22884): `gbrain bench publish` turns a captured-run
+  // NDJSON into a baseline file — pure file I/O, no DB/brain — so handle it
+  // BEFORE connectEngine, mirroring the `sources pull --path` DB-free pattern
+  // above. The command file (commands/bench-publish.ts), its tests
+  // (test/bench-publish.test.ts, test/e2e/eval-loop.test.ts) and
+  // docs/eval-bench.md all shipped, but the dispatch case was missing, so
+  // `gbrain bench` reported "Unknown command" and the eval LOOP
+  // (eval export → bench publish → eval gate) could not be closed on a real
+  // brain.
+  if (command === 'bench') {
+    const { runBenchPublish } = await import('./commands/bench-publish.ts');
+    if (subArgs[0] === 'publish') {
+      await runBenchPublish(subArgs.slice(1));
+    } else if (hasHelpFlag(subArgs) || subArgs.length === 0) {
+      console.log('Usage: gbrain bench publish --from <captured.ndjson> --to <baseline.ndjson> [--label L] [--force]');
+      console.log('  Closes the v0.41 eval LOOP: `gbrain eval export` → `gbrain bench publish` → `gbrain eval gate`.');
+    } else {
+      console.error(`Unknown bench subcommand: ${subArgs[0]}`);
+      console.error('Usage: gbrain bench publish --from <captured.ndjson> --to <baseline.ndjson> [--label L] [--force]');
+      process.exit(2);
+    }
+    return;
+  }
+
   // CLI-only commands
   if (CLI_ONLY.has(command)) {
     await handleCliOnly(command, subArgs);
