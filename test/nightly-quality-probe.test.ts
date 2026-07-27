@@ -181,6 +181,54 @@ describe('runNightlyQualityProbe (DI stub harness)', () => {
     });
   });
 
+  // FRA-22884 — a 1-of-10 failure used to be un-actionable: the working dir
+  // holding the per-question hypotheses was a tmpdir dropped in `finally`, so
+  // the operator could not tell WHICH question regressed without paying to
+  // re-run the whole probe.
+  test('FAIL run retains per-question artifacts and records their path', async () => {
+    await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
+      const r = await runNightlyQualityProbe(makeDeps({
+        runLongMemEval: async ({ outputPath }) => {
+          writeFileSync(outputPath, '{"qid":"q7","hypothesis":"wrong answer"}\n');
+        },
+        runCrossModalBatch: async ({ summaryPath }) => {
+          writeFileSync(summaryPath, JSON.stringify({ verdict: 'fail' }));
+          return {
+            exitCode: 1,
+            summary: {
+              pass_count: 9, fail_count: 1, inconclusive_count: 0, error_count: 0,
+              est_cost_usd: 2, verdict: 'fail',
+            },
+          };
+        },
+      }));
+      expect(r.outcome).toBe('fail');
+
+      const events = await readEvents();
+      const kept = events[0].artifacts_path as string;
+      expect(kept).toBeTruthy();
+      // Retained under the audit dir, and the hypotheses actually survived
+      // the tmpdir cleanup.
+      expect(kept.startsWith(auditTmp)).toBe(true);
+      expect(readFileSync(join(kept, 'lme-output.jsonl'), 'utf8')).toContain('q7');
+      expect(existsSync(join(kept, 'summary.json'))).toBe(true);
+    });
+  });
+
+  test('PASS run retains nothing (no failing case to diagnose)', async () => {
+    await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
+      const r = await runNightlyQualityProbe(makeDeps({
+        runLongMemEval: async ({ outputPath }) => {
+          writeFileSync(outputPath, '{"qid":"q1","hypothesis":"right answer"}\n');
+        },
+      }));
+      expect(r.outcome).toBe('pass');
+      const events = await readEvents();
+      expect(events[0].artifacts_path).toBeUndefined();
+      expect(existsSync(join(auditTmp, 'quality-probe-artifacts'))).toBe(false);
+    });
+  });
+
   test('runLongMemEval throws → outcome: error with audit row', async () => {
     await withEnv({ GBRAIN_AUDIT_DIR: auditTmp }, async () => {
       const r = await runNightlyQualityProbe(makeDeps({

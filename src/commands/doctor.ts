@@ -3287,7 +3287,7 @@ export function computeConversationParserProbeHealthCheck(
 
 export function computeNightlyQualityProbeHealthCheck(
   probeEnabled: boolean,
-  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string }>,
+  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string; artifacts_path?: string }>,
 ): Check {
   const name = 'nightly_quality_probe_health';
   if (!probeEnabled && events.length === 0) {
@@ -3323,7 +3323,12 @@ export function computeNightlyQualityProbeHealthCheck(
     return {
       name,
       status: 'warn',
-      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.`,
+      message:
+        `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). ` +
+        `Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.` +
+        // FRA-22884 — point at the retained per-question hypotheses so the
+        // warn names where to look instead of just how many failed.
+        (latest.artifacts_path ? ` Failing cases: ${latest.artifacts_path}` : ''),
     };
   }
   return {

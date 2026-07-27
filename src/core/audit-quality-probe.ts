@@ -39,6 +39,15 @@ export interface QualityProbeAuditEvent {
   fixture_sha8?: string;
   /** Optional human-readable detail (e.g. error message, "no chat provider configured"). */
   detail?: string;
+  /**
+   * FRA-22884 — directory holding the retained per-question hypothesis JSONL
+   * + batch summary for a non-PASS run. The probe's working dir is a tmpdir
+   * that was deleted unconditionally, so a `fail_count: 1` warn could name
+   * neither the failing question nor its hypothesis, and the operator had no
+   * way to act on it short of re-running the whole probe. Only set when the
+   * run did not pass — a PASS run has nothing to diagnose.
+   */
+  artifacts_path?: string;
 }
 
 /** ISO-week-rotated filename: `quality-probe-YYYY-Www.jsonl`. Mirrors audit-slug-fallback. */
@@ -71,6 +80,7 @@ export function logQualityProbeEvent(event: Omit<QualityProbeAuditEvent, 'ts'> &
     est_cost_usd: event.est_cost_usd,
     ...(event.fixture_sha8 !== undefined ? { fixture_sha8: event.fixture_sha8 } : {}),
     ...(event.detail !== undefined ? { detail: event.detail } : {}),
+    ...(event.artifacts_path !== undefined ? { artifacts_path: event.artifacts_path } : {}),
   };
   const dir = resolveAuditDir();
   const file = path.join(dir, computeQualityProbeAuditFilename());
