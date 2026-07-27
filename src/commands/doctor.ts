@@ -5355,7 +5355,13 @@ export async function buildChecks(
         for (const page of sample) {
           const body = await readConversationBodyForParsing(engine, page);
           const result = parseConversation(body, { page, noPolish: true, noFallback: true });
-          const id = result.matched_pattern_id ?? '_no_match';
+          // FRA-22807: email pages parse via the deterministic email adapter
+          // (phase='email') with no matched_pattern_id. Bucket them under their
+          // phase so the breakdown reads `email=N`, not a misleading
+          // `_no_match=N` — they DID parse and are excluded from `unmatched`.
+          const id =
+            result.matched_pattern_id ??
+            (result.phase === 'no_match' ? '_no_match' : result.phase);
           hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
           if (result.phase === 'no_match') unmatched++;
         }

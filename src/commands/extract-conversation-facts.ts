@@ -239,6 +239,14 @@ export interface ExtractConversationFactsCoreOpts {
   /** Bypass `facts.extraction_enabled=false`. Power-user escape. */
   overrideDisabled?: boolean;
   /**
+   * Override the fact-extraction chat model for this run only (e.g.
+   * `anthropic:claude-haiku-4-5-20251001` for a cost-efficient bulk email
+   * drain). When unset the extractor reads `facts.extraction_model` /
+   * models.tier.reasoning as usual. Does NOT mutate global config, so a
+   * concurrent real-time / atoms path keeps its configured model.
+   */
+  model?: string;
+  /**
    * v0.41.15.0 (D9 wrapper): in-process worker count for the per-page
    * fan-out. Default 1 (back-compat). Recommended 5-20 for LLM-bound
    * work; PGLite engines silently clamp to 1 with a stderr warn. Cross-
@@ -347,6 +355,13 @@ export interface SplitSegmentsOpts {
   maxMessages?: number;
   /** Drop messages with timestamp <= this ISO before splitting. */
   sinceIso?: string;
+  /**
+   * Minimum messages required for a segment to be emitted. Defaults to
+   * MIN_SEGMENT_MESSAGES (2) — a lone chat line isn't a conversation. Email
+   * pages (FRA-22807) pass 1: a single authored email is one message but
+   * still carries real facts, so it must produce one segment.
+   */
+  minMessages?: number;
 }
 
 export function splitIntoSegments(
@@ -355,6 +370,7 @@ export function splitIntoSegments(
 ): ConversationSegment[] {
   const gapMs = (opts.gapMinutes ?? DEFAULT_SEGMENT_GAP_MINUTES) * 60_000;
   const maxMessages = opts.maxMessages ?? DEFAULT_SEGMENT_MAX_MESSAGES;
+  const minMessages = opts.minMessages ?? MIN_SEGMENT_MESSAGES;
   const sinceMs = opts.sinceIso ? Date.parse(opts.sinceIso) : NaN;
 
   const filtered = Number.isFinite(sinceMs)
@@ -366,7 +382,7 @@ export function splitIntoSegments(
   let lastTs: number | null = null;
 
   const flush = () => {
-    if (cur.length < MIN_SEGMENT_MESSAGES) {
+    if (cur.length < minMessages) {
       cur = [];
       return;
     }
@@ -650,6 +666,8 @@ interface ExtractCoreState {
    * parser path.
    */
   llmFallbackModel: string | null;
+  /** Per-run fact-extraction model override (opts.model); undefined = default. */
+  extractionModel: string | undefined;
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -844,8 +862,14 @@ async function processPage(
   // `parseConversationMessages(body)` shape only saw the body, which
   // meant Telegram-bracket pages with frontmatter dates landed at
   // 1970-01-01. Now they pick up the correct date.
+  //
+  // FRA-22807: for `email`-type pages the orchestrator routes internally
+  // through the email adapter (strip HTML / decode entities → one sender
+  // message) and returns phase='email'. Those single-message emails carry
+  // real facts, so we relax the segmenter's 2-message minimum to 1 below.
   const parseResult = parseConversation(body, { page });
   let messages = parseResult.messages;
+  const minSegmentMessages = parseResult.phase === 'email' ? 1 : undefined;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
   }
@@ -876,8 +900,11 @@ async function processPage(
       );
     }
   }
-  const allSegments = splitIntoSegments(messages);
-  const segments = splitIntoSegments(messages, { sinceIso });
+  const allSegments = splitIntoSegments(messages, { minMessages: minSegmentMessages });
+  const segments = splitIntoSegments(messages, {
+    sinceIso,
+    minMessages: minSegmentMessages,
+  });
   if (segments.length === 0) {
     state.result.pages_skipped++;
     if (
@@ -951,6 +978,7 @@ async function processPage(
       source: PER_SEGMENT_SOURCE_PREFIX,
       engine: state.engine,
       abortSignal: state.signal,
+      ...(state.extractionModel ? { model: state.extractionModel } : {}),
     });
     if (!extraction.ok) {
       const detail = extraction.error instanceof Error
@@ -1191,6 +1219,7 @@ export async function runExtractConversationFactsCore(
     signal,
     cpMap: new Map(),
     llmFallbackModel,
+    extractionModel: opts.model,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
@@ -1545,6 +1574,8 @@ interface ParsedArgs {
   overrideDisabled?: boolean;
   /** v0.41.15.0 (D9): in-process parallel workers per source. */
   workers?: number;
+  /** Per-run fact-extraction model override (FRA-22807 cost-efficient drain). */
+  model?: string;
   yes?: boolean;
   help?: boolean;
   error?: string;
@@ -1561,6 +1592,7 @@ function parseArgs(args: string[]): ParsedArgs {
     if (a === '--override-disabled') { out.overrideDisabled = true; continue; }
     if (a === '--slug') { out.slug = args[++i]; continue; }
     if (a === '--source-id') { out.sourceId = args[++i]; continue; }
+    if (a === '--model') { out.model = args[++i]; continue; }
     if (a === '--since') { out.sinceIso = args[++i]; continue; }
     if (a === '--types') {
       const v = args[++i] ?? '';
@@ -1647,6 +1679,9 @@ Options:
                          silently clamps to 1 (single-writer engine). Cross-process
                          safety is guaranteed by the per-page advisory lock + replay
                          safety (delete-orphans-first on each page claim).
+  --model <id>           Override the fact-extraction model for this run only
+                         (e.g. anthropic:claude-haiku-4-5-20251001 for a cheap
+                         bulk email drain). Does NOT change global config.
   --override-disabled    Bypass facts.extraction_enabled=false brain-wide kill-switch.
   --background           Submit as a Minion job; print job_id; exit (use 'gbrain jobs follow').
   --yes                  Auto-confirm cost preview in non-TTY contexts.
@@ -1681,6 +1716,7 @@ function buildJobParams(args: string[]): Record<string, unknown> {
     // round-trips. The handler in src/commands/jobs.ts reads
     // job.data.workers and passes to runExtractConversationFactsCore.
     workers: parsed.workers,
+    model: parsed.model,
   };
 }
 
@@ -1763,6 +1799,7 @@ export async function runExtractConversationFacts(
         maxCostUsd: parsed.maxCostUsd,
         overrideDisabled: parsed.overrideDisabled,
         workers: parsed.workers,
+        model: parsed.model,
       });
 
       aggregate.pages_considered += perSource.pages_considered;

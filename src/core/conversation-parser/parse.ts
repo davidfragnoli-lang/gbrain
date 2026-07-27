@@ -29,6 +29,7 @@ import {
   BUILTIN_PATTERNS,
   cleanSpeaker,
 } from './builtins.ts';
+import { looksLikeEmailPage, parseEmailToMessages } from './email.ts';
 import type {
   DateContext,
   MatchedMessage,
@@ -471,6 +472,21 @@ export function parseConversation(
 ): ParseResult {
   if (!body) {
     return { messages: [], phase: 'no_match' };
+  }
+
+  // FRA-22807: `email`-type pages carry Word HTML / entity-encoded plain text,
+  // not a line-oriented transcript, so no built-in regex pattern matches them
+  // (they scored 100% `_no_match` in doctor's coverage sample). Route them
+  // through the deterministic email adapter — strip HTML, decode entities, and
+  // project the mail into a single sender message (envelope + body). Runs
+  // before pattern scoring and independent of the LLM polish/fallback opts
+  // (it's fully deterministic, no chat content leaves the process).
+  if (opts.page && looksLikeEmailPage(opts.page)) {
+    const messages = parseEmailToMessages(opts.page, body);
+    return {
+      messages,
+      phase: messages.length > 0 ? 'email' : 'no_match',
+    };
   }
 
   const dateCtx = deriveDateContext(opts);

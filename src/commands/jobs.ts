@@ -1559,6 +1559,9 @@ export async function registerBuiltinHandlers(
       // `gbrain extract-conversation-facts --background --workers 20`
       // works end-to-end.
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
+      // FRA-22807: round-trip --model so a background email drain can pin a
+      // cost-efficient extraction model (e.g. Haiku) without touching config.
+      model: typeof job.data.model === 'string' ? job.data.model : undefined,
     });
     return result;
   });
