@@ -972,6 +972,22 @@ async function processPage(
     const text = renderSegmentForExtraction(page.title || page.slug, seg);
     const sessionId = `${PER_SEGMENT_SOURCE_PREFIX}:${page.slug}`;
 
+    // A dry run is a preview: it answers "which pages and how many segments
+    // need work", and it must cost nothing. Extraction is the only paid call
+    // on this path, so it is skipped entirely rather than merely having its
+    // writes suppressed below. Without this guard --dry-run billed the full
+    // extraction and discarded every fact, which is strictly worse than not
+    // running it: the operator pays real money for zero durable rows, and
+    // once the cost cap trips the remaining pages report as "failed", so the
+    // coverage number the preview exists to produce comes back truncated and
+    // is easily misread as "nothing left to do".
+    if (state.dryRun) {
+      state.result.segments_processed++;
+      segmentsThisPage++;
+      newestEnd = seg.endIso;
+      continue;
+    }
+
     const extraction = await extractFactsFromTurnWithOutcome({
       turnText: text,
       sessionId,
@@ -1018,7 +1034,9 @@ async function processPage(
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
     } else {
-      // dry-run: count for reporting, no DB write.
+      // Nothing extracted from this segment, so there is no row to write —
+      // advance the accumulator only. (Dry runs never reach here: they skip
+      // extraction entirely above.)
       rowNum += extracted.length;
     }
 
@@ -1826,13 +1844,21 @@ export async function runExtractConversationFacts(
     progress.finish();
   }
 
-  const verb = parsed.dryRun ? '(dry run) would extract' : 'extracted';
+  // A dry run never calls the provider, so it cannot know how many facts it
+  // "would" extract — reporting a fact count here would read as "0 facts to
+  // find" when it actually means "did not look". Report the work outstanding,
+  // which is the number the preview can honestly produce.
   console.log(
-    `\nDone: ${verb} ${aggregate.facts_extracted} facts ` +
-    `(${aggregate.facts_inserted} inserted) across ${aggregate.segments_processed} segments ` +
-    `from ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
-    `in ${sourceIds.length} source(s). ` +
-    `Spent ~$${totalSpent.toFixed(4)}.`,
+    parsed.dryRun
+      ? `\nDone: (dry run) ${aggregate.segments_processed} segment(s) need extraction ` +
+        `across ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
+        `in ${sourceIds.length} source(s). ` +
+        `Spent ~$${totalSpent.toFixed(4)} (a dry run makes no paid calls).`
+      : `\nDone: extracted ${aggregate.facts_extracted} facts ` +
+        `(${aggregate.facts_inserted} inserted) across ${aggregate.segments_processed} segments ` +
+        `from ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
+        `in ${sourceIds.length} source(s). ` +
+        `Spent ~$${totalSpent.toFixed(4)}.`,
   );
   if (aggregate.pages_skipped > 0) {
     console.log(`  Skipped ${aggregate.pages_skipped} page(s) with no new segments since last checkpoint.`);

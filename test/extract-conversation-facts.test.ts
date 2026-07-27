@@ -265,6 +265,7 @@ describe('runExtractConversationFactsCore', () => {
   let chatStopReason: ChatResult['stopReason'] = 'end';
   let chatTextOverride: string | null = null;
   let fallbackCalls = 0;
+  let extractionCalls = 0;
   let fallbackContents: string[] = [];
   let fallbackControlError: Error | null = null;
   let fallbackOnCall: (() => void) | null = null;
@@ -322,6 +323,9 @@ describe('runExtractConversationFactsCore', () => {
       chatHook = null;
       if (hook) await hook();
       callIndex++;
+      // Every call reaching here is a paid fact-extraction turn. Counted so
+      // dry-run can assert it spends nothing.
+      extractionCalls++;
       return {
         text: chatTextOverride ?? JSON.stringify({
           facts: [{
@@ -367,6 +371,7 @@ describe('runExtractConversationFactsCore', () => {
     chatStopReason = 'end';
     chatTextOverride = null;
     fallbackCalls = 0;
+    extractionCalls = 0;
     fallbackContents = [];
     fallbackControlError = null;
     fallbackOnCall = null;
@@ -464,6 +469,37 @@ describe('runExtractConversationFactsCore', () => {
     expect(result.pages_processed).toBe(1);
     expect(result.facts_inserted).toBe(0);
     expect(result.segments_processed).toBeGreaterThanOrEqual(1);
+  });
+
+  test('dry-run issues no paid extraction call', async () => {
+    // Regression (FRA-22896): --dry-run suppressed only the DB writes, so a
+    // preview billed the full extraction and threw every fact away. Observed
+    // in production at $4.94 for 0 inserted rows. The paid turn must not be
+    // issued at all. An API key is set so the assertion proves the dry-run
+    // guard is what suppresses the call, not a missing credential.
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const dry = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        dryRun: true,
+        sleepMs: 0,
+      });
+      expect(extractionCalls).toBe(0);
+      expect(dry.facts_inserted).toBe(0);
+      // The preview still answers the question it exists to answer.
+      expect(dry.pages_processed).toBe(1);
+      expect(dry.segments_processed).toBeGreaterThanOrEqual(1);
+
+      // Same page, same fixtures, without --dry-run: the call IS issued.
+      // Without this half the test would pass on a no-op implementation.
+      const real = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        sleepMs: 0,
+      });
+      expect(extractionCalls).toBeGreaterThan(0);
+      expect(real.facts_inserted).toBeGreaterThan(0);
+    });
   });
 
   test('dry-run does not write the extract_rollup_7d cache row', async () => {
