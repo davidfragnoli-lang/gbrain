@@ -264,6 +264,9 @@ export async function runPhaseConversationFactsBackfill(
             pages_skipped_non_extractable: 0,
             pages_marked_non_extractable: 0,
             pages_failed: 1,
+            // Budget denials break out above, so a source landing here failed
+            // for its own reasons, not the cap.
+            pages_budget_denied: 0,
             pages_llm_fallback: 0,
             // v0.41.15.0 (D6 + D11): new counters from the per-page lock
             // + delete-orphans-first replay safety.

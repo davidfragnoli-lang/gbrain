@@ -1156,6 +1156,33 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(result.pages_failed).toBe(1);
     expect(result.pages_processed).toBe(0);
+    // The cap was never involved, so nothing lands in the budget bucket.
+    expect(result.pages_budget_denied).toBe(0);
+  });
+
+  test('a cost-cap denial is reported apart from a genuine failure', async () => {
+    // Regression (FRA-22896): the cap denial reaches this command wrapped as
+    // reason:'provider_error'. Re-wrapping it in a plain Error stripped the
+    // BUDGET_EXHAUSTED tag that runSlidingPool's must-abort path keys on, so
+    // the pool kept claiming pages, every one was denied, and all of them were
+    // counted as broken. In production that printed 1,471 "failures" for a run
+    // whose only problem was running out of authorized spend — and made the
+    // truncated coverage number read as "nothing left to do".
+    chatFailure = new BudgetExhausted('test cap reached', {
+      reason: 'cost',
+      spent: 5,
+      cap: 5,
+    });
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    expect(result.budget_exhausted).toBe(true);
+    expect(result.pages_budget_denied).toBeGreaterThan(0);
+    // The load-bearing assertion: a cap denial is NOT a failure.
+    expect(result.pages_failed).toBe(0);
+    expect(result.facts_inserted).toBe(0);
   });
 
   test('content identity reopens a page even when updated_at is unchanged', async () => {

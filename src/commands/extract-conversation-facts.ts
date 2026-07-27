@@ -85,7 +85,7 @@ import { createHash } from 'crypto';
 // per-page advisory lock + delete-orphans-first replay safety. See plan
 // `~/.claude/plans/system-instruction-you-are-working-fancy-creek.md`
 // decisions D2, D6, D9, D11, D12, D13, D15.
-import { runSlidingPool } from '../core/worker-pool.ts';
+import { runSlidingPool, isMustAbortError } from '../core/worker-pool.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
@@ -276,6 +276,13 @@ export interface ExtractConversationFactsResult {
   pages_marked_non_extractable: number;
   /** Pages whose claim reached extraction but failed before durable outcome. */
   pages_failed: number;
+  /**
+   * FRA-22896: pages the cost cap refused to extract. These are NOT failures
+   * — nothing is wrong with the page, we simply ran out of authorized spend.
+   * Counted apart from `pages_failed` because conflating the two is what made
+   * a capped run's coverage number readable as "nothing left to do".
+   */
+  pages_budget_denied: number;
   /**
    * Pages whose built-in parse returned `no_match` and whose messages were
    * recovered by the explicitly enabled LLM fallback.
@@ -997,6 +1004,17 @@ async function processPage(
       ...(state.extractionModel ? { model: state.extractionModel } : {}),
     });
     if (!extraction.ok) {
+      // FRA-22896: a cost-cap denial arrives here as reason:'provider_error'
+      // carrying the original BudgetExhausted. Wrapping it in a plain Error
+      // strips the BUDGET_EXHAUSTED tag that runSlidingPool's must-abort path
+      // (D13) keys on, so the pool kept claiming pages and every remaining one
+      // was denied and then reported as a genuine failure — 1,471 denials
+      // presented as 1,471 broken pages. Rethrow the tagged error unchanged so
+      // the cap halts the run on first denial and is accounted separately.
+      if (isMustAbortError(extraction.error)) {
+        state.result.pages_budget_denied++;
+        throw extraction.error;
+      }
       const detail = extraction.error instanceof Error
         ? `: ${extraction.error.message}`
         : '';
@@ -1082,8 +1100,12 @@ async function processPage(
     state.cpMap.set(cpMapKey(state.sourceId, page.slug), newestEnd);
   }
 
+  // A dry run inserts nothing by construction, so "0 facts inserted" would read
+  // as "this page yields nothing" rather than "this page is queued for work".
   process.stderr.write(
-    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
+    state.dryRun
+      ? `[extract-conversation-facts] ${page.slug}: ${segmentsThisPage} segment(s) need extraction (dry run)\n`
+      : `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
   );
 
   state.result.pages_processed++;
@@ -1168,6 +1190,7 @@ export async function runExtractConversationFactsCore(
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
     pages_failed: 0,
+    pages_budget_denied: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1783,6 +1806,7 @@ export async function runExtractConversationFacts(
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
     pages_failed: 0,
+    pages_budget_denied: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1829,6 +1853,7 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
       aggregate.pages_failed += perSource.pages_failed;
+      aggregate.pages_budget_denied += perSource.pages_budget_denied;
       aggregate.pages_llm_fallback += perSource.pages_llm_fallback;
       aggregate.pages_lock_skipped += perSource.pages_lock_skipped;
       aggregate.orphan_facts_cleaned += perSource.orphan_facts_cleaned;
@@ -1880,6 +1905,16 @@ export async function runExtractConversationFacts(
   }
   if (aggregate.pages_failed > 0) {
     console.error(`  Failed ${aggregate.pages_failed} page(s); they remain unfinished and will retry.`);
+  }
+  // FRA-22896: kept distinct from the failure line above. A cap denial says
+  // "out of authorized spend", not "this page is broken", and a run that ends
+  // here has NOT enumerated the rest of the backlog — so its coverage number
+  // is a floor, never an all-clear.
+  if (aggregate.pages_budget_denied > 0) {
+    console.log(
+      `  Halted ${aggregate.pages_budget_denied} page(s) at the cost cap (not failures). ` +
+      `Pages beyond the cap were never examined, so the counts above are a lower bound.`,
+    );
   }
   if (aggregate.pages_llm_fallback > 0) {
     console.log(`  Parsed ${aggregate.pages_llm_fallback} page(s) with the opt-in LLM fallback.`);
