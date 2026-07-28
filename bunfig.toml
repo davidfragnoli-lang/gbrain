@@ -18,4 +18,14 @@ timeout = 60_000
 # runs, so audit-emitting code paths (content-sanity, shell-audit, etc.)
 # can't leak fixture events into the operator's real ~/.gbrain/audit/. See
 # test/helpers/audit-dir-preload.ts for the full rationale.
-preload = ["./test/helpers/legacy-embedding-preload.ts", "./test/helpers/audit-dir-preload.ts"]
+#
+# FRA-22903: neutralize the operator's GBRAIN_MAX_DAILY_COST_USD, so the suite
+# cannot pass or fail based on local billing configuration. Fixture spend accrues
+# into the scratch ledger above until it crosses the cap, after which reserve()
+# denies and extraction assertions fail on test order rather than on the code
+# under test. See test/helpers/daily-cap-preload.ts.
+preload = [
+  "./test/helpers/legacy-embedding-preload.ts",
+  "./test/helpers/audit-dir-preload.ts",
+  "./test/helpers/daily-cap-preload.ts",
+]
