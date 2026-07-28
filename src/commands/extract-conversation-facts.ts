@@ -86,6 +86,7 @@ import { createHash } from 'crypto';
 // `~/.claude/plans/system-instruction-you-are-working-fancy-creek.md`
 // decisions D2, D6, D9, D11, D12, D13, D15.
 import { runSlidingPool, isMustAbortError } from '../core/worker-pool.ts';
+import { isRequestRejectedBeforeGeneration } from '../core/ai/errors.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
@@ -155,6 +156,77 @@ export type AllowedType = (typeof ALLOWED_TYPES)[number];
  * (Eng-v2 C8 — bounded vs PR's unbounded listPages limit:500 = 12.5GB).
  */
 export const PAGE_LIST_BATCH = 10;
+
+/**
+ * FRA-22906: how many CONSECUTIVE request-level provider rejections end the
+ * source instead of marching on.
+ *
+ * A 4xx-non-429 means the provider refused before running the model, so the
+ * failure is a property of the account or the request envelope, never of the
+ * page. Nothing about attempting page 4 makes it likelier to succeed than page
+ * 3 did. On 2026-07-27 the credit balance emptied and the loop attempted all
+ * 1,548 pages twice, then reported `pages_failed: 1548` — a provider outage
+ * wearing the costume of a corpus-wide data-quality problem.
+ *
+ * 3 rather than 1 so a genuinely per-request 4xx (one oversized payload, one
+ * transient auth blip) still only costs that page. Counted consecutively —
+ * any other outcome resets it — so a long healthy run is never ended by
+ * rejections scattered across thousands of pages.
+ */
+export const PROVIDER_REJECTION_ABORT_THRESHOLD = 3;
+
+/** Circuit breaker over consecutive request-level provider rejections. */
+export interface ProviderRejectionBreaker {
+  /** Record an item that completed — restarts the streak. */
+  onSuccess(): void;
+  /** Classify a failure and say whether the caller should keep going. */
+  onFailure(error: unknown): 'continue' | 'abort';
+  /** True once the streak reached the threshold. */
+  readonly tripped: boolean;
+  /** Message of the rejection that tripped it, or null. */
+  readonly reason: string | null;
+}
+
+/**
+ * FRA-22906: build a breaker for one source's enumeration.
+ *
+ * Extracted from the worker-pool callback so the abort rule is testable
+ * without a seeded brain and a live provider — the incident it exists to
+ * prevent is precisely the one nobody can reproduce on demand.
+ *
+ * Counting is safe from the pool's parallel workers: mutations happen only
+ * inside `onItem`/`onError`, which run on JS's single thread, so no two
+ * workers interleave a read-modify-write.
+ */
+export function createProviderRejectionBreaker(
+  threshold: number = PROVIDER_REJECTION_ABORT_THRESHOLD,
+): ProviderRejectionBreaker {
+  let consecutive = 0;
+  let reason: string | null = null;
+  return {
+    onSuccess() {
+      // Any completed page proves the provider is answering, so the streak
+      // restarts. "Consecutive" is what keeps a healthy multi-thousand-page
+      // run from being ended by 4xx scattered across it.
+      consecutive = 0;
+    },
+    onFailure(error: unknown): 'continue' | 'abort' {
+      if (!isRequestRejectedBeforeGeneration(error)) {
+        consecutive = 0;
+        return 'continue';
+      }
+      consecutive++;
+      reason = error instanceof Error ? error.message : String(error);
+      return consecutive >= threshold ? 'abort' : 'continue';
+    },
+    get tripped() {
+      return consecutive >= threshold;
+    },
+    get reason() {
+      return this.tripped ? reason : null;
+    },
+  };
+}
 
 /** Op name for the checkpoint primitive. */
 export const CHECKPOINT_OP = 'extract-conversation-facts';
@@ -284,6 +356,15 @@ export interface ExtractConversationFactsResult {
    */
   pages_budget_denied: number;
   /**
+   * FRA-22906: pages whose extraction was rejected by the provider before it
+   * generated anything (4xx-non-429 — bad key, bad model, exhausted credit
+   * balance). Like `pages_budget_denied` these are NOT page defects: the page
+   * was never read by a model. Kept out of `pages_failed` because reporting
+   * "1,548 pages failed" for one zero-credit outage sends diagnosis after a
+   * data-quality problem that does not exist.
+   */
+  pages_provider_rejected: number;
+  /**
    * Pages whose built-in parse returned `no_match` and whose messages were
    * recovered by the explicitly enabled LLM fallback.
    */
@@ -307,6 +388,15 @@ export interface ExtractConversationFactsResult {
   facts_extracted: number;
   facts_inserted: number;
   budget_exhausted?: boolean;
+  /**
+   * FRA-22906: the run stopped early because the provider was rejecting every
+   * request. Same contract as `budget_exhausted` — a partial, honestly-halted
+   * result, not a thrown failure. The remaining backlog was never enumerated,
+   * so every count above is a lower bound.
+   */
+  provider_unavailable?: boolean;
+  /** Message of the provider rejection that tripped the circuit breaker. */
+  provider_error?: string;
   spent_usd?: number;
 }
 
@@ -1018,8 +1108,15 @@ async function processPage(
       const detail = extraction.error instanceof Error
         ? `: ${extraction.error.message}`
         : '';
+      // FRA-22906: thread the original error through `cause`. The pool's
+      // error policy has to tell a provider-level rejection (the whole
+      // account is down) from a bad page (only this page is down), and the
+      // status code that says which lives on the SDK error underneath.
+      // Flattening it to a message string made every outage indistinguishable
+      // from 1,548 broken pages.
       throw new Error(
         `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
+        { cause: extraction.error },
       );
     }
     const extracted = extraction.facts;
@@ -1191,6 +1288,7 @@ export async function runExtractConversationFactsCore(
     pages_marked_non_extractable: 0,
     pages_failed: 0,
     pages_budget_denied: 0,
+    pages_provider_rejected: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1354,6 +1452,9 @@ export async function runExtractConversationFactsCore(
       // honors AbortSignal at each claim boundary and threads
       // BudgetExhausted abort (D13) automatically.
       let processedPagesCount = 0;
+      // FRA-22906: one breaker for the whole source, so a streak that spans
+      // a batch boundary still trips.
+      const breaker = createProviderRejectionBreaker();
       pageLoop: for (const type of types) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
@@ -1399,8 +1500,12 @@ export async function runExtractConversationFactsCore(
             items: claimable,
             workers,
             signal,
-            onItem: (page) => processPageWithLock(page),
-            onError: (error) => (isAbortError(error) ? 'abort' : 'continue'),
+            onItem: async (page) => {
+              await processPageWithLock(page);
+              breaker.onSuccess();
+            },
+            onError: (error) =>
+              isAbortError(error) ? 'abort' : breaker.onFailure(error),
             failureLabel: (page) => page.slug,
           });
           const cancellation = poolResult.failures.find((failure) =>
@@ -1413,14 +1518,39 @@ export async function runExtractConversationFactsCore(
               name: 'AbortError',
             });
           }
-          result.pages_failed += poolResult.errored;
+          // FRA-22906: split provider rejections out of the failure count.
+          // These pages were never shown to a model, so calling them failures
+          // points diagnosis at the corpus instead of at the account.
+          let rejectedThisBatch = 0;
           for (const failure of poolResult.failures) {
             const message = failure.error instanceof Error
               ? failure.error.message
               : String(failure.error);
+            if (isRequestRejectedBeforeGeneration(failure.error)) {
+              rejectedThisBatch++;
+              process.stderr.write(
+                `[extract-conversation-facts] ${failure.label} rejected by provider ` +
+                `(not a page defect): ${message}\n`,
+              );
+              continue;
+            }
             process.stderr.write(
               `[extract-conversation-facts] ${failure.label} failed: ${message}\n`,
             );
+          }
+          result.pages_provider_rejected += rejectedThisBatch;
+          result.pages_failed += poolResult.errored - rejectedThisBatch;
+
+          if (breaker.tripped) {
+            result.provider_unavailable = true;
+            result.provider_error = breaker.reason ?? 'provider rejected the request';
+            process.stderr.write(
+              `[extract-conversation-facts] provider rejected ` +
+              `${PROVIDER_REJECTION_ABORT_THRESHOLD} requests in a row; ending this source ` +
+              `instead of attempting the rest of the backlog. ` +
+              `Cause: ${result.provider_error}\n`,
+            );
+            break pageLoop;
           }
 
           processedPagesCount += claimable.length;
@@ -1502,7 +1632,8 @@ export async function runExtractConversationFactsCore(
       engine,
       sourceId,
       result,
-      /* halted */ result.budget_exhausted === true,
+      /* halted */ result.budget_exhausted === true ||
+        result.provider_unavailable === true,
     );
   }
 
@@ -1807,6 +1938,7 @@ export async function runExtractConversationFacts(
     pages_marked_non_extractable: 0,
     pages_failed: 0,
     pages_budget_denied: 0,
+    pages_provider_rejected: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1816,6 +1948,7 @@ export async function runExtractConversationFacts(
   };
   let totalSpent = 0;
   let anyBudgetExhausted = false;
+  let providerUnavailable: string | null = null;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
@@ -1854,6 +1987,7 @@ export async function runExtractConversationFacts(
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
       aggregate.pages_failed += perSource.pages_failed;
       aggregate.pages_budget_denied += perSource.pages_budget_denied;
+      aggregate.pages_provider_rejected += perSource.pages_provider_rejected;
       aggregate.pages_llm_fallback += perSource.pages_llm_fallback;
       aggregate.pages_lock_skipped += perSource.pages_lock_skipped;
       aggregate.orphan_facts_cleaned += perSource.orphan_facts_cleaned;
@@ -1864,6 +1998,14 @@ export async function runExtractConversationFacts(
       if (perSource.spent_usd) totalSpent += perSource.spent_usd;
 
       progress.tick(1, `${sourceId}: ${perSource.facts_inserted} facts inserted`);
+
+      // FRA-22906: the provider refusing every request is an account-level
+      // condition, not a per-source one. Without this break the breaker just
+      // re-arms and pays its threshold again for every remaining source.
+      if (perSource.provider_unavailable) {
+        providerUnavailable = perSource.provider_error ?? 'provider rejected the request';
+        break;
+      }
     }
   } finally {
     progress.finish();
@@ -1916,6 +2058,14 @@ export async function runExtractConversationFacts(
       `Pages beyond the cap were never examined, so the counts above are a lower bound.`,
     );
   }
+  // FRA-22906: same reasoning as the cap line — "the provider refused" is a
+  // different instruction to the operator than "these pages are broken".
+  if (aggregate.pages_provider_rejected > 0) {
+    console.log(
+      `  Provider rejected ${aggregate.pages_provider_rejected} page(s) before generating ` +
+      `anything (not page defects; nothing was charged).`,
+    );
+  }
   if (aggregate.pages_llm_fallback > 0) {
     console.log(`  Parsed ${aggregate.pages_llm_fallback} page(s) with the opt-in LLM fallback.`);
   }
@@ -1928,6 +2078,15 @@ export async function runExtractConversationFacts(
   if (anyBudgetExhausted) {
     console.log(`  Budget cap reached. Re-run with a higher --max-cost-usd to continue.`);
   }
+  if (providerUnavailable) {
+    console.error(
+      `\n  STOPPED: the provider rejected ${PROVIDER_REJECTION_ABORT_THRESHOLD} requests in a row, ` +
+      `so the rest of the backlog was not attempted.\n` +
+      `  Cause: ${providerUnavailable}\n` +
+      `  This is an account/config condition (key, model, or credit balance), not a corpus ` +
+      `problem. Fix it and re-run; nothing above is a page defect.`,
+    );
+  }
 
   // v0.41.15.0 (codex #3): exit 3 when pages were skipped due to
   // lock-busy AND no hard failures fired. "Incomplete run, please
@@ -1936,6 +2095,12 @@ export async function runExtractConversationFacts(
   // above already tells the user what to do, and exit 0 is the right
   // signal for "ran to the cap intentionally."
   if (aggregate.pages_failed > 0) {
+    process.exit(1);
+  }
+  // FRA-22906: a provider outage is a hard failure of the run even though no
+  // individual page failed. Exiting 0 here would let a nightly cycle record a
+  // clean extract that never called the model once.
+  if (providerUnavailable) {
     process.exit(1);
   }
   if (aggregate.pages_lock_skipped > 0 && !anyBudgetExhausted) {

@@ -49,6 +49,7 @@ import { listSources } from '../sources-ops.ts';
 import {
   runExtractConversationFactsCore,
   ALLOWED_TYPES,
+  PROVIDER_REJECTION_ABORT_THRESHOLD,
   type AllowedType,
   type ExtractConversationFactsResult,
 } from '../../commands/extract-conversation-facts.ts';
@@ -208,6 +209,7 @@ export async function runPhaseConversationFactsBackfill(
   let skippedByBrainWideCap = 0;
   let skippedByBrainWideWalltime = 0;
   let totalSpent = 0;
+  let providerUnavailable: string | null = null;
 
   try {
     // Single withBudgetTracker scope wraps the entire loop so the
@@ -245,6 +247,14 @@ export async function runPhaseConversationFactsBackfill(
             );
             break;
           }
+          // FRA-22906: the provider is refusing every request account-wide.
+          // Continuing would re-pay the breaker's threshold per remaining
+          // source and bury the one real cause under per-source noise — this
+          // phase runs every ~600s unattended, so it repeats all night.
+          if (result.provider_unavailable) {
+            providerUnavailable = result.provider_error ?? 'provider rejected the request';
+            break;
+          }
         } catch (err) {
           if (err instanceof BudgetExhausted) {
             skippedByBrainWideCap = Math.max(
@@ -267,6 +277,7 @@ export async function runPhaseConversationFactsBackfill(
             // Budget denials break out above, so a source landing here failed
             // for its own reasons, not the cap.
             pages_budget_denied: 0,
+            pages_provider_rejected: 0,
             pages_llm_fallback: 0,
             // v0.41.15.0 (D6 + D11): new counters from the per-page lock
             // + delete-orphans-first replay safety.
@@ -325,8 +336,15 @@ export async function runPhaseConversationFactsBackfill(
   const anyError = Object.values(perSourceResults).some(
     (r) => r.error || r.pages_failed > 0,
   );
-  const status = anyError ? 'warn' : 'ok';
-  const summary = `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent`;
+  // FRA-22906: a provider outage now costs 3 pages instead of 1,548, which
+  // means it no longer shows up as a wall of `pages_failed` either. Without an
+  // explicit branch the phase would report `ok` for a run that never reached a
+  // model — the quietest possible way to lose a night of extraction.
+  const status = providerUnavailable ? 'fail' : anyError ? 'warn' : 'ok';
+  const summary = providerUnavailable
+    ? `provider unavailable — stopped after ${PROVIDER_REJECTION_ABORT_THRESHOLD} consecutive ` +
+      `rejections, backlog not attempted: ${providerUnavailable}`
+    : `${totals.facts_inserted} facts inserted across ${totals.sources_processed}/${sources.length} sources, ~$${totalSpent.toFixed(4)} spent`;
 
   return {
     phase: 'conversation_facts_backfill',
@@ -344,6 +362,7 @@ export async function runPhaseConversationFactsBackfill(
       pages_failed: totals.pages_failed,
       facts_inserted: totals.facts_inserted,
       spent_usd: totalSpent,
+      provider_unavailable: providerUnavailable ?? undefined,
       skipped_by_brain_wide_cap: skippedByBrainWideCap,
       skipped_by_brain_wide_walltime: skippedByBrainWideWalltime,
       types: cfg.types,
