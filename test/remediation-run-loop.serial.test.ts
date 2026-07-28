@@ -43,6 +43,8 @@ function makeHealth(): BrainHealth {
     embed_coverage: 1,
     stale_pages: 1,
     orphan_pages: 0,
+    // Mirrors orphan_pages: this fixture has no orphans, linkable or not.
+    linkable_orphan_pages: 0,
     missing_embeddings: 0,
     brain_score: 80,
     dead_links: 1,

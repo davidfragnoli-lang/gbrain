@@ -15,6 +15,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withEnv } from '../../helpers/with-env.ts';
 import { BudgetTracker, BudgetExhausted } from '../../../src/core/budget/budget-tracker.ts';
 import {
   readDailySpendUsd,
@@ -27,20 +28,15 @@ const MODEL = 'claude-sonnet-4-6';
 
 let tmp: string;
 let auditPath: string;
-let origEnv: string | undefined;
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-daily-cap-'));
   auditPath = join(tmp, 'budget.jsonl');
   _resetDailyLedgerCacheForTest();
-  origEnv = process.env.GBRAIN_MAX_DAILY_COST_USD;
-  delete process.env.GBRAIN_MAX_DAILY_COST_USD;
 });
 
 afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
-  if (origEnv === undefined) delete process.env.GBRAIN_MAX_DAILY_COST_USD;
-  else process.env.GBRAIN_MAX_DAILY_COST_USD = origEnv;
 });
 
 /** A `record` row shaped exactly like the ones BudgetTracker.record() writes. */
@@ -162,29 +158,37 @@ describe('readDailySpendUsd', () => {
 });
 
 describe('resolveDailyCapUsd', () => {
-  test('defaults to DEFAULT_MAX_DAILY_COST_USD when nothing is set', () => {
-    expect(resolveDailyCapUsd()).toBe(DEFAULT_MAX_DAILY_COST_USD);
+  test('defaults to DEFAULT_MAX_DAILY_COST_USD when nothing is set', async () => {
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: undefined }, () => {
+      expect(resolveDailyCapUsd()).toBe(DEFAULT_MAX_DAILY_COST_USD);
+    });
   });
 
-  test('explicit option wins over env', () => {
-    process.env.GBRAIN_MAX_DAILY_COST_USD = '250';
-    expect(resolveDailyCapUsd(30)).toBe(30);
+  test('explicit option wins over env', async () => {
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: '250' }, () => {
+      expect(resolveDailyCapUsd(30)).toBe(30);
+    });
   });
 
-  test('env overrides the default', () => {
-    process.env.GBRAIN_MAX_DAILY_COST_USD = '250';
-    expect(resolveDailyCapUsd()).toBe(250);
+  test('env overrides the default', async () => {
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: '250' }, () => {
+      expect(resolveDailyCapUsd()).toBe(250);
+    });
   });
 
-  test('0 and "off" disable the gate (deliberate, auditable escape hatch)', () => {
-    expect(resolveDailyCapUsd(0)).toBeUndefined();
-    process.env.GBRAIN_MAX_DAILY_COST_USD = 'off';
-    expect(resolveDailyCapUsd()).toBeUndefined();
+  test('0 and "off" disable the gate (deliberate, auditable escape hatch)', async () => {
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: undefined }, () => {
+      expect(resolveDailyCapUsd(0)).toBeUndefined();
+    });
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: 'off' }, () => {
+      expect(resolveDailyCapUsd()).toBeUndefined();
+    });
   });
 
-  test('a typo falls back to the default rather than running uncapped', () => {
-    process.env.GBRAIN_MAX_DAILY_COST_USD = 'ten dollars';
-    expect(resolveDailyCapUsd()).toBe(DEFAULT_MAX_DAILY_COST_USD);
+  test('a typo falls back to the default rather than running uncapped', async () => {
+    await withEnv({ GBRAIN_MAX_DAILY_COST_USD: 'ten dollars' }, () => {
+      expect(resolveDailyCapUsd()).toBe(DEFAULT_MAX_DAILY_COST_USD);
+    });
   });
 });
 
