@@ -1920,8 +1920,18 @@ export async function runExtractConversationFacts(
 
   // Chat gateway is required for non-dry-run. Recover a cold singleton before
   // reporting an availability error (#2590).
-  if (!parsed.dryRun && !isAvailable('chat')) configureGatewayIfUninitialized();
-  if (!parsed.dryRun && !isAvailable('chat')) {
+  //
+  // Gate against `--model` when the caller supplied one (FRA-22903): a run
+  // pointed at `claude-cli:*` bills a Claude subscription seat and needs no
+  // ANTHROPIC_API_KEY, but the unqualified check resolves the global
+  // `chat_model` default and demands *its* recipe's key — so an API-credit
+  // outage aborted runs that were explicitly routed away from the API. With no
+  // flag there is no engine yet to read the DB-plane `facts.extraction_model`,
+  // so this stays a best-effort fast-fail; the authoritative per-call gate is
+  // in extractFactsFromTurnWithOutcome, which sees the resolved model.
+  const preflightModel = parsed.model;
+  if (!parsed.dryRun && !isAvailable('chat', preflightModel)) configureGatewayIfUninitialized();
+  if (!parsed.dryRun && !isAvailable('chat', preflightModel)) {
     console.error('Chat gateway unavailable. Configure an Anthropic or compatible chat model, or pass --dry-run to preview segmentation.');
     process.exit(1);
   }

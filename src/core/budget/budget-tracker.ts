@@ -176,6 +176,33 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Provider id prefixes billed against a flat-rate subscription rather than
+ * metered API credit, so they price at $0 in this ledger.
+ *
+ * `claude-cli` shells out to the Claude Code binary with ANTHROPIC_API_KEY /
+ * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL scrubbed from the child env (see
+ * providers/claude-cli-language-model.ts), so the call authenticates against
+ * the operator's Claude subscription seat and draws **zero** API credit.
+ *
+ * Pre-fix, lookupPricing fell through to the `provider:model` tail lookup and
+ * priced `claude-cli:claude-sonnet-4-6` off ANTHROPIC_PRICING['claude-sonnet-4-6']
+ * at the metered $3/$15 per 1M. That charged subscription traffic to the API
+ * dollar cap — so routing work to the subscription to *save* credit would
+ * instead trip the daily ceiling (FRA-22903) and halt the run, having spent
+ * nothing. The two budgets are physically different resources; conflating them
+ * made the cheaper route look like the expensive one.
+ *
+ * $0 here means "consumes no API credit", NOT "unlimited": subscription seats
+ * carry their own rate limits, which are bounded by call/token volume, not
+ * dollars. The ledger still records the real token counts under the
+ * `claude-cli:*` model id, so subscription volume stays auditable — it is only
+ * the *dollar* cap it no longer draws against.
+ */
+const SUBSCRIPTION_FLAT_RATE_PROVIDERS: ReadonlySet<string> = new Set([
+  'claude-cli',
+]);
+
+/**
  * Look up `modelId` in the chat or embedding pricing maps. Returns a
  * per-1M-token price tuple, or null when unknown.
  *
@@ -195,6 +222,14 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
  *     not tokens); else unknown.
  */
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
+  // Subscription-billed providers draw no API credit — check before any
+  // pricing table, since the `provider:model` tail would otherwise resolve
+  // against the metered Anthropic prices. Kind-independent: the seat covers
+  // whatever the recipe routes through it.
+  const { provider: subProvider } = splitProviderModelId(modelId);
+  if (subProvider && SUBSCRIPTION_FLAT_RATE_PROVIDERS.has(subProvider)) {
+    return { input: 0, output: 0 };
+  }
   if (kind === 'embed') {
     const hit = lookupEmbeddingPrice(modelId);
     if (hit.kind === 'known') {

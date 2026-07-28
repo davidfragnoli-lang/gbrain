@@ -243,16 +243,24 @@ export async function extractFactsFromTurnWithOutcome(
   cleaned = cleaned.trim();
   if (!cleaned) return { ok: true, facts: [] };
 
-  if (!isAvailable('chat')) {
-    // No chat gateway → no extraction. Caller still inserts facts via direct
-    // `gbrain take add` paths.
-    return { ok: false, reason: 'chat_unavailable' };
-  }
-
   const cap = Math.max(1, Math.min(input.maxFactsPerTurn ?? 10, 25));
   const defaultModel = await getFactsExtractionModel(input.engine);
   const maxTokens = await getFactsExtractionMaxTokens(input.engine);
   const model = input.model ?? defaultModel;
+
+  // Gate on the model this call will ACTUALLY use, not the global chat default.
+  // Pre-fix this asked `isAvailable('chat')` with no override, which resolves
+  // `chat_model ?? anthropic:claude-sonnet-4-6` and then demands that recipe's
+  // ANTHROPIC_API_KEY. So a brain routed to `claude-cli:*` — which bills a
+  // Claude subscription seat and requires no API key at all — was refused
+  // extraction whenever the API key was absent: precisely the credit outage the
+  // subscription route exists to survive (FRA-22903). The resolution above is
+  // config-only and side-effect-free, so it is safe to run before the gate.
+  if (!isAvailable('chat', model)) {
+    // No chat gateway → no extraction. Caller still inserts facts via direct
+    // `gbrain take add` paths.
+    return { ok: false, reason: 'chat_unavailable' };
+  }
   const userContent = `<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
       ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, 5).join(', ')}.`
