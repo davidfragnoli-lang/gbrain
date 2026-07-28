@@ -1165,9 +1165,27 @@ export interface SearchOpts {
     topNOut: number | null;
     model?: string;
     timeoutMs?: number;
+    // FRA-22966 — throw RerankUnavailableError instead of degrading silently.
+    // Eval/bench paths only; see `rerankerFailClosed` for the ergonomic form.
+    failClosed?: boolean;
     // Test seam — never set in production code.
     rerankerFn?: (input: { query: string; documents: string[]; topN?: number; model?: string; signal?: AbortSignal; timeoutMs?: number }) => Promise<{ index: number; relevanceScore: number }[]>;
   };
+  /**
+   * FRA-22966 — measurement posture for the reranker, WITHOUT having to
+   * restate the whole `reranker` bundle. When true, a reranker failure throws
+   * `RerankUnavailableError` out of hybridSearch instead of silently falling
+   * back to un-reranked RRF order. Composes with mode-bundle resolution: the
+   * mode still decides `enabled`/`topNIn`/`model`, this only changes what
+   * happens when the upstream call fails.
+   *
+   * Set by the qrels correctness gate and baseline replay so a reranker
+   * outage reads as `inconclusive` rather than as a retrieval regression
+   * (un-reranked ordering collapses first_relevant_hit 0.571 → 0.143).
+   * Production search MUST NOT set this — search reliability beats reranker
+   * quality outside measurement.
+   */
+  rerankerFailClosed?: boolean;
   /**
    * v0.35.6.0 — floor-ratio gate for metadata-axis boost stages.
    * Number in [0, 1] or undefined (default = no gate). When set, each gated

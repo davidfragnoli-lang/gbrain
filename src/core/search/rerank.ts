@@ -12,6 +12,15 @@
  * the original RRF order unchanged. Search reliability beats reranker
  * quality; a flaky upstream must never break search.
  *
+ * FAIL-CLOSED opt-in (FRA-22966): measurement callers — the qrels correctness
+ * gate and baseline replay — set `opts.failClosed`. For them a silent
+ * degradation is worse than an error: un-reranked ordering drops
+ * first_relevant_hit from 0.571 to 0.143 on the validated qrels set, so a
+ * one-query reranker blip reads as a catastrophic retrieval regression. With
+ * `failClosed` the call throws `RerankUnavailableError` and the gate marks
+ * the run inconclusive instead of publishing a degraded number. Production
+ * search never sets this — the default stays fail-open.
+ *
  * Caller (hybridSearch) decides whether the reranker fires via
  * `opts.reranker?.enabled`. Mode-bundle resolution defaults this to `true`
  * for tokenmax and `false` for conservative/balanced.
@@ -33,10 +42,43 @@ export interface RerankerOpts {
   /** Per-call timeout in ms (default 5000 — propagates to gateway.rerank). */
   timeoutMs?: number;
   /**
+   * FRA-22966 — measurement posture. When true, any reranker failure (upstream
+   * error OR a malformed/empty response) throws `RerankUnavailableError`
+   * instead of silently returning the un-reranked RRF order. Set ONLY by
+   * eval/bench code paths; production search leaves it unset (fail-open).
+   */
+  failClosed?: boolean;
+  /**
    * Test seam — when set, applyReranker calls this instead of gateway.rerank.
    * Production must NEVER set this.
    */
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
+}
+
+/**
+ * Thrown by `applyReranker` only when `opts.failClosed` is set. Signals "this
+ * result set is un-measurable", NOT "search is broken" — callers should mark
+ * the run inconclusive rather than record a quality regression.
+ */
+export class RerankUnavailableError extends Error {
+  readonly reason: RerankFailureReason | 'malformed_response';
+  readonly cause?: unknown;
+
+  constructor(reason: RerankFailureReason | 'malformed_response', message: string, cause?: unknown) {
+    super(`reranker unavailable (${reason}): ${message}`);
+    this.name = 'RerankUnavailableError';
+    this.reason = reason;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Structural check — survives the module-instance duplication you get when
+ * the CLI and a test import through different specifiers. Callers use this
+ * instead of `instanceof` for that reason.
+ */
+export function isRerankUnavailableError(err: unknown): err is RerankUnavailableError {
+  return err instanceof Error && err.name === 'RerankUnavailableError';
 }
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
@@ -51,7 +93,8 @@ function hashQuery(query: string): string {
  * coming in.
  *
  * On reranker failure, logs to ~/.gbrain/audit/rerank-failures-* and
- * returns the input array unmodified. Never throws.
+ * returns the input array unmodified. Never throws — UNLESS `opts.failClosed`
+ * is set, in which case it throws `RerankUnavailableError` after logging.
  *
  * Empty input passes through immediately (no upstream call).
  */
@@ -97,11 +140,20 @@ export async function applyReranker(
     } catch {
       // Audit logging must never break search.
     }
+    if (opts.failClosed) throw new RerankUnavailableError(reason, errorSummary, err);
     return results;
   }
 
   // Defensive: if the reranker returned a malformed shape, pass through.
-  if (!Array.isArray(reranked) || reranked.length === 0) return results;
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    if (opts.failClosed) {
+      throw new RerankUnavailableError(
+        'malformed_response',
+        `expected a non-empty RerankResult[], got ${Array.isArray(reranked) ? 'an empty array' : typeof reranked}`,
+      );
+    }
+    return results;
+  }
 
   // Build the reordered head. We keep ONLY indices the reranker returned
   // (so a top_n response with fewer items than head.length naturally

@@ -30,6 +30,7 @@ import { readFileSync, existsSync } from 'fs';
 import type { BrainEngine } from '../core/engine.ts';
 import type { SearchResult } from '../core/types.ts';
 import { hybridSearch } from '../core/search/hybrid.ts';
+import { isRerankUnavailableError } from '../core/search/rerank.ts';
 
 interface ReplayOpts {
   help?: boolean;
@@ -42,6 +43,14 @@ interface ReplayOpts {
   mode?: 'conservative' | 'balanced' | 'tokenmax';
   /** v0.32.3 [CDX-13] — force the per-call limit to a constant across modes. */
   compareLimit?: number;
+  /**
+   * FRA-22966 — opt back into the production fail-OPEN reranker posture.
+   * Replay is a measurement path, so it defaults to fail-CLOSED: a reranker
+   * outage errors the row (excluded from mean_jaccard, counted in
+   * `rows_reranker_unavailable`) instead of scoring un-reranked ordering
+   * against a reranked capture and calling the difference a regression.
+   */
+  allowRerankerFailOpen?: boolean;
 }
 
 interface RowResult {
@@ -68,6 +77,11 @@ interface RowResult {
   /** True if the row threw during replay; current_slugs is empty. */
   errored?: boolean;
   error_message?: string;
+  /**
+   * FRA-22966 — the throw was a reranker outage, not a brain error. Makes the
+   * whole replay inconclusive rather than regressed.
+   */
+  reranker_unavailable?: boolean;
 }
 
 function parseArgs(args: string[]): ReplayOpts {
@@ -92,6 +106,9 @@ function parseArgs(args: string[]): ReplayOpts {
         break;
       case '--json':
         opts.json = true;
+        break;
+      case '--allow-reranker-fail-open':
+        opts.allowRerankerFailOpen = true;
         break;
       case '--verbose':
         opts.verbose = true;
@@ -262,6 +279,9 @@ async function replayRow(engine: BrainEngine, row: CapturedRow, opts: ReplayOpts
         // time so config drift between capture and replay doesn't surface
         // as "regression." NULL/undefined falls through to resolver default.
         embeddingColumn: row.embedding_column ?? undefined,
+        // FRA-22966 — measurement posture. Un-reranked ordering replayed
+        // against a reranked capture is a fake regression, not a real one.
+        rerankerFailClosed: !opts.allowRerankerFailOpen,
       });
     }
   } catch (err) {
@@ -277,6 +297,7 @@ async function replayRow(engine: BrainEngine, row: CapturedRow, opts: ReplayOpts
       latency_delta_ms: Date.now() - startedAt - row.latency_ms,
       errored: true,
       error_message: (err as Error).message ?? String(err),
+      ...(isRerankUnavailableError(err) ? { reranker_unavailable: true } : {}),
     };
   }
 
@@ -309,6 +330,12 @@ export interface ReplaySummary {
   rows_replayed: number;
   rows_skipped: number;
   rows_errored: number;
+  /**
+   * Subset of `rows_errored` whose throw was a reranker outage (FRA-22966).
+   * Non-zero means the replay is INCONCLUSIVE — the metrics below were
+   * computed over a partial, non-comparable row set.
+   */
+  rows_reranker_unavailable: number;
   /** Mean Jaccard across non-skipped, non-errored rows. */
   mean_jaccard: number;
   top1_stability_rate: number;
@@ -338,6 +365,7 @@ function summarize(results: RowResult[]): ReplaySummary {
     rows_replayed: eligible.length,
     rows_skipped: results.filter(r => r.skipped).length,
     rows_errored: results.filter(r => r.errored).length,
+    rows_reranker_unavailable: results.filter(r => r.reranker_unavailable).length,
     mean_jaccard: meanJaccard,
     top1_stability_rate: top1Rate,
     mean_latency_delta_ms: meanLatencyDelta,

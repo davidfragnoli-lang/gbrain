@@ -1591,12 +1591,19 @@ export async function hybridSearch(
   // from the resolved mode bundle (tokenmax → enabled, others → disabled).
   // The resolved mode's fields already participate in knobsHash, so cache
   // rows naturally segregate by reranker config.
-  const rerankerOpts = opts?.reranker ?? {
-    enabled: resolvedMode.reranker_enabled,
-    topNIn: resolvedMode.reranker_top_n_in,
-    topNOut: resolvedMode.reranker_top_n_out,
-    model: resolvedMode.reranker_model,
-    timeoutMs: resolvedMode.reranker_timeout_ms,
+  //
+  // FRA-22966: `rerankerFailClosed` layers on top of BOTH branches so eval
+  // callers get the measurement posture without restating the mode bundle.
+  // It only changes failure handling, never which reranker runs.
+  const rerankerOpts = {
+    ...(opts?.reranker ?? {
+      enabled: resolvedMode.reranker_enabled,
+      topNIn: resolvedMode.reranker_top_n_in,
+      topNOut: resolvedMode.reranker_top_n_out,
+      model: resolvedMode.reranker_model,
+      timeoutMs: resolvedMode.reranker_timeout_ms,
+    }),
+    ...(opts?.rerankerFailClosed ? { failClosed: true } : {}),
   };
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, rerankerOpts as any)

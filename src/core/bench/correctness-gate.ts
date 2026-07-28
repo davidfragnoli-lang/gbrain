@@ -15,10 +15,20 @@
  * etc.) flips verdict to `fail` with a per-query breach naming the
  * exception. The lenient alternative — drop the failing query from the
  * aggregate — would silently inflate scores by hiding hard queries.
+ *
+ * Reranker posture (FRA-22966): the gate searches FAIL-CLOSED. Production
+ * search falls back to un-reranked RRF order when the cross-encoder call
+ * errors, which on this qrels set drops first_relevant_hit 0.571 → 0.143 and
+ * mean_recall 0.500 → 0.286 — a blip in an optional network call would read
+ * as a catastrophic regression, and could get frozen into a published
+ * baseline. Here those queries throw and are counted separately
+ * (`queries_reranker_unavailable`) so the caller can report the run
+ * INCONCLUSIVE instead of scoring it.
  */
 
 import type { BrainEngine } from '../engine.ts';
 import { hybridSearch } from '../search/hybrid.ts';
+import { isRerankUnavailableError } from '../search/rerank.ts';
 import {
   computeExpectedTop1Hit,
   computeFirstRelevantHit,
@@ -38,6 +48,13 @@ export interface CorrectnessGateOpts {
    * a real brain.
    */
   searchFn?: (engine: BrainEngine, query: string, opts: { limit: number }) => Promise<Array<{ source_id?: string; slug: string }>>;
+  /**
+   * FRA-22966 — escape hatch for the fail-closed reranker posture. Default
+   * (undefined/false) keeps the gate fail-CLOSED. Set true only to reproduce
+   * the pre-fix behavior; the resulting numbers are not baseline-worthy.
+   * Ignored when a custom `searchFn` is supplied.
+   */
+  allowRerankerFailOpen?: boolean;
 }
 
 export interface PerQueryResult {
@@ -50,6 +67,11 @@ export interface PerQueryResult {
   /** When the query throws, recorded as a per-query failure. */
   errored?: true;
   error_message?: string;
+  /**
+   * FRA-22966 — set when the throw was a reranker outage rather than a brain
+   * error. These make the run un-measurable (inconclusive), not failed.
+   */
+  reranker_unavailable?: true;
 }
 
 export interface CorrectnessSummary {
@@ -57,6 +79,12 @@ export interface CorrectnessSummary {
   queries_total: number;
   queries_run: number; // queries_total - queries_errored
   queries_errored: number;
+  /**
+   * Subset of `queries_errored` whose throw was a reranker outage
+   * (FRA-22966). Non-zero means the run is INCONCLUSIVE — the aggregates
+   * below are computed over a partial, non-comparable query set.
+   */
+  queries_reranker_unavailable: number;
   mean_recall_at_k: number;
   first_relevant_hit_rate: number;
   /** Denominator = queries with expected_top1 SET (not total queries). */
@@ -93,6 +121,7 @@ async function runOneQuery(
       retrieved_count: 0,
       errored: true,
       error_message: (err as Error).message,
+      ...(isRerankUnavailableError(err) ? { reranker_unavailable: true as const } : {}),
     };
   }
 
@@ -132,7 +161,11 @@ export async function runCorrectnessGate(
   }
   const k = opts.k ?? DEFAULT_QRELS_THRESHOLDS.k;
   const searchFn = opts.searchFn ?? (async (e, q, o) => {
-    const results = await hybridSearch(e, q, { limit: o.limit });
+    const results = await hybridSearch(e, q, {
+      limit: o.limit,
+      // FRA-22966 — measurement posture, not production posture.
+      rerankerFailClosed: !opts.allowRerankerFailOpen,
+    });
     return results.map(r => ({ source_id: r.source_id, slug: r.slug }));
   });
 
@@ -163,6 +196,7 @@ export async function runCorrectnessGate(
       queries_total: perQuery.length,
       queries_run: run,
       queries_errored: errored,
+      queries_reranker_unavailable: perQuery.filter(p => p.reranker_unavailable).length,
       mean_recall_at_k: meanRecall,
       first_relevant_hit_rate: firstRelevantRate,
       expected_top1_hit_rate: expectedTop1Rate,

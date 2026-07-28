@@ -25,7 +25,17 @@
  * The earlier formula (`delta / baseline <= multiplier`) would let a 2.5x
  * slowdown pass at multiplier=2.0.
  *
- * Exit codes: 0 PASS, 1 FAIL (regression OR throw), 2 USAGE.
+ * Reranker posture (FRA-22966): both gates search FAIL-CLOSED. A reranker
+ * outage degrades ordering enough to look like a catastrophic regression
+ * (first_relevant_hit 0.571 → 0.143 on the validated qrels set), so instead
+ * of scoring those queries the gate reports verdict `inconclusive`. That is
+ * still a non-zero exit — a run whose reranker was down never gates anything
+ * green — but it is distinguishable from a real quality drop, and it must
+ * never be published as a baseline. `--allow-reranker-fail-open` restores the
+ * pre-fix behavior for debugging.
+ *
+ * Exit codes: 0 PASS, 1 FAIL or INCONCLUSIVE (regression, throw, or reranker
+ * outage), 2 USAGE.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -55,6 +65,7 @@ interface GateOpts {
   thresholdRecallAtK?: number;
   thresholdFirstRelevantHit?: number;
   thresholdExpectedTop1?: number;
+  allowRerankerFailOpen?: boolean;
 }
 
 interface Breach {
@@ -67,7 +78,13 @@ interface Breach {
 
 interface GateResult {
   schema_version: 1;
-  verdict: 'pass' | 'fail';
+  /**
+   * `inconclusive` (FRA-22966) = the reranker was unavailable for at least one
+   * query, so the numbers below describe a degraded retrieval stack rather
+   * than the brain. Exits non-zero like `fail`, but must not be treated as a
+   * regression signal or published as a baseline.
+   */
+  verdict: 'pass' | 'fail' | 'inconclusive';
   regression_gate: {
     ran: boolean;
     baseline_path?: string;
@@ -109,6 +126,9 @@ function parseArgs(args: string[]): GateOpts {
         break;
       case '--json':
         opts.json = true;
+        break;
+      case '--allow-reranker-fail-open':
+        opts.allowRerankerFailOpen = true;
         break;
       case '-k':
       case '--k':
@@ -169,25 +189,62 @@ Thresholds (override baseline metadata; CLI > embedded > defaults):
   --threshold-expected-top1 FLOAT    Correctness: expected_top1-hit-rate floor (default ${DEFAULT_QRELS_THRESHOLDS.expected_top1})
   -k, --k N                          Top-K for recall@K (default ${DEFAULT_QRELS_THRESHOLDS.k})
 
+Reranker posture:
+  --allow-reranker-fail-open   Score queries even when the cross-encoder call
+                               fails (pre-FRA-22966 behavior). Default is
+                               fail-CLOSED: a reranker outage makes the run
+                               INCONCLUSIVE instead of a fake regression.
+                               Numbers from a fail-open run are NOT
+                               baseline-worthy.
+
 Output:
   --json                       Print JSON envelope to stdout
   -h, --help                   Show this help
 
 Exit codes:
   0   All requested gates passed
-  1   At least one breach (regression or correctness) OR in-process throw
+  1   At least one breach (regression or correctness), in-process throw, OR an
+      inconclusive run (reranker unavailable)
   2   Usage error (no flags, file missing, malformed JSON)
 `);
 }
+
+/** Breach metric that downgrades the verdict to `inconclusive` (FRA-22966). */
+const RERANKER_UNAVAILABLE_METRIC = 'reranker_unavailable';
 
 function isFinitePos(n: number): boolean {
   return Number.isFinite(n) && n > 0;
 }
 
+/** True when any breach in the list is a reranker outage. */
+function hasRerankerOutage(breaches: Breach[] | undefined): boolean {
+  return (breaches ?? []).some(b => b.metric === RERANKER_UNAVAILABLE_METRIC);
+}
+
+/**
+ * Headline verdict from both gates' breach lists (FRA-22966).
+ *
+ * A reranker outage outranks every other verdict: the surviving queries were
+ * measured over a shrunken, non-comparable denominator, so neither `pass` nor
+ * `fail` is a claim we can make. Co-occurring breaches stay in the envelope —
+ * only the headline changes — and `inconclusive` still exits non-zero, so a
+ * degraded run can never gate anything green.
+ */
+export function resolveVerdict(
+  regressionBreaches: Breach[] | undefined,
+  correctnessBreaches: Breach[] | undefined,
+): GateResult['verdict'] {
+  if (hasRerankerOutage(regressionBreaches) || hasRerankerOutage(correctnessBreaches)) {
+    return 'inconclusive';
+  }
+  const anyBreach = (regressionBreaches?.length ?? 0) > 0 || (correctnessBreaches?.length ?? 0) > 0;
+  return anyBreach ? 'fail' : 'pass';
+}
+
 function runRegressionGate(
   engine: BrainEngine,
   baselinePath: string,
-  cliOverrides: Pick<GateOpts, 'thresholdJaccard' | 'thresholdTop1' | 'thresholdLatencyMultiplier'>,
+  cliOverrides: Pick<GateOpts, 'thresholdJaccard' | 'thresholdTop1' | 'thresholdLatencyMultiplier' | 'allowRerankerFailOpen'>,
 ): Promise<GateResult['regression_gate']> {
   return (async () => {
     let baselineFile: BaselineFile;
@@ -217,7 +274,10 @@ function runRegressionGate(
 
     let summary: ReplaySummary;
     try {
-      const out = await replayCore(engine, { against: baselinePath });
+      const out = await replayCore(engine, {
+        against: baselinePath,
+        allowRerankerFailOpen: cliOverrides.allowRerankerFailOpen,
+      });
       summary = out.summary;
     } catch (err) {
       // D3 fail-closed on in-process throw (codex round-2 #7).
@@ -234,6 +294,17 @@ function runRegressionGate(
     }
 
     const breaches: Breach[] = [];
+    // FRA-22966 — replayed rows whose reranker call failed are excluded from
+    // mean_jaccard, so the metrics below describe a partial row set. Flag it
+    // before the threshold comparisons so the verdict reads `inconclusive`.
+    if (summary.rows_reranker_unavailable > 0) {
+      breaches.push({
+        metric: RERANKER_UNAVAILABLE_METRIC,
+        observed: summary.rows_reranker_unavailable,
+        threshold: 0,
+        reason: 'reranker_unavailable_run_not_measurable',
+      });
+    }
     if (summary.mean_jaccard < thresholds.jaccard) {
       breaches.push({
         metric: 'mean_jaccard',
@@ -285,7 +356,7 @@ function runCorrectnessGateDispatch(
   engine: BrainEngine,
   qrelsPath: string,
   k: number,
-  cliOverrides: Pick<GateOpts, 'thresholdRecallAtK' | 'thresholdFirstRelevantHit' | 'thresholdExpectedTop1'>,
+  cliOverrides: Pick<GateOpts, 'thresholdRecallAtK' | 'thresholdFirstRelevantHit' | 'thresholdExpectedTop1' | 'allowRerankerFailOpen'>,
 ): Promise<GateResult['correctness_gate']> {
   return (async () => {
     let qrelsFile: QrelsFile;
@@ -312,7 +383,10 @@ function runCorrectnessGateDispatch(
 
     let result: CorrectnessResult;
     try {
-      result = await runCorrectnessGate(engine, qrelsFile, { k });
+      result = await runCorrectnessGate(engine, qrelsFile, {
+        k,
+        allowRerankerFailOpen: cliOverrides.allowRerankerFailOpen,
+      });
     } catch (err) {
       return {
         ran: true,
@@ -327,15 +401,29 @@ function runCorrectnessGateDispatch(
     }
 
     const breaches: Breach[] = [];
-    if (result.summary.queries_errored > 0) {
+    // FRA-22966: reranker outages are reported on their own metric so the
+    // caller can tell "un-measurable" apart from "the brain got worse". They
+    // are still breaches — the run never passes — but they set verdict
+    // `inconclusive`.
+    if (result.summary.queries_reranker_unavailable > 0) {
+      const downQueries = result.per_query.filter(p => p.reranker_unavailable).slice(0, 5);
+      breaches.push({
+        metric: RERANKER_UNAVAILABLE_METRIC,
+        observed: result.summary.queries_reranker_unavailable,
+        threshold: 0,
+        reason: 'reranker_unavailable_run_not_measurable',
+        error_tail: downQueries.map(p => `${p.query_id}: ${p.error_message}`).join(' | '),
+      });
+    }
+    const otherErrored = result.per_query.filter(p => p.errored && !p.reranker_unavailable);
+    if (otherErrored.length > 0) {
       // Per-query throws are gate failures (Finding 2D).
-      const erroredQueries = result.per_query.filter(p => p.errored).slice(0, 5);
       breaches.push({
         metric: 'queries_errored',
-        observed: result.summary.queries_errored,
+        observed: otherErrored.length,
         threshold: 0,
         reason: 'one_or_more_qrels_queries_threw',
-        error_tail: erroredQueries.map(p => `${p.query_id}: ${p.error_message}`).join(' | '),
+        error_tail: otherErrored.slice(0, 5).map(p => `${p.query_id}: ${p.error_message}`).join(' | '),
       });
     }
     if (result.summary.mean_recall_at_k < thresholds.recall_at_k) {
@@ -373,8 +461,17 @@ function runCorrectnessGateDispatch(
 }
 
 function printHumanOutput(result: GateResult): void {
-  const overall = result.verdict === 'pass' ? '✅ PASS' : '❌ FAIL';
+  const overall = result.verdict === 'pass'
+    ? '✅ PASS'
+    : result.verdict === 'inconclusive'
+      ? '⚠️  INCONCLUSIVE'
+      : '❌ FAIL';
   console.log(`Verdict: ${overall}`);
+  if (result.verdict === 'inconclusive') {
+    console.log('  The cross-encoder reranker was unavailable for one or more queries.');
+    console.log('  This is NOT a retrieval regression, and these numbers must NOT be');
+    console.log('  published as a baseline. Re-run once the reranker provider is healthy.');
+  }
   console.log('');
 
   if (result.regression_gate.ran) {
@@ -406,7 +503,10 @@ function printHumanOutput(result: GateResult): void {
     console.log('Correctness gate (--qrels)');
     const c = result.correctness_gate;
     if (c.summary) {
-      console.log(`  queries_run:           ${c.summary.queries_run}/${c.summary.queries_total} (${c.summary.queries_errored} errored)`);
+      const rerankerNote = c.summary.queries_reranker_unavailable > 0
+        ? `, ${c.summary.queries_reranker_unavailable} reranker-unavailable`
+        : '';
+      console.log(`  queries_run:           ${c.summary.queries_run}/${c.summary.queries_total} (${c.summary.queries_errored} errored${rerankerNote})`);
       console.log(`  mean_recall@${c.summary.k}:        ${c.summary.mean_recall_at_k.toFixed(3)} (floor ${c.thresholds?.recall_at_k ?? '?'})`);
       console.log(`  first_relevant_hit:    ${(c.summary.first_relevant_hit_rate * 100).toFixed(1)}% (floor ${(((c.thresholds?.first_relevant_hit ?? 0)) * 100).toFixed(0)}%)`);
       if (c.summary.expected_top1_denominator > 0) {
@@ -460,10 +560,8 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
       thresholdJaccard: opts.thresholdJaccard,
       thresholdTop1: opts.thresholdTop1,
       thresholdLatencyMultiplier: opts.thresholdLatencyMultiplier,
+      allowRerankerFailOpen: opts.allowRerankerFailOpen,
     });
-    if (result.regression_gate.breaches && result.regression_gate.breaches.length > 0) {
-      result.verdict = 'fail';
-    }
   }
 
   if (opts.qrels) {
@@ -472,11 +570,14 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
       thresholdRecallAtK: opts.thresholdRecallAtK,
       thresholdFirstRelevantHit: opts.thresholdFirstRelevantHit,
       thresholdExpectedTop1: opts.thresholdExpectedTop1,
+      allowRerankerFailOpen: opts.allowRerankerFailOpen,
     });
-    if (result.correctness_gate.breaches && result.correctness_gate.breaches.length > 0) {
-      result.verdict = 'fail';
-    }
   }
+
+  result.verdict = resolveVerdict(
+    result.regression_gate.breaches,
+    result.correctness_gate.breaches,
+  );
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -484,7 +585,9 @@ export async function runEvalGate(engine: BrainEngine, args: string[]): Promise<
     printHumanOutput(result);
   }
 
-  if (result.verdict === 'fail') process.exit(1);
+  // `inconclusive` exits non-zero too — a run whose reranker was down must
+  // never gate anything green (FRA-22966).
+  if (result.verdict !== 'pass') process.exit(1);
 }
 
 // Exported for tests + e2e LOOP test
