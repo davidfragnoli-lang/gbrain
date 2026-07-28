@@ -1,4 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
+import { REPAIR_SOURCE_CONFIG_SQL } from '../core/source-config-sql.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -40,7 +41,7 @@ import {
   buildBasenameIndex,
   queryBasenameIndex,
 } from '../core/link-extraction.ts';
-import { isSourceUnchangedSinceSync } from '../core/git-head.ts';
+import { probeSourceGitState } from '../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
 import { lagFromContentMs } from '../core/source-health.ts';
@@ -53,6 +54,8 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { unverifiedExtractionFragment } from '../core/extraction-review.ts';
+import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 
 export interface Check {
   name: string;
@@ -616,10 +619,8 @@ export async function checkSourceConfigShape(engine: BrainEngine): Promise<Check
         `${rows.length} source(s) have a non-object config — a JSON string/scalar ` +
         `instead of an object (the #2829 re-wrapping bug): ${affected}. ` +
         `Federation and ACL settings on these sources won't be read correctly. ` +
-        `Repair by running any 'gbrain sources' config write (self-heals up to 10 ` +
-        `nested layers), or in SQL: ` +
-        `UPDATE sources SET config = (config #>> '{}')::jsonb ` +
-        `WHERE jsonb_typeof(config) <> 'object';`,
+        `Repair by running any 'gbrain sources' config write (self-heals nested ` +
+        `strings and recoverable arrays), or in SQL: ${REPAIR_SOURCE_CONFIG_SQL}`,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -879,8 +880,8 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   checks.push(await checkEmbeddingEnvOverride(engine));
 
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
-  // The subagent loop is Anthropic-only. If models.tier.subagent or
-  // models.default is explicitly set to a non-Anthropic provider, warn here
+  // The subagent loop requires native tool-calling. If models.subagent,
+  // models.tier.subagent, or models.default resolves to a limited provider, warn here
   // so the user sees it at the next `gbrain doctor` run instead of at the
   // next subagent job submission. (Layers 1+2 also enforce — this is the
   // surfacing layer.)
@@ -3065,6 +3066,7 @@ async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
 export async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
     const { classifyCapabilities } = await import('../core/ai/capabilities.ts');
+    const modelsSubagent = await engine.getConfig('models.subagent');
     const tierSubagent = await engine.getConfig('models.tier.subagent');
     const modelsDefault = await engine.getConfig('models.default');
 
@@ -3105,11 +3107,22 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
       return null;
     };
 
-    if (tierSubagent) {
-      const issue = explain(tierSubagent, 'models.tier.subagent');
+    let resolvedSource: string | null = null;
+    let resolvedModel: string | null = null;
+    if (modelsSubagent) {
+      resolvedSource = 'models.subagent';
+      resolvedModel = modelsSubagent;
+      const issue = explain(modelsSubagent, resolvedSource);
       if (issue) return issue;
     } else if (modelsDefault) {
+      resolvedSource = 'models.default';
+      resolvedModel = modelsDefault;
       const issue = explain(modelsDefault, 'models.default');
+      if (issue) return issue;
+    } else if (tierSubagent) {
+      resolvedSource = 'models.tier.subagent';
+      resolvedModel = tierSubagent;
+      const issue = explain(tierSubagent, resolvedSource);
       if (issue) return issue;
     }
     // v0.37 (T10 / D7) + v0.38 (D7 capability rename): warn when the configured
@@ -3123,9 +3136,9 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
       const { loadConfig } = await import('../core/config.ts');
       const cfg = loadConfig();
       const chatModel = cfg?.chat_model;
+      const { isConfigTruthy } = await import('../core/config.ts');
       const gatewayLoopRaw = await engine.getConfig('agent.use_gateway_loop').catch(() => null);
-      const gatewayLoopEnabled = typeof gatewayLoopRaw === 'string'
-        && ['true', '1', 'yes', 'on'].includes(gatewayLoopRaw.trim().toLowerCase());
+      const gatewayLoopEnabled = isConfigTruthy(gatewayLoopRaw);
       const { isAnthropicProvider } = await import('../core/model-config.ts');
       if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY && !gatewayLoopEnabled) {
         return {
@@ -3143,8 +3156,8 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
     return {
       name: 'subagent_capability',
       status: 'ok',
-      message: tierSubagent
-        ? `Subagent tier resolves to "${tierSubagent}" with full tool-loop capability`
+      message: resolvedModel && resolvedSource
+        ? `Subagent model resolves via ${resolvedSource} to "${resolvedModel}" with full tool-loop capability`
         : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
     };
   } catch (e) {
@@ -3626,6 +3639,52 @@ export async function checkLinksExtractionLag(
 }
 
 /**
+ * issue #160 — unverified_extractions doctor check.
+ *
+ * The extraction quarantine lane parks auto-extracted entity stubs
+ * (frontmatter `provenance: 'auto-extracted'` + `status: 'unverified'`)
+ * until the owner promotes or rejects them. A queue nobody reviews decays
+ * into invisible clutter, so this check counts stubs older than N days
+ * (default 7) and nudges toward the review surface. Exported for direct
+ * testing (mirrors checkLinksExtractionLag).
+ */
+export async function checkUnverifiedExtractions(
+  engine: BrainEngine,
+  opts?: { sourceId?: string; days?: number },
+): Promise<Check> {
+  const name = 'unverified_extractions';
+  const days = opts?.days ?? 7;
+  const sourceId = opts?.sourceId;
+  try {
+    const params: unknown[] = [String(days)];
+    let srcClause = '';
+    if (sourceId) {
+      params.push(sourceId);
+      srcClause = 'AND p.source_id = $2';
+    }
+    const rows = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*)::int AS n FROM pages p
+       WHERE p.deleted_at IS NULL
+         AND ${unverifiedExtractionFragment('p')}
+         AND p.created_at < now() - ($1 || ' days')::interval
+         ${srcClause}`,
+      params,
+    );
+    const n = Number(rows[0]?.n ?? 0);
+    return {
+      name,
+      status: n > 0 ? 'warn' : 'ok',
+      message: n > 0
+        ? `${n} unverified auto-extracted entity stub(s) older than ${days} days awaiting review. List with 'gbrain extraction-pending'; promote/reject with 'gbrain extraction-review <promote|reject> --slugs <slug,...>'.`
+        : 'No stale unverified extraction stubs',
+      details: { count: n, days, source_id: sourceId ?? null },
+    };
+  } catch (e) {
+    return { name, status: 'warn', message: `Could not check unverified_extractions: ${(e as Error).message}` };
+  }
+}
+
+/**
  * issue #1678 — extract_atoms_backlog doctor check.
  *
  * Closes the "silent backlog" gap: extract_atoms is pack-gated, so on a brain
@@ -4020,29 +4079,51 @@ export async function checkSyncFreshness(
       // All four must hold; otherwise fall through to the time-based check.
       // The chunker version match is computed here (not in the helper)
       // because it depends on engine state, not git state.
+      //
+      // Clone-unavailable fallback: on stateless deploys (Docker on EB /
+      // K8s / Fly — the platforms the cloud recipes produce), a container
+      // restart wipes `local_path` and each clone is only re-materialized
+      // when that source's next sync job runs. Until then the HEAD probe
+      // cannot run at all ('unavailable'), which previously fell through to
+      // raw wall-clock age — and since a no-op sync doesn't advance
+      // `last_sync_at`, every QUIET source read as stale/FAIL after a
+      // restart (score-sinking alert storm; observed live: 16-source brain,
+      // 12 clones gone after a config-update restart, doctor 70→30).
+      // 'unavailable' + chunker match now reuses the v0.41.32.0 REMOTE lag
+      // signal (newest_content_at) below — DB-only, no subprocess, and it
+      // still reports staleness whenever content really is newer than the
+      // last sync. 'changed' (readable clone with real work) keeps
+      // wall-clock exactly as before, and a chunker mismatch is never
+      // masked (D7): it disables the fallback too.
+      let cloneUnavailable = false;
       if (localOnly) {
-        const gitUnchanged = isSourceUnchangedSinceSync(
+        const gitState = probeSourceGitState(
           source.local_path,
           source.last_commit,
           { requireCleanWorkingTree: 'ignore-untracked' },
         );
         const chunkerMatch = source.chunker_version === currentChunkerVersion;
-        if (gitUnchanged && chunkerMatch) {
+        if (gitState === 'unchanged' && chunkerMatch) {
           unchanged_count++;
           continue;
         }
+        cloneUnavailable = gitState === 'unavailable' && chunkerMatch;
       }
 
       // v0.41.32.0: REMOTE path (doctorReportRemote, !localOnly) computes lag
       // from the stored newest_content_at column — NO git subprocess on a
       // DB-supplied local_path (preserves the v0.41.27.0 trust boundary). A
       // quiet repo whose newest commit predates its last sync reports 0; NULL
-      // column → wall-clock fallback. LOCAL fall-through keeps wall-clock: the
-      // short-circuit already failed, so the source genuinely has work and
-      // "hours since last sync" is the right staleness measure. The `ageMs < 0`
-      // skew check above still runs on raw wall-clock for both paths (A1).
+      // column → wall-clock fallback. LOCAL fall-through keeps wall-clock when
+      // the clone is READABLE: the short-circuit failed on real evidence
+      // (HEAD moved / dirty tree), so the source genuinely has work and
+      // "hours since last sync" is the right staleness measure. A local clone
+      // that is UNAVAILABLE (not yet re-materialized, see above) carries no
+      // evidence either way, so it borrows this same DB-only lag. The
+      // `ageMs < 0` skew check above still runs on raw wall-clock for both
+      // paths (A1).
       let thresholdAgeMs = ageMs;
-      if (!localOnly) {
+      if (!localOnly || cloneUnavailable) {
         const contentMs = source.newest_content_at
           ? new Date(source.newest_content_at).getTime()
           : null;
@@ -4660,11 +4741,10 @@ export async function buildChecks(
   const checks: Check[] = [];
   let autoFixReport: AutoFixReport | null = null;
 
-  // Progress reporter. `--json` is doctor's own JSON output (list of checks);
-  // progress events stay on stderr regardless, gated by the global --quiet /
-  // --progress-json flags. On a 52K-page brain the DB checks can take minutes,
-  // and without a heartbeat agents can't tell doctor from a hang.
-  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  // Progress reporter. `--json` is doctor's machine-readable output, so plain
+  // progress must not leak to stderr unless the caller explicitly asks for
+  // structured progress with --progress-json.
+  const progress = createProgress(doctorProgressOptions(jsonOutput));
 
   // --- Filesystem checks (always run, no DB needed) ---
 
@@ -5935,7 +6015,7 @@ export async function buildChecks(
     // that doesn't match the gateway's resolved default. Empty-brain vs
     // non-empty-brain branching determines the repair hint:
     //   - empty brain (no embedded chunks) → `gbrain init --force --embedding-model …`
-    //   - non-empty brain → `gbrain retrieval-upgrade --to … --reindex`
+    //   - non-empty brain → `gbrain migrate embeddings --to … --dim …` (#3390)
     // The bug-reporter's `rm -rf ~/.gbrain` recovery is never the right answer.
     let surfacedUnconfiguredDrift = false;
     try {
@@ -5966,7 +6046,7 @@ export async function buildChecks(
           if (totalChunks > 0) {
             const fix = embeddedCount === 0
               ? `No embeddings yet — drop the empty schema and re-init at the right dim:\n        gbrain init --force --pglite --embedding-model ${configuredModel} --embedding-dimensions ${configuredDims}`
-              : `Non-empty brain (${embeddedCount} embedded chunks). Migrate cleanly:\n        gbrain retrieval-upgrade --to ${configuredModel} --reindex`;
+              : `Non-empty brain (${embeddedCount} embedded chunks). Migrate cleanly:\n        gbrain migrate embeddings --to ${configuredModel} --dim ${configuredDims}`;
 
             checks.push({
               name: 'embedding_provider',
@@ -6170,6 +6250,12 @@ export async function buildChecks(
           continue;
         }
         if (engine.kind === 'postgres' && haveIndex.get(colName) === false) {
+          if (!hnswIndexExpected(entry.type, entry.dimensions)) {
+            okColumns.push(
+              `${colName} (exact scan: ${entry.type}(${entry.dimensions}) exceeds HNSW cap ${hnswMaxDimsForType(entry.type)})`,
+            );
+            continue;
+          }
           issues.push(
             `${colName}: no HNSW index. Search works but uses sequential scan. ` +
               `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${colName} ON content_chunks USING hnsw (${quoteIdentifier(colName)} ${entry.type}_cosine_ops);`,
@@ -6896,6 +6982,10 @@ export async function buildChecks(
     const msg = err instanceof Error ? err.message : String(err);
     checks.push({ name: 'flagged_pages', status: 'ok', message: `Skipped (${msg})` });
   }
+
+  // issue #160: extraction quarantine lane review nudge.
+  progress.heartbeat('unverified_extractions');
+  checks.push(await checkUnverifiedExtractions(engine, { sourceId: orphanRatioSourceId }));
 
   // 11a. Frontmatter integrity (v0.22.4, hardened in v0.38.2.0).
   // scanBrainSources walks every registered source's local_path on disk
@@ -7692,6 +7782,14 @@ export async function runDoctor(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+export function doctorProgressOptions(jsonOutput: boolean) {
+  const cliOpts = getCliOptions();
+  if (jsonOutput && !cliOpts.quiet && !cliOpts.progressJson) {
+    return { mode: 'quiet' as const };
+  }
+  return cliOptsToProgressOptions(cliOpts);
+}
 
 /** Print the auto-fix report in human-readable form. JSON output goes through
  *  outputResults alongside the check list; this is the pretty-print path. */
