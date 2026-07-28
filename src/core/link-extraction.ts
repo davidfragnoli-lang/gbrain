@@ -1235,6 +1235,24 @@ const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[|\-–—]+\s*
 // 年/月 markers so plain ASCII `- 2020-01-02 - text` does NOT match — non-bold
 // ASCII dates were never timeline entries and must stay that way.
 const TIMELINE_LINE_RE_CN = /^\s*-?\s*(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*[|\-–—]+\s*(.+?)\s*$/;
+// Non-bold bullet: `- YYYY-MM-DD — summary`. This is the shape curated entity
+// pages actually use under their `## Timeline` heading, and requiring the bold
+// markers above made every one of them invisible (measured on a real brain:
+// 639 entries across 121 of 216 entity pages, i.e. timeline_coverage 65% vs a
+// true 90%).
+//
+// Deliberately gated on being INSIDE a Timeline section (see the
+// `inTimelineSection` pass in parseTimelineEntries) rather than relaxing
+// TIMELINE_LINE_RE. That preserves the invariant the CN pattern documents
+// above — a plain `- 2020-01-02 - text` bullet in ordinary prose is not an
+// event — while still reading the dates a Timeline section exists to declare.
+// A leading bullet marker is required so prose sentences opening with a date
+// cannot match.
+const TIMELINE_LINE_RE_PLAIN = /^\s*[-*]\s+(\d{4}-\d{2}-\d{2})\s*[|\-–—]+\s*(.+?)\s*$/;
+// A markdown heading whose text mentions "timeline" opens a timeline section;
+// any other heading closes it. Matches `## Timeline`, `## Timeline / evidence`,
+// `### Timeline (verified)`, etc.
+const TIMELINE_HEADING_RE = /^#{1,6}\s*(.*)$/;
 
 /**
  * Parse timeline entries from content. Looks at:
@@ -1249,9 +1267,23 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   const result: TimelineCandidate[] = [];
   const lines = content.split('\n');
 
+  // Per-line: is this line under a "Timeline" heading? Non-bold ASCII date
+  // bullets only count as entries there (see TIMELINE_LINE_RE_PLAIN).
+  const inTimelineSection: boolean[] = new Array(lines.length).fill(false);
+  let sectionOpen = false;
+  for (let k = 0; k < lines.length; k++) {
+    const h = TIMELINE_HEADING_RE.exec(lines[k]);
+    if (h) {
+      sectionOpen = /timeline/i.test(h[1]);
+      continue; // the heading line itself is never an entry
+    }
+    inTimelineSection[k] = sectionOpen;
+  }
+
   let i = 0;
   while (i < lines.length) {
-    // Try English format first, then Chinese
+    // Try English format first, then Chinese, then the non-bold bullet form
+    // (Timeline sections only).
     const m = TIMELINE_LINE_RE.exec(lines[i]);
     let date: string;
     let summary: string;
@@ -1260,10 +1292,16 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
       summary = m[2].trim();
     } else {
       const cm = TIMELINE_LINE_RE_CN.exec(lines[i]);
-      if (!cm) { i++; continue; }
-      // Normalize Chinese date to YYYY-MM-DD
-      date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
-      summary = cm[4].trim();
+      if (cm) {
+        // Normalize Chinese date to YYYY-MM-DD
+        date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
+        summary = cm[4].trim();
+      } else {
+        const pm = inTimelineSection[i] ? TIMELINE_LINE_RE_PLAIN.exec(lines[i]) : null;
+        if (!pm) { i++; continue; }
+        date = pm[1];
+        summary = pm[2].trim();
+      }
     }
     if (!isValidDate(date) || summary.length === 0) { i++; continue; }
     // Collect optional detail lines (indented, until next date or heading).
@@ -1272,6 +1310,8 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     while (j < lines.length) {
       const next = lines[j];
       if (TIMELINE_LINE_RE.test(next)) break;
+      // An indented plain date bullet is the NEXT entry, not this one's detail.
+      if (inTimelineSection[j] && TIMELINE_LINE_RE_PLAIN.test(next)) break;
       if (/^#{1,6}\s/.test(next)) break;
       if (next.trim().length === 0 && detailLines.length === 0) {
         // skip leading blank line; if we hit a blank after detail content
@@ -1300,8 +1340,12 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   // Format 3 (the fs-source path). Lines already captured by the timeline
   // bullet pass are skipped (a bullet often carries its own citation).
   const citationRe = /\[Source:\s*([^\]]+?),\s*(\d{4}-\d{2}-\d{2})\s*\]/g;
-  for (const line of lines) {
+  for (let k = 0; k < lines.length; k++) {
+    const line = lines[k];
     if (TIMELINE_LINE_RE.test(line)) continue;
+    // Same skip for plain bullets now captured by the pass above, so a
+    // Timeline bullet carrying its own [Source: ...] is not filed twice.
+    if (inTimelineSection[k] && TIMELINE_LINE_RE_PLAIN.test(line)) continue;
     const matches = [...line.matchAll(citationRe)];
     if (matches.length === 0) continue;
     const summary = line
