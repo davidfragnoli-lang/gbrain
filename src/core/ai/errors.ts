@@ -69,3 +69,35 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
   // Everything else (5xx, timeouts, network) = transient
   return new AITransientError(`${ctxPrefix}${msg}`, err);
 }
+
+/**
+ * FRA-22903: did the provider reject this request BEFORE generating any
+ * output?
+ *
+ * A 4xx other than 429 is a request-level rejection — bad key, bad model,
+ * malformed request, or an exhausted credit balance (Anthropic returns HTTP
+ * 400 `invalid_request_error` for that). The provider never ran the model, so
+ * there are no output tokens and no charge.
+ *
+ * Excluded on purpose: 429 (rate limit) and 5xx/timeout/network can abort a
+ * request that already started streaming, so output may genuinely have been
+ * generated and billed. Those keep the pessimistic ceiling.
+ *
+ * Why it matters: charging a rejected request the full `maxOutputTokens`
+ * ceiling let 78 instant failures exhaust a $5 cap in 26 seconds, and inflated
+ * the 2026-07-27 ledger by $64.80 of spend that never reached the provider.
+ */
+export function isRequestRejectedBeforeGeneration(err: unknown): boolean {
+  if (err && typeof err === 'object') {
+    const anyErr = err as { status?: number; statusCode?: number; cause?: unknown };
+    const status = anyErr.status ?? anyErr.statusCode;
+    if (typeof status === 'number') {
+      return status >= 400 && status < 500 && status !== 429;
+    }
+    // SDK wrappers frequently nest the transport error carrying the status.
+    if (anyErr.cause && anyErr.cause !== err) {
+      return isRequestRejectedBeforeGeneration(anyErr.cause);
+    }
+  }
+  return false;
+}
