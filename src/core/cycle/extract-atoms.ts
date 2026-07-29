@@ -61,6 +61,31 @@ import { slugifySegment } from '../sync.ts';
 const DEFAULT_BUDGET_USD = 0.3;
 const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
 
+// FRA-23196: wall-clock bound for the phase's work loop.
+//
+// The phase had three nominal bounds and only ONE of them was live:
+//   - budget: `DEFAULT_BUDGET_USD` is INERT under `claude-cli` subscription
+//     routing, where every call records $0.0000 and the tracker never
+//     exhausts (measured: 76 `cycle.extract_atoms` calls, $0.0000 total).
+//   - wall clock: absent entirely. The retired `extract-atoms-drain`
+//     compensator checked `windowSeconds` between batches; the routine-cycle
+//     phase that replaced it (`b6656679`) checked nothing.
+//   - page count: `PAGE_DISCOVERY_BUDGET = 50`, the only live bound. At the
+//     ~25.5s/page measured in `e862bdb3` a full batch is ~21 min inside an
+//     `autopilot-cycle` job whose TOTAL budget is 30 min and has to cover
+//     every other phase too.
+//
+// 900s = half the 1800ms*1000 cycle timeout, so a saturated atom batch can
+// never starve the phases that follow it. Truncating is safe and cheap:
+// progress is durable per item (each atom is `putPage`'d as produced, and
+// zero-yield pages get `atoms_scan_hash` stamped), so a deadline-skipped
+// item is simply rediscovered next cycle. Yielding a `warn` PhaseResult with
+// a partial count beats letting the whole cycle job abort on its own
+// deadline and be dead-lettered.
+//
+// Override with `cycle.extract_atoms.window_seconds`; <= 0 disables the bound.
+const DEFAULT_WINDOW_SECONDS = 900;
+
 // v0.42+ TODO: read atom_type enum from active pack manifest at runtime.
 const ATOM_TYPES = [
   'insight', 'anecdote', 'quote', 'framework', 'statistic',
@@ -165,6 +190,19 @@ export interface ExtractAtomsOpts {
    * `heartbeat()` on the passed reporter.
    */
   progress?: ProgressReporter;
+  /**
+   * FRA-23196: wall-clock budget for the work loop, in seconds. Mirrors the
+   * retired drain's `windowSeconds`. Checked BETWEEN items, so an in-flight
+   * `chat()` is never interrupted mid-call. Remaining items are counted as
+   * `*_skipped_deadline` (deliberately NOT folded into `*_skipped_budget` —
+   * the FRA-23196 trigger reads `pages_skipped_budget` as the signal that
+   * the dollar cap stopped being inert, and conflating the two would make it
+   * misfire). Omitted → `cycle.extract_atoms.window_seconds` config →
+   * `DEFAULT_WINDOW_SECONDS`. <= 0 disables the bound.
+   */
+  windowSeconds?: number;
+  /** Test seam: monotonic-ish clock for the deadline check. */
+  _now?: () => number;
 }
 
 interface ExtractedAtom {
@@ -538,6 +576,9 @@ export async function runPhaseExtractAtoms(
   let budgetExhausted = false;
   let extractModel = DEFAULT_EXTRACT_ATOMS_MODEL;
   let budgetCap = DEFAULT_BUDGET_USD;
+  // FRA-23196: opts override wins (the drain passes its own remaining
+  // window); otherwise config; otherwise the default.
+  let windowSeconds = opts.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
   try {
     const configuredModel = await engine.getConfig('models.dream.extract_atoms');
     if (configuredModel) extractModel = configuredModel;
@@ -546,8 +587,17 @@ export async function runPhaseExtractAtoms(
       const n = Number(configuredBudget);
       if (Number.isFinite(n) && n > 0) budgetCap = n;
     }
+    if (opts.windowSeconds === undefined) {
+      const configuredWindow = await engine.getConfig('cycle.extract_atoms.window_seconds');
+      if (configuredWindow !== null && configuredWindow !== undefined && configuredWindow !== '') {
+        const n = Number(configuredWindow);
+        // 0 / negative is a deliberate "no bound" escape hatch, so it is
+        // accepted here — only a non-numeric value falls back to the default.
+        if (Number.isFinite(n)) windowSeconds = n;
+      }
+    }
   } catch {
-    // Keep safe defaults: Haiku + $0.30.
+    // Keep safe defaults: Haiku + $0.30 + 900s.
   }
   const budgetTracker = new BudgetTracker({
     maxCostUsd: budgetCap,
@@ -577,9 +627,27 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  // FRA-23196: absolute deadline for the work loop. `null` = unbounded
+  // (windowSeconds <= 0). Established AFTER discovery so the window covers
+  // the LLM work it is meant to bound, not the discovery queries.
+  const now = opts._now ?? Date.now;
+  const loopStartedAt = now();
+  const deadlineAt = windowSeconds > 0 ? loopStartedAt + windowSeconds * 1000 : null;
+  let deadlineExceeded = false;
+  let transcriptsSkippedDeadline = 0;
+  let pagesSkippedDeadline = 0;
+
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     await maybeYield();
+    // Checked BETWEEN items only — an in-flight chat() is never torn down
+    // mid-call, so a truncated run leaves no half-written atom set.
+    if (deadlineAt !== null && (deadlineExceeded || now() >= deadlineAt)) {
+      deadlineExceeded = true;
+      if (item.kind === 'transcript') transcriptsSkippedDeadline++;
+      else pagesSkippedDeadline++;
+      continue;
+    }
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
       else pagesSkipped++;
@@ -724,9 +792,15 @@ export async function runPhaseExtractAtoms(
     });
   }
 
+  const loopElapsedMs = now() - loopStartedAt;
+  const skippedDeadline = transcriptsSkippedDeadline + pagesSkippedDeadline;
+
   return {
     phase: 'extract_atoms',
-    status: failures.length > 0 ? 'warn' : 'ok',
+    // FRA-23196: a deadline hit is a partial success, not a failure — the
+    // remaining items are durably rediscoverable next cycle. `warn` is what
+    // makes the cycle report it instead of silently truncating.
+    status: failures.length > 0 || deadlineExceeded ? 'warn' : 'ok',
     duration_ms: 0,
     summary:
       `extract_atoms: ${totalAtomsExtracted} atoms from ` +
@@ -735,6 +809,10 @@ export async function runPhaseExtractAtoms(
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
+        : '') +
+      (skippedDeadline > 0
+        ? ` (${skippedDeadline} deadline-skipped after ${Math.round(loopElapsedMs / 1000)}s` +
+          `/${windowSeconds}s window)`
         : ''),
     details: {
       atoms_extracted: totalAtomsExtracted,
@@ -750,6 +828,14 @@ export async function runPhaseExtractAtoms(
       budget_usd: budgetCap,
       model: extractModel,
       budget_exhausted: budgetExhausted,
+      // FRA-23196 wall-clock bound. Kept in fields of their own: the trigger
+      // check reads `pages_skipped_budget` / `budget_exhausted` as proof the
+      // DOLLAR cap stopped being inert, so deadline skips must not land there.
+      window_seconds: windowSeconds,
+      deadline_exceeded: deadlineExceeded,
+      transcripts_skipped_deadline: transcriptsSkippedDeadline,
+      pages_skipped_deadline: pagesSkippedDeadline,
+      loop_elapsed_ms: loopElapsedMs,
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
     },

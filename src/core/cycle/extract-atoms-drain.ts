@@ -204,6 +204,11 @@ export async function runExtractAtomsDrainForSource(
           sourceId: extractionSourceId,
           dryRun: false,
           brainDir: opts.brainDir,
+          // FRA-23196: the phase now self-bounds on wall clock (default 900s).
+          // Hand it the DRAIN's window so a single batch can never outlive the
+          // window the drain is enforcing between batches — otherwise a
+          // 120s-window drain could sit inside one 900s batch.
+          windowSeconds: opts.windowSeconds,
         });
         const d = (r.details ?? {}) as Record<string, unknown>;
         // issue #3218: `r.status` collapses to 'warn' whether ONE item failed
