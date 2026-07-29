@@ -672,6 +672,51 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
 });
 
 describe('runExtractFacts — multi-source isolation', () => {
+  test('a pending legacy row in source A does NOT jam extraction for source B (#2646 source-scope)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO sources (id, name, config) VALUES ('work', 'work', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+
+    // Source "work": a genuine pending legacy row (row_num NULL, active,
+    // live backing page) — the exact shape that must gate work's cycle.
+    await engine.putPage('people/alice', {
+      title: 'people/alice', type: 'person',
+      compiled_truth: FACT_FENCE(`| 1 | work fence fact | fact | 1.0 | world | high | 2026-01-01 |  | s |  |`),
+      frontmatter: {}, timeline: '',
+    }, { sourceId: 'work' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence)
+       VALUES ('work', 'people/alice', 'work legacy claim', 'fact', 'private', 'medium',
+               now(), 'mcp:put_page', 1.0)`,
+    );
+
+    // Source "default": clean — no legacy rows, one fenced page.
+    await putPage('people/bob', FACT_FENCE(
+      `| 1 | default fact | fact | 1.0 | world | high | 2026-01-01 |  | s |  |`,
+    ));
+
+    // default's run must NOT be jammed by work's pending backlog.
+    const rDefault = await runExtractFacts(engine, { slugs: ['people/bob'], sourceId: 'default' });
+    expect(rDefault.guardTriggered).toBe(false);
+    expect(rDefault.legacyRowsPending).toBe(0);
+    expect(rDefault.factsInserted).toBe(1);
+
+    // work's own run still gates (discriminator stays sharp).
+    const rWork = await runExtractFacts(engine, { slugs: ['people/alice'], sourceId: 'work' });
+    expect(rWork.guardTriggered).toBe(true);
+    expect(rWork.legacyRowsPending).toBe(1);
+    expect(rWork.factsInserted).toBe(0);
+    // The drain advice must be one that actually re-runs Phase B — a bare
+    // `apply-migrations --yes` no-ops once the ledger says complete.
+    expect(rWork.warnings.some(w => w.includes('--force-retry 0.32.2'))).toBe(true);
+    expect(rWork.warnings.some(w => w.includes('forget_fact'))).toBe(true);
+    expect(rWork.warnings.some(w => w.includes('source "work"'))).toBe(true);
+  });
+
   test('deleteFactsForPage scoping does not affect other sources', async () => {
     // Seed sources work + home.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

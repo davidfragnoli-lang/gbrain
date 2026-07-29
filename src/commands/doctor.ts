@@ -4467,8 +4467,18 @@ export async function checkCycleFreshness(
         : `'${source.id}'`;
       const raw = source.config?.last_full_cycle_at;
       if (typeof raw !== 'string') {
+        // #2540: WARN, not FAIL. This check iterates EVERY local_path source,
+        // so on a multi-source install where only some vaults are cycled
+        // (e.g. one nightly `gbrain dream --dir <vault>`), a never-cycled
+        // sibling source turned doctor permanently red — which erodes the
+        // check's signal until real staleness hides inside the noise (the
+        // reporter's install masked genuinely stale sources for weeks this
+        // way). "Never cycled" also fires on a source added minutes ago.
+        // A source that HAS cycled and then went stale still escalates
+        // through the warn/fail age thresholds below — that is the
+        // regression signal this check exists for.
         issues.push(`Source ${display} has never completed a full cycle`);
-        hasFailures = true;
+        hasWarnings = true;
         continue;
       }
       const last = new Date(raw).getTime();
@@ -4504,7 +4514,7 @@ export async function checkCycleFreshness(
       return {
         name: 'cycle_freshness',
         status: 'warn',
-        message: `${issues.join('; ')}.`,
+        message: `${issues.join('; ')}. Run \`gbrain dream --source <id>\` to cycle a source, or start \`gbrain autopilot\`.`,
       };
     }
     return {

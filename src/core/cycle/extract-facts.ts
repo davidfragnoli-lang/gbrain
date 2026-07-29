@@ -26,13 +26,17 @@
  *
  * Empty-fence guard (Codex R2-#7; #2484; #2646): the phase refuses to do
  * its destructive reconciliation pass when genuinely-backfillable legacy
- * rows still exist — `row_num IS NULL` (never fenced) AND `entity_slug`
- * resolves to a live page in this source (so the v0_32_2 migration's
- * Phase B could fence them) AND the row is not soft-expired
- * (`expired_at IS NULL`). Status returns `warn` with a hint to run
- * `gbrain apply-migrations --yes`. Without the guard, an interrupted
- * upgrade where v0_32_2 hasn't run could leave the cycle silently
- * misreporting "0 facts on people/alice" while legacy rows linger.
+ * rows still exist — in THIS run's source only (`source_id = sourceId`;
+ * a pending row in source A must not jam extraction for source B — the
+ * source-isolation invariant) — `row_num IS NULL` (never fenced) AND
+ * `entity_slug` resolves to a live page in this source (so the v0_32_2
+ * migration's Phase B could fence them) AND the row is not soft-expired
+ * (`expired_at IS NULL`). Status returns `warn` with a hint to re-run
+ * the v0.32.2 fence backfill (`apply-migrations --force-retry 0.32.2`
+ * then `--yes` — a bare `--yes` is a no-op once the ledger says
+ * complete). Without the guard, an interrupted upgrade where v0_32_2
+ * hasn't run could leave the cycle silently misreporting "0 facts on
+ * people/alice" while legacy rows linger.
  *
  * The live-page requirement (#2484) is load-bearing: the inline facts
  * writer keeps producing `row_num IS NULL, entity_slug IS NOT NULL`
@@ -225,10 +229,17 @@ export async function runExtractFacts(
   // soft-expires legacy rows rather than deleting them, so counting
   // expired rows would leave the guard permanently stuck with no
   // supported way to drain the backlog.
+  //
+  // Source isolation (#3526): the count is scoped to THIS run's
+  // sourceId. The pre-fix query counted brain-wide, so a single pending
+  // legacy row in any mounted source jammed extract_facts for every
+  // source — a cross-source leak of one source's migration state into
+  // another's cycle (CLAUDE.md source-isolation invariant).
   const legacy = await engine.executeRaw<{ n: string }>(
     `SELECT COUNT(*) AS n
        FROM facts f
-      WHERE f.row_num IS NULL
+      WHERE f.source_id = $1
+        AND f.row_num IS NULL
         AND f.entity_slug IS NOT NULL
         AND f.expired_at IS NULL
         AND EXISTS (
@@ -237,15 +248,25 @@ export async function runExtractFacts(
              AND p.slug = f.entity_slug
              AND p.deleted_at IS NULL
         )`,
+    [sourceId],
   );
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
   if (legacyCount > 0) {
     result.guardTriggered = true;
+    // Drain advice must actually work: a bare `apply-migrations --yes`
+    // is a no-op once the v0.32.2 ledger entry says complete (the
+    // runner classifies it as already-applied), so the sanctioned
+    // re-run path is the explicit retry marker first. Phase B is
+    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
+    // against the existing fence — so the re-run is safe. Individual
+    // rows can instead be drained through `forget_fact` (soft-expired
+    // rows stop counting).
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows (entity page present, not yet ` +
-      `fenced) pending fence backfill. Run \`gbrain apply-migrations --yes\` to complete ` +
-      `v0_32_2 before this phase can safely reconcile fence → DB.`,
+      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
+      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
+      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
+      `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
     );
     return result;
   }

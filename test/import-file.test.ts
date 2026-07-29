@@ -522,7 +522,7 @@ just content.
     const result = await importFile(engine, filePath, '🌟🚀.md', { noEmbed: true });
     expect(result.status).toBe('skipped');
     expect(result.error).toContain('no usable slug');
-    expect(result.error).toContain('ASCII / Chinese / Japanese / Korean');
+    expect(result.error).toContain('at least one letter or number (any script)');
     expect((engine as any)._calls.length).toBe(0);
   });
 

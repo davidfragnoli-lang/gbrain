@@ -766,7 +766,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // written between the #3391 stale-fix (which changes which chunks count as
 // current) and the operator's migration run. Same one-time global cold-miss
 // pattern as the bumps above.
-export const KNOBS_HASH_VERSION = 13;
+export const KNOBS_HASH_VERSION = 14;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
