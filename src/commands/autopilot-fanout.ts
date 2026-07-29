@@ -33,6 +33,7 @@
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { MAINTENANCE_QUEUE } from '../core/minions/queue-lanes.ts';
 
 const FULL_CYCLE_FLOOR_MIN = 60;
 
@@ -393,7 +394,9 @@ export async function dispatchPerSource(
       'autopilot-cycle',
       { repoPath: opts.repoPath },
       {
-        queue: 'default',
+        // FRA-23078: maintenance lane, not `default` — a bulk backfill on
+        // `default` must not head-of-line-block the brain's own upkeep.
+        queue: MAINTENANCE_QUEUE,
         idempotency_key: `autopilot-cycle:${opts.slot}`,
         max_attempts: 2,
         timeout_ms: opts.timeoutMs,
@@ -444,7 +447,8 @@ export async function dispatchPerSource(
           phases: NON_GLOBAL_PHASES,
         },
         {
-          queue: 'default',
+          // FRA-23078: maintenance lane (see the legacy submit above).
+          queue: MAINTENANCE_QUEUE,
           // Per-source idempotency key — two ticks for the same source
           // within the same slot coalesce; different sources never collide.
           idempotency_key: `autopilot-cycle:${src.id}:${opts.slot}`,
@@ -553,7 +557,8 @@ export async function dispatchGlobalMaintenance(
     'autopilot-global-maintenance',
     { repoPath: opts.repoPath, phases: GLOBAL_PHASES },
     {
-      queue: 'default',
+      // FRA-23078: maintenance lane (see the per-source submit above).
+      queue: MAINTENANCE_QUEUE,
       // Structural single-flight: one global job per slot; maxWaiting:1 coalesces
       // any surplus so a slow brain-wide pass never stacks duplicates.
       idempotency_key: `autopilot-global:${opts.slot}`,

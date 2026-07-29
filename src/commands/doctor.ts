@@ -4,6 +4,7 @@ import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
+import { MAINTENANCE_JOB_NAMES } from '../core/minions/queue-lanes.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
 import { loadOrDeriveManifest } from '../core/skill-manifest.ts';
@@ -1698,6 +1699,8 @@ export async function computeQueueHealthCheck(
   opts: {
     waitingDepthThreshold?: number;
     oldWaitingHours?: number;
+    /** FRA-23078: lookback for the backlog-vs-wedge drain measurement. */
+    drainWindowMinutes?: number;
     readWorkers?: () => Array<{ queue: string }>;
   } = {},
 ): Promise<Check> {
@@ -1724,17 +1727,69 @@ export async function computeQueueHealthCheck(
 
     const threshold = opts.waitingDepthThreshold
       ?? _resolveEnvNumber('GBRAIN_QUEUE_WAITING_THRESHOLD', 10);
-    const depthRows: Array<{ name: string; queue: string; depth: number }> =
-      await engine.executeRaw(
-        `SELECT name, queue, count(*)::int AS depth
+    // FRA-23078: depth alone cannot tell a healthy bulk backfill from a wedge.
+    // On 2026-07-29 a ~7,955-job chronicle_extract backfill tripped this warn
+    // while draining perfectly at ~1,040 jobs/h — identical output to a queue
+    // with a dead worker. So measure the DRAIN alongside the depth: count the
+    // same (name, queue) pair's completions in a recent window, plus its
+    // failed/dead and stalled counts. A positive completion rate with no
+    // failures and no stalls is a backlog (report it, don't warn); a zero rate
+    // is the real wedge.
+    const drainWindowMin = opts.drainWindowMinutes
+      ?? _resolveEnvNumber('GBRAIN_QUEUE_DRAIN_WINDOW_MIN', 15);
+    const depthRows: Array<{
+      name: string;
+      queue: string;
+      depth: number;
+      completed_recent: number;
+      failed_recent: number;
+      stalled_now: number;
+      active_healthy: number;
+    }> = await engine.executeRaw(
+      `WITH deep AS (
+         SELECT name, queue, count(*)::int AS depth
            FROM minion_jobs
           WHERE status = 'waiting'
           GROUP BY name, queue
          HAVING count(*) > $1
-          ORDER BY depth DESC
-          LIMIT 5`,
-        [threshold],
-      );
+       )
+       SELECT d.name,
+              d.queue,
+              d.depth,
+              -- Drain evidence, scoped to the SAME (name, queue) pair: a
+              -- different job type completing on the queue says nothing about
+              -- whether THIS one is moving.
+              coalesce(c.completed_recent, 0)::int AS completed_recent,
+              coalesce(c.failed_recent, 0)::int    AS failed_recent,
+              coalesce(s.stalled_now, 0)::int      AS stalled_now,
+              coalesce(s.active_healthy, 0)::int   AS active_healthy
+         FROM deep d
+         LEFT JOIN (
+           SELECT name, queue,
+                  count(*) FILTER (WHERE status = 'completed')          AS completed_recent,
+                  count(*) FILTER (WHERE status IN ('failed', 'dead'))  AS failed_recent
+             FROM minion_jobs
+            WHERE finished_at > now() - ($2::text::interval)
+            GROUP BY name, queue
+         ) c ON c.name = d.name AND c.queue = d.queue
+         LEFT JOIN (
+           SELECT name, queue,
+                  count(*) FILTER (WHERE lock_until <  now()) AS stalled_now,
+                  -- A job in flight with a live lock means a worker IS serving
+                  -- this pair. Without this, a slow handler false-alarms: 11
+                  -- queued autopilot-cycles at ~20min each complete 0 times in
+                  -- a 15min window, which is slow, not wedged. Genuinely stuck
+                  -- work is caught by the separate stalled-forever check
+                  -- (active > 1h) above, not here.
+                  count(*) FILTER (WHERE lock_until >= now()) AS active_healthy
+             FROM minion_jobs
+            WHERE status = 'active'
+            GROUP BY name, queue
+         ) s ON s.name = d.name AND s.queue = d.queue
+        ORDER BY d.depth DESC
+        LIMIT 5`,
+      [threshold, `${drainWindowMin} minutes`],
+    );
 
     const rssKillRows: Array<{ cnt: number }> = await engine.executeRaw(
       `SELECT count(*)::int AS cnt
@@ -1769,12 +1824,17 @@ export async function computeQueueHealthCheck(
               EXTRACT(EPOCH FROM (now() - min(created_at)))::int AS oldest_age_seconds
          FROM minion_jobs
         WHERE status = 'waiting'
-          AND name = 'embed-backfill'
+          -- FRA-23078: was 'embed-backfill' only. The maintenance lane made
+          -- that too narrow: its whole point is that autopilot's worker is the
+          -- ONLY worker bound to it, so "queue up, worker down" is the one new
+          -- starvation surface the lane introduces. Cover the maintenance job
+          -- names too and that surface reports itself within the hour.
+          AND name = ANY($2)
         GROUP BY name, queue
        HAVING min(created_at) < now() - ($1::text::interval)
         ORDER BY oldest_age_seconds DESC
         LIMIT 5`,
-      [`${oldWaitingHours} hours`],
+      [`${oldWaitingHours} hours`, ['embed-backfill', ...MAINTENANCE_JOB_NAMES]],
     );
 
     let liveWorkerQueues = new Set<string>();
@@ -1795,13 +1855,45 @@ export async function computeQueueHealthCheck(
         `Fix: gbrain jobs get <id> to inspect; gbrain jobs cancel <id> to force-kill.`
       );
     }
-    if (depthRows.length > 0) {
-      const sample = depthRows
-        .map(r => `${r.name}@${r.queue}=${r.depth}`)
-        .join(', ');
+    // FRA-23078: split the deep queues into draining backlogs and wedges.
+    // Only the wedges become `problems` (i.e. warn); a backlog is reported in
+    // the message with its measured rate + ETA so an operator can see it is
+    // working rather than mistaking it for the cause of unrelated warns.
+    const backlogs: string[] = [];
+    for (const r of depthRows) {
+      const completed = Number(r.completed_recent ?? 0);
+      const failed = Number(r.failed_recent ?? 0);
+      const stalled = Number(r.stalled_now ?? 0);
+      const activeHealthy = Number(r.active_healthy ?? 0);
+      // "Being served" = finished something recently OR has a live-locked job
+      // in flight. Either way a worker is attached and the depth is a backlog.
+      const draining = (completed > 0 || activeHealthy > 0) && failed === 0 && stalled === 0;
+      if (draining) {
+        const perHour = Math.round((completed / drainWindowMin) * 60);
+        if (perHour > 0) {
+          const etaHours = r.depth / perHour;
+          const eta = etaHours >= 1
+            ? `~${etaHours.toFixed(1)}h`
+            : `~${Math.round(etaHours * 60)}min`;
+          backlogs.push(`${r.name}@${r.queue}=${r.depth} (draining ${perHour}/h, ETA ${eta})`);
+        } else {
+          // Nothing finished in the window but a live-locked job is in flight —
+          // a slow handler. Report the depth without inventing a rate or ETA.
+          backlogs.push(
+            `${r.name}@${r.queue}=${r.depth} (in progress: ${activeHealthy} running, ` +
+            `none finished in the last ${drainWindowMin}min — slow handler, not wedged)`
+          );
+        }
+        continue;
+      }
+      const why = failed > 0 || stalled > 0
+        ? `${failed} failed/dead in the last ${drainWindowMin}min + ${stalled} stalled in flight`
+        : `nothing running and 0 completions in the last ${drainWindowMin}min`;
       problems.push(
-        `waiting-queue depth exceeds ${threshold} for: ${sample}. ` +
-        `Fix: set maxWaiting on the submitter (or raise GBRAIN_QUEUE_WAITING_THRESHOLD).`
+        `queue '${r.queue}' appears WEDGED for '${r.name}': ${r.depth} waiting, ${why}. ` +
+        `Fix: check a live worker is registered (\`gbrain jobs stats --queue ${r.queue}\`); ` +
+        `\`gbrain jobs work --queue ${r.queue}\` if none, or \`gbrain jobs get <id>\` to ` +
+        `inspect the failures.`
       );
     }
     for (const row of oldWaitingRows) {
@@ -1831,17 +1923,26 @@ export async function computeQueueHealthCheck(
       );
     }
 
+    // FRA-23078: a draining backlog is NOT a problem, but it IS worth stating —
+    // silently dropping it would leave an operator wondering why `jobs stats`
+    // shows 5,000 waiting while doctor says the queue is fine.
+    const backlogNote = backlogs.length > 0
+      ? ` Draining backlog (not a wedge): ${backlogs.join(', ')}.`
+      : '';
+
     if (problems.length === 0) {
       return {
         name: 'queue_health',
         status: 'ok',
-        message: `No stalled-forever jobs; no queue over depth ${threshold}; no old embed-backfill jobs without a worker.`,
+        message:
+          `No stalled-forever jobs; no wedged queue; no old maintenance/embed-backfill ` +
+          `jobs without a worker.${backlogNote}`,
       };
     }
     return {
       name: 'queue_health',
       status: 'warn',
-      message: problems.join(' '),
+      message: problems.join(' ') + backlogNote,
     };
   } catch (e) {
     return {

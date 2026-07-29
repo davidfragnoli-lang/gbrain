@@ -25,6 +25,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig, saveConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
 import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
+import { MAINTENANCE_QUEUE } from '../core/minions/queue-lanes.ts';
 import { VERSION } from '../version.ts';
 import {
   canSelfUpdate,
@@ -477,7 +478,20 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     const autopilotMaxRssMb = resolveDefaultMaxRssMb();
     childSupervisor = new ChildWorkerSupervisor({
       cliPath,
-      args: ['jobs', 'work', '--max-rss', String(autopilotMaxRssMb)],
+      // FRA-23078: bind autopilot's managed worker to the maintenance lane it
+      // submits to. `MinionQueue.claim()` filters `WHERE queue = $3`, so a bulk
+      // backfill sitting on `default` is invisible to this worker and can no
+      // longer head-of-line-block a cycle, sync, or atoms drain.
+      //
+      // Deliberately reuses THIS worker rather than adding a launchd-supervised
+      // one: the lane is then served by the same process that fills it, so
+      // there is no new "queue up, worker down" starvation surface. Concurrency
+      // stays at the default 1 — autopilot-cycle is the ~10GB-RSS job, and
+      // parallelising it here is what the #1678 watchdog exists to prevent.
+      //
+      // Cost, stated honestly: `default` drops from 3 concurrent slots
+      // (supervisor 2 + this 1) to 2, so bulk backfills drain ~1/3 slower.
+      args: ['jobs', 'work', '--queue', MAINTENANCE_QUEUE, '--max-rss', String(autopilotMaxRssMb)],
       // process.env clone; autopilot doesn't gate shell jobs the way the
       // standalone supervisor does (autopilot is the operator-trust path).
       env: { ...process.env },
@@ -758,7 +772,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                     embed_reason: 'autopilot_freshness',
                   },
                   {
-                    queue: 'default',
+                    // FRA-23078: maintenance lane — freshness sync is upkeep,
+                    // and must not queue behind a bulk backfill.
+                    queue: MAINTENANCE_QUEUE,
                     idempotency_key: `autopilot-sync:${src.id}:${slot}`,
                     max_attempts: 2,
                     timeout_ms: timeoutMs,
@@ -863,7 +879,10 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                         'extract-atoms-drain',
                         { sourceId: src.id, window: windowSeconds, repoPath: src.local_path },
                         {
-                          queue: 'default',
+                          // FRA-23078: maintenance lane. This job IS the
+                          // `extract_atoms_backlog` drain, so starving it makes
+                          // doctor report the backlog as its own defect.
+                          queue: MAINTENANCE_QUEUE,
                           idempotency_key: idemKey,
                           // issue #3218: the handler now throws on an
                           // all-provider-failed batch, so give the queue's
@@ -1033,7 +1052,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             try {
               const isProtected = !!step.protected;
               const submitOpts = {
-                queue: 'default',
+                // FRA-23078: maintenance lane — targeted plan steps are the
+                // score-gated half of the same upkeep dispatch.
+                queue: MAINTENANCE_QUEUE,
                 idempotency_key: step.idempotency_key,
                 max_attempts: 2,
                 timeout_ms: timeoutMs,
