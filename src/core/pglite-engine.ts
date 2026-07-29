@@ -420,8 +420,10 @@ export class PGLiteEngine implements BrainEngine {
     let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
       const gw = await import('./ai/gateway.ts');
+      // Both accessors THROW when the gateway is unconfigured (they never
+      // return falsy), so the catch below is the only fallback path (#3461).
       dims = gw.getEmbeddingDimensions();
-      model = gw.getEmbeddingModel() || model;
+      model = gw.getEmbeddingModel();
     } catch { /* gateway not configured — use defaults */ }
 
     await this.db.exec(getPGLiteSchema(dims, model));
@@ -979,7 +981,8 @@ export class PGLiteEngine implements BrainEngine {
     const { rows } = await this.db.query(
       `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
               effective_date, effective_date_source,
-              source_kind, source_uri, ingested_via, ingested_at
+              source_kind, source_uri, ingested_via, ingested_at,
+              contextual_retrieval_mode
        FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
       params
     );
@@ -2320,15 +2323,26 @@ export class PGLiteEngine implements BrainEngine {
 
     // Provenance fallback for chunks without an explicit `model`: resolve the
     // gateway's runtime model, not the compile-time DEFAULT_EMBEDDING_MODEL.
-    // See postgres-engine.ts _upsertChunksOnce for the full rationale — pglite
-    // mirrors it for parity.
-    let resolvedModel: string = DEFAULT_EMBEDDING_MODEL;
+    // #3461: getEmbeddingModel() THROWS when unconfigured (never returns
+    // falsy) — on the throw path fall back to the brain's own
+    // `config.embedding_model` row, then the compile-time default as the
+    // last resort. See postgres-engine.ts _upsertChunksOnce for the full
+    // rationale — pglite mirrors it for parity.
+    let resolvedModel: string | null = null;
     try {
       const gw = await import('./ai/gateway.ts');
-      resolvedModel = gw.getEmbeddingModel() || resolvedModel;
+      resolvedModel = gw.getEmbeddingModel();
     } catch {
-      // Gateway unconfigured (unit tests / pre-connect): keep the default.
+      try {
+        const cfg = await this.db.query(
+          `SELECT value FROM config WHERE key = 'embedding_model'`,
+        );
+        resolvedModel = ((cfg.rows[0] as { value?: string } | undefined)?.value) ?? null;
+      } catch {
+        // config table unreadable — fall through to the compile-time default.
+      }
     }
+    if (!resolvedModel) resolvedModel = DEFAULT_EMBEDDING_MODEL;
 
     for (const chunk of chunks) {
       const embeddingStr = chunk.embedding
@@ -2381,6 +2395,9 @@ export class PGLiteEngine implements BrainEngine {
     // Code-chunk metadata columns follow the same chunk_text-gated CASE pattern as `embedding`
     // (#769). Re-chunk trusts EXCLUDED outright; pure re-embed COALESCEs so a caller carrying
     // only embedding-shaped fields doesn't clobber metadata to NULL.
+    //
+    // #3461: `model` mirrors the `embedding` CASE branch-for-branch so the label always
+    // describes whichever vector wins the upsert. See postgres-engine.ts for rationale.
     await this.db.query(
       `INSERT INTO content_chunks ${cols} VALUES ${rowParts.join(', ')}
        ON CONFLICT (page_id, chunk_index) DO UPDATE SET
@@ -2394,7 +2411,14 @@ export class PGLiteEngine implements BrainEngine {
                 THEN EXCLUDED.embedding
            ELSE content_chunks.embedding
          END,
-         model = COALESCE(EXCLUDED.model, content_chunks.model),
+         model = CASE
+           WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.model
+           WHEN content_chunks.embedding IS NULL THEN EXCLUDED.model
+           WHEN EXCLUDED.embedded_at IS NOT NULL
+                AND (content_chunks.embedded_at IS NULL OR EXCLUDED.embedded_at > content_chunks.embedded_at)
+                THEN EXCLUDED.model
+           ELSE content_chunks.model
+         END,
          token_count = EXCLUDED.token_count,
          embedded_at = CASE
            WHEN EXCLUDED.chunk_text != content_chunks.chunk_text AND EXCLUDED.embedding IS NULL THEN NULL
@@ -5309,12 +5333,16 @@ export class PGLiteEngine implements BrainEngine {
     // pages_with_timeline) and v0.10.3 graph layer (link_coverage, timeline_coverage,
     // most_connected). Both coexist: master's brain_score is the composite
     // dashboard, v0.10.3 metrics give entity-page-level granularity.
+    // #1305: every page-scoped count here excludes soft-deleted rows — same
+    // posture as getStats — so brain_score moves when the user deletes pages.
+    // Chunk/link counts stay raw (storage until the purge phase), matching
+    // getStats, and destructive-removal counts elsewhere deliberately stay raw.
     const { rows: [h] } = await this.db.query(`
       WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company')
+        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
       )
       SELECT
-        (SELECT count(*) FROM pages) as page_count,
+        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         -- stale_pages + orphan_pages are computed in TS below (upstream #3015):
@@ -5354,7 +5382,7 @@ export class PGLiteEngine implements BrainEngine {
       SELECT p.slug,
              (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
       FROM pages p
-      WHERE p.type IN ('entity', 'person', 'company')
+      WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
       ORDER BY link_count DESC
       LIMIT 5
     `);
@@ -5373,6 +5401,7 @@ export class PGLiteEngine implements BrainEngine {
               AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
+      WHERE p.deleted_at IS NULL
     `);
 
     const r = h as Record<string, unknown>;
@@ -5493,15 +5522,18 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Sync
-  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
+  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<number> {
     newSlug = validateSlug(newSlug);
     const sourceId = opts?.sourceId ?? 'default';
     // Source-qualify so a rename in source A doesn't sweep up same-slug rows
     // in sources B/C/D (mirrors postgres-engine.ts).
-    await this.db.query(
+    const result = await this.db.query(
       `UPDATE pages SET slug = $1, updated_at = now() WHERE slug = $2 AND source_id = $3`,
       [newSlug, oldSlug, sourceId]
     );
+    // #3056: rows moved — a zero-row UPDATE does not throw, so the count is
+    // the only way callers can see the no-op.
+    return result.affectedRows ?? 0;
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {

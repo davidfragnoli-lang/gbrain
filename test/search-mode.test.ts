@@ -413,7 +413,10 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // #3390/#3391: bumped 12→13 for the embedding-provider migration wave —
     // legacy callers hash prov=default before AND after a provider swap, so
     // pre-migration cache rows must become unreachable on upgrade.
-    expect(KNOBS_HASH_VERSION).toBe(13);
+    // v0.42.67.x bumped 13→14: the compiled_truth boost no longer applies at
+    // detail=medium (#3430). Cached rows were ranked under the old semantics,
+    // so they must become unreachable rather than be served under the new ones.
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -578,8 +581,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 13 (12→13 embedding-migration wave, #3390/#3391)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(13);
+  test('KNOBS_HASH_VERSION is 14 (13→14 compiled_truth boost scope fix, #3430)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

@@ -1092,8 +1092,8 @@ export async function importFromFile(
         chunks: 0,
         error:
           `Filename "${relativePath}" produces no usable slug. ` +
-          `Add a "slug:" to the frontmatter, or rename the file to use ` +
-          `ASCII / Chinese / Japanese / Korean characters.`,
+          `Add a "slug:" to the frontmatter, or rename the file to include ` +
+          `at least one letter or number (any script).`,
       };
     }
   } else if (parsed.slug !== expectedSlug) {

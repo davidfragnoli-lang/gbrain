@@ -64,7 +64,10 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // pre-fix document-side query vectors must not be served.
     // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
     // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
-    expect(KNOBS_HASH_VERSION).toBe(13);
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
