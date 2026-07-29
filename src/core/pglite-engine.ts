@@ -59,6 +59,7 @@ import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
+import { machineGeneratedFragment } from './machine-generated.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import {
@@ -2079,7 +2080,7 @@ export class PGLiteEngine implements BrainEngine {
     // issue #160: guard predicate projected as `unverified_stub` in
     // hnsw_candidates (parity with postgres-engine) so unverified stubs get
     // factor 1.0, not the people/ 1.2x, inside the pre-LIMIT re-rank.
-    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub');
+    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub', 'machine_generated');
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const innerLimit = offset + Math.max(limit * 5, 100);
@@ -2156,6 +2157,7 @@ export class PGLiteEngine implements BrainEngine {
              THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            (${unverifiedExtractionFragment('p')}) AS unverified_stub,
+           (${machineGeneratedFragment('p')}) AS machine_generated,
            1 - (cc.${col} <=> ${castSql}) AS raw_score
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id

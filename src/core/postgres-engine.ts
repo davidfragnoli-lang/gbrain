@@ -66,6 +66,7 @@ import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowTo
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
+import { machineGeneratedFragment } from './machine-generated.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
@@ -2127,7 +2128,7 @@ export class PostgresEngine implements BrainEngine {
     // issue #160: the guard predicate is projected as `unverified_stub` in
     // hnsw_candidates (frontmatter isn't otherwise available at re-rank), so
     // unverified auto-extracted stubs get factor 1.0, not the people/ 1.2x.
-    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub');
+    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub', 'machine_generated');
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const innerLimit = offset + Math.max(limit * 5, 100);
@@ -2228,6 +2229,7 @@ export class PostgresEngine implements BrainEngine {
             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
           (${unverifiedExtractionFragment('p')}) AS unverified_stub,
+          (${machineGeneratedFragment('p')}) AS machine_generated,
           1 - (cc.${col} <=> ${castSql}) AS raw_score
         FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id

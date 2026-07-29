@@ -8,6 +8,11 @@ import {
 } from '../src/core/search/sql-ranking.ts';
 import { unverifiedExtractionFragment } from '../src/core/extraction-review.ts';
 import {
+  machineGeneratedFragment,
+  resolveMachineGeneratedFactor,
+  DEFAULT_MACHINE_GENERATED_FACTOR,
+} from '../src/core/machine-generated.ts';
+import {
   DEFAULT_SOURCE_BOOSTS,
   DEFAULT_HARD_EXCLUDES,
   parseSourceBoostEnv,
@@ -84,14 +89,22 @@ describe('buildSourceFactorCase', () => {
     expect(buildSourceFactorCase('p.slug', map, '  High  ' as 'high')).toBe('1.0');
   });
 
-  test('returns plain 1.0 when boost map is empty', () => {
-    expect(buildSourceFactorCase('p.slug', {}, 'medium')).toBe('1.0');
+  test('an empty boost map still emits the frontmatter guards (FRA-23172)', () => {
+    // The two guards are provenance-derived, not prefix-derived, so they must
+    // survive a brain that configures no slug boosts at all. Only a map with
+    // no prefixes AND both guards suppressed collapses to the bare literal.
+    const result = buildSourceFactorCase('p.slug', {}, 'medium');
+    expect(result).toBe(
+      `(CASE WHEN ${machineGeneratedFragment('p')} THEN ${DEFAULT_MACHINE_GENERATED_FACTOR} ` +
+      `WHEN ${unverifiedExtractionFragment('p')} THEN 1.0  ELSE 1.0 END)`,
+    );
   });
 
   test('emits a CASE expression for non-high detail (unverified guard first — issue #160)', () => {
     const result = buildSourceFactorCase('p.slug', { 'originals/': 1.5 }, 'medium');
     expect(result).toBe(
-      `(CASE WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'originals/%' THEN 1.5 ELSE 1.0 END)`,
+      `(CASE WHEN ${machineGeneratedFragment('p')} THEN ${DEFAULT_MACHINE_GENERATED_FACTOR} ` +
+      `WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'originals/%' THEN 1.5 ELSE 1.0 END)`,
     );
   });
 
@@ -123,13 +136,112 @@ describe('buildSourceFactorCase', () => {
       'medium',
     );
     expect(result).toBe(
-      `(CASE WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'good/%' THEN 1.5 ELSE 1.0 END)`,
+      `(CASE WHEN ${machineGeneratedFragment('p')} THEN ${DEFAULT_MACHINE_GENERATED_FACTOR} ` +
+      `WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'good/%' THEN 1.5 ELSE 1.0 END)`,
     );
   });
 
   test('uses the supplied slug column reference', () => {
     expect(buildSourceFactorCase('slug', { 'originals/': 1.5 }, 'medium'))
       .toContain('WHEN slug LIKE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FRA-23172 — machine-generated derivative-register demote
+// ---------------------------------------------------------------------------
+
+describe('buildSourceFactorCase — machine-generated demote (FRA-23172)', () => {
+  test('demote branch precedes every prefix boost so a register never collects namespace authority', () => {
+    // A vision register filed under people/ must NOT get the 1.2x entity-page
+    // boost. CASE takes the first true branch, so ordering IS the guarantee.
+    const result = buildSourceFactorCase('p.slug', { 'people/': 1.2 }, 'medium');
+    const demoteAt = result.indexOf(machineGeneratedFragment('p'));
+    const boostAt = result.indexOf("LIKE 'people/%'");
+    expect(demoteAt).toBeGreaterThanOrEqual(0);
+    expect(boostAt).toBeGreaterThan(demoteAt);
+  });
+
+  test('demote branch precedes the unverified-extraction guard', () => {
+    // The unverified guard only WITHHOLDS authority (1.0). A page that is both
+    // an unverified stub and a machine-generated register is still a register,
+    // so the stricter factor has to win.
+    const result = buildSourceFactorCase('p.slug', {}, 'medium');
+    expect(result.indexOf(machineGeneratedFragment('p')))
+      .toBeLessThan(result.indexOf(unverifiedExtractionFragment('p')));
+  });
+
+  test('temporal bypass (detail=high) skips the demote too', () => {
+    // "what did I photograph in the warehouse in March" is exactly the query a
+    // register SHOULD win. detail=high already bypasses source-boost; the
+    // demote inherits that bypass rather than fighting it.
+    expect(buildSourceFactorCase('p.slug', {}, 'high')).toBe('1.0');
+  });
+
+  test('vector arm uses the projected boolean column, not an inline frontmatter read', () => {
+    // hnsw_candidates has no frontmatter column at re-rank time; it projects
+    // the predicate as `machine_generated`. Reading frontmatter here would be
+    // a SQL error, so this asserts the guard-column form is honoured.
+    const result = buildSourceFactorCase('slug', {}, 'medium', 'unverified_stub', 'machine_generated');
+    expect(result).toContain(`WHEN machine_generated THEN ${DEFAULT_MACHINE_GENERATED_FACTOR}`);
+    expect(result).not.toContain('frontmatter');
+  });
+
+  test('bare (unqualified) slug column with no guard columns emits neither guard', () => {
+    // No alias to derive `p` from and no projected columns supplied → there is
+    // no legal way to read the markers, so the builder must omit both rather
+    // than emit invalid SQL.
+    const result = buildSourceFactorCase('slug', { 'originals/': 1.5 }, 'medium');
+    expect(result).not.toContain('frontmatter');
+    expect(result).not.toContain('machine_generated');
+    expect(result).toBe(`(CASE WHEN slug LIKE 'originals/%' THEN 1.5 ELSE 1.0 END)`);
+  });
+});
+
+describe('resolveMachineGeneratedFactor (FRA-23172)', () => {
+  test('defaults when env is unset', () => {
+    expect(resolveMachineGeneratedFactor(undefined)).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
+  });
+
+  test('honours a valid override, including 0 (hard sink)', () => {
+    expect(resolveMachineGeneratedFactor('0.5')).toBe(0.5);
+    expect(resolveMachineGeneratedFactor(' 0.1 ')).toBe(0.1);
+    expect(resolveMachineGeneratedFactor('0')).toBe(0);
+  });
+
+  test('falls back to the default on garbage rather than throwing', () => {
+    // A malformed env var must never take search down.
+    expect(resolveMachineGeneratedFactor('abc')).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
+    expect(resolveMachineGeneratedFactor('-1')).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
+    expect(resolveMachineGeneratedFactor('')).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
+    expect(resolveMachineGeneratedFactor('NaN')).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
+  });
+
+  test('factor 1.0 removes the branch entirely (documented off-switch)', () => {
+    const prev = process.env.GBRAIN_MACHINE_GENERATED_BOOST;
+    process.env.GBRAIN_MACHINE_GENERATED_BOOST = '1';
+    try {
+      const result = buildSourceFactorCase('p.slug', { 'originals/': 1.5 }, 'medium');
+      expect(result).not.toContain('machine_generated');
+      expect(result).toContain("LIKE 'originals/%'");
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_MACHINE_GENERATED_BOOST;
+      else process.env.GBRAIN_MACHINE_GENERATED_BOOST = prev;
+    }
+  });
+});
+
+describe('machineGeneratedFragment (FRA-23172)', () => {
+  test('matches only the literal true, so machine_generated: false reads as authored', () => {
+    // `->> = 'true'` rather than a JSONB `?` existence check: a lane that
+    // explicitly stamps false must NOT be demoted.
+    expect(machineGeneratedFragment('p')).toBe(
+      `(COALESCE(p.frontmatter, '{}'::jsonb) ->> 'machine_generated') = 'true'`,
+    );
+  });
+
+  test('honours the supplied page alias', () => {
+    expect(machineGeneratedFragment('pg')).toContain('pg.frontmatter');
   });
 });
 
