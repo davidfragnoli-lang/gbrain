@@ -21,7 +21,15 @@ describe('autopilot auto-drain wiring', () => {
   });
 
   test('CODEX #1: submits with allowProtectedSubmit', () => {
-    expect(SRC).toMatch(/extract-atoms-drain[\s\S]{0,800}allowProtectedSubmit: true/);
+    // FRA-23119: was `/extract-atoms-drain[\s\S]{0,800}allowProtectedSubmit/`.
+    // That char-distance proximity match is brittle — FRA-23078 (fcb86402)
+    // added the `queue: MAINTENANCE_QUEUE` block and pushed the gap to 849
+    // chars, silently breaking this guard at HEAD. Anchor on the submit call
+    // site instead, like the max_attempts guard below, so explanatory comments
+    // can't turn a real regression guard into a red test.
+    const callSite = SRC.lastIndexOf("'extract-atoms-drain'");
+    expect(callSite).toBeGreaterThan(-1);
+    expect(SRC.slice(callSite, callSite + 1200)).toContain('allowProtectedSubmit: true');
   });
 
   test('CODEX #3: enumerates sources and counts backlog per source', () => {
@@ -63,5 +71,23 @@ describe('autopilot auto-drain wiring', () => {
     const drainBlock = SRC.slice(SRC.indexOf("'extract-atoms-drain'"));
     expect(drainBlock.slice(0, 900)).not.toContain('maxWaiting');
     expect(SRC).toContain('WHERE idempotency_key = $1 LIMIT 1');
+  });
+
+  // FRA-23119: the drain is LLM-bound — one batch is up to
+  // PAGE_DISCOVERY_BUDGET (50) pages at a measured ~27s/page (~22min). The
+  // short interval-derived timeout (600s on a 300s base interval) was always
+  // hit mid-first-batch, and handleTimeouts dead-letters terminally, so the
+  // job died `timeout exceeded` every night despite real forward progress.
+  // Guard that the submission keeps the long (fullCycle) timeout.
+  test('FRA-23119: submits with the long fullCycle timeout, not the short interval-derived one', () => {
+    expect(SRC).toContain(
+      'const drainTimeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, true);',
+    );
+    const callSite = SRC.lastIndexOf("'extract-atoms-drain'");
+    const submitBlock = SRC.slice(callSite, callSite + 900);
+    expect(submitBlock).toContain('timeout_ms: drainTimeoutMs');
+    // The bare `timeoutMs` local is the SHORT interval-derived one (600s on a
+    // 300s base interval) — regression-guard against reverting to it here.
+    expect(submitBlock).not.toMatch(/timeout_ms:\s*timeoutMs\b/);
   });
 });

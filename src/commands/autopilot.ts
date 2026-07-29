@@ -875,6 +875,20 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                         [idemKey],
                       );
                       if (dupe.length > 0) continue; // already queued/drained for this source today
+                      // FRA-23119: the drain is LLM-bound and needs the same long
+                      // timeout `autopilot-cycle` gets, NOT the short
+                      // interval-derived `timeoutMs`. Its own `windowSeconds`
+                      // (default 120) is only checked BETWEEN batches, and one
+                      // batch is up to PAGE_DISCOVERY_BUDGET (50) pages at a
+                      // measured ~27s/page — ~22min. So the 600s timeout was
+                      // ALWAYS hit mid-first-batch, and `handleTimeouts`
+                      // dead-letters terminally (stall -> retry, timeout -> dead),
+                      // spending 1 of the 3 attempts and killing the job outright.
+                      // Before this fix the drain genuinely worked (23 pages
+                      // drained 2026-07-29) but reported `dead: timeout exceeded`
+                      // every night. With the long timeout a full batch fits, so
+                      // the wallclock window is what stops the loop.
+                      const drainTimeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, true);
                       const job = await queue.add(
                         'extract-atoms-drain',
                         { sourceId: src.id, window: windowSeconds, repoPath: src.local_path },
@@ -888,7 +902,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                           // all-provider-failed batch, so give the queue's
                           // backoff a chance (was 1 — dead-lettered instantly).
                           max_attempts: 3,
-                          timeout_ms: timeoutMs,
+                          // FRA-23119 (see note above the call): long-job timeout.
+                          timeout_ms: drainTimeoutMs,
                         },
                         { allowProtectedSubmit: true },
                       );
