@@ -17,7 +17,26 @@ import type {
   SourceRow,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
-import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
+// Engine-path imports stay static unless a call site carries an explicit
+// engine-dynamic-import-ok justification. The gateway is the only current
+// exception because its local try/catch preserves a soft fallback.
+import {
+  withRetry,
+  BULK_RETRY_OPTS,
+  resolveBulkRetryOpts,
+  computeNextDelay,
+  isRetryableConnError,
+  type BatchAuditSite,
+} from './retry.ts';
+import {
+  valueHash,
+  normalizeDimension,
+  isNovelDimension,
+} from './chronicle/ontology.ts';
+import {
+  resolveRecencyDecayMap,
+  DEFAULT_FALLBACK,
+} from './search/recency-decay.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
@@ -420,7 +439,9 @@ export class PGLiteEngine implements BrainEngine {
     let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
     let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy: its static closure is large, and evaluation inside
+      // this try/catch preserves the unconfigured-gateway default fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       // Both accessors THROW when the gateway is unconfigured (they never
       // return falsy), so the catch below is the only fallback path (#3461).
       dims = gw.getEmbeddingDimensions();
@@ -2266,7 +2287,6 @@ export class PGLiteEngine implements BrainEngine {
       });
     } catch (err) {
       if (err instanceof Error && err.name === 'RetryAbortError') throw err;
-      const { isRetryableConnError } = await import('./retry.ts');
       if (isRetryableConnError(err)) {
         auditLogBatchExhausted(auditSite, batchSize, opts.maxRetries + 1, err);
       }
@@ -2332,7 +2352,9 @@ export class PGLiteEngine implements BrainEngine {
     // rationale — pglite mirrors it for parity.
     let resolvedModel: string | null = null;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy so module-load failure remains inside this soft
+      // fallback boundary; eager evaluation would bypass the config-row fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       resolvedModel = gw.getEmbeddingModel();
     } catch {
       try {
@@ -3845,7 +3867,6 @@ export class PGLiteEngine implements BrainEngine {
 
   async mergeOntologyFact(obs: OntologyObservationInput): Promise<OntologyMergeResult> {
     const sourceId = obs.sourceId ?? 'default';
-    const { valueHash, normalizeDimension, isNovelDimension } = await import('./chronicle/ontology.ts');
     const dimension = normalizeDimension(obs.dimension);
     const vh = valueHash(obs.value);
     const conf = obs.confidence ?? 0.7;
@@ -6049,7 +6070,6 @@ export class PGLiteEngine implements BrainEngine {
     const recencyBias = opts.recency_bias ?? 'flat';
     let recencySql: string;
     if (recencyBias === 'on') {
-      const { resolveRecencyDecayMap, DEFAULT_FALLBACK } = await import('./search/recency-decay.ts');
       recencySql = buildRecencyComponentSql({
         slugColumn: 'p.slug',
         dateExpr: 'COALESCE(p.effective_date, p.updated_at)',

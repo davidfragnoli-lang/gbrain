@@ -2,6 +2,13 @@ import type { BrainEngine } from './engine.ts';
 import { slugifyPath } from './sync.ts';
 import { getFtsLanguage } from './fts-language.ts';
 import { hnswMaxDimsForType } from './vector-index.ts';
+// runMigrations executes while an initialized engine is live. Keep its helper
+// modules in the static graph rather than importing them from async handlers.
+import {
+  isStatementTimeoutError,
+  isRetryableConnError,
+} from './retry-matcher.ts';
+import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
 
 /**
  * Schema migrations — run automatically on initSchema().
@@ -5801,7 +5808,6 @@ async function runMigrationSQLWithRetry(
   m: Migration,
   sql: string,
 ): Promise<void> {
-  const { isStatementTimeoutError, isRetryableConnError } = await import('./retry-matcher.ts');
   // GBRAIN_MIGRATE_BACKOFF_MS lets tests skip the 5s/15s/45s backoff. In
   // production the env var is unset and the default cadence applies.
   const fastBackoff = process.env.GBRAIN_MIGRATE_BACKOFF_MS;
@@ -6071,7 +6077,6 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   // reach the loop below). Best-effort + idempotent: a no-op on a healthy
   // index; `doctor` surfaces it independently if this ever fails.
   try {
-    const { repairTimelineDedupIndex } = await import('./timeline-dedup-repair.ts');
     const r = await repairTimelineDedupIndex(engine);
     if (r.repaired) {
       console.error(

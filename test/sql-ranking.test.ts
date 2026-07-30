@@ -12,6 +12,7 @@ import {
   resolveMachineGeneratedFactor,
   DEFAULT_MACHINE_GENERATED_FACTOR,
 } from '../src/core/machine-generated.ts';
+import { withEnv } from './helpers/with-env.ts';
 import {
   DEFAULT_SOURCE_BOOSTS,
   DEFAULT_HARD_EXCLUDES,
@@ -217,17 +218,12 @@ describe('resolveMachineGeneratedFactor (FRA-23172)', () => {
     expect(resolveMachineGeneratedFactor('NaN')).toBe(DEFAULT_MACHINE_GENERATED_FACTOR);
   });
 
-  test('factor 1.0 removes the branch entirely (documented off-switch)', () => {
-    const prev = process.env.GBRAIN_MACHINE_GENERATED_BOOST;
-    process.env.GBRAIN_MACHINE_GENERATED_BOOST = '1';
-    try {
+  test('factor 1.0 removes the branch entirely (documented off-switch)', async () => {
+    await withEnv({ GBRAIN_MACHINE_GENERATED_BOOST: '1' }, () => {
       const result = buildSourceFactorCase('p.slug', { 'originals/': 1.5 }, 'medium');
       expect(result).not.toContain('machine_generated');
       expect(result).toContain("LIKE 'originals/%'");
-    } finally {
-      if (prev === undefined) delete process.env.GBRAIN_MACHINE_GENERATED_BOOST;
-      else process.env.GBRAIN_MACHINE_GENERATED_BOOST = prev;
-    }
+    });
   });
 });
 
