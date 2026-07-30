@@ -13,7 +13,29 @@ import type {
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
 } from './engine.ts';
-import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
+// Engine-path imports stay static unless a call site carries an explicit
+// engine-dynamic-import-ok justification. The gateway is the only current
+// exception because its local try/catch preserves a soft fallback.
+import {
+  withRetry,
+  BULK_RETRY_OPTS,
+  resolveBulkRetryOpts,
+  computeNextDelay,
+  isRetryableConnError,
+  type BatchAuditSite,
+} from './retry.ts';
+import { isConnectionEndedError } from './retry-matcher.ts';
+import {
+  valueHash,
+  normalizeDimension,
+  isNovelDimension,
+} from './chronicle/ontology.ts';
+import {
+  resolveRecencyDecayMap,
+  DEFAULT_FALLBACK,
+} from './search/recency-decay.ts';
+import { logDbDisconnect } from './audit/db-disconnect-audit.ts';
+import { logPoolRecovery } from './audit/pool-recovery-audit.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
@@ -332,7 +354,6 @@ export class PostgresEngine implements BrainEngine {
     // even a no-op disconnect (engine that was never connected) is
     // recorded — that case may itself be a caller-side bug worth seeing.
     try {
-      const { logDbDisconnect } = await import('./audit/db-disconnect-audit.ts');
       logDbDisconnect('postgres', this._connectionStyle ?? 'unknown');
     } catch { /* best-effort; never block disconnect on audit failure */ }
     // v0.30.1: tear down the direct pool first if the manager owns one.
@@ -382,7 +403,9 @@ export class PostgresEngine implements BrainEngine {
     let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
     let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy: its static closure is large, and evaluation inside
+      // this try/catch preserves the unconfigured-gateway default fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       // Both accessors THROW when the gateway is unconfigured (they never
       // return falsy), so the catch below is the only fallback path (#3461).
       dims = gw.getEmbeddingDimensions();
@@ -2383,8 +2406,8 @@ export class PostgresEngine implements BrainEngine {
       if (err instanceof Error && err.name === 'RetryAbortError') throw err;
       // Best-effort exhausted-retry log. If the error wasn't retryable in
       // the first place, isRetryableConnError(err) is false and we skip.
-      // Lazy-import to avoid a circular dep concern.
-      const { isRetryableConnError } = await import('./retry.ts');
+      // retry.ts is already in this module's static graph through withRetry, so
+      // classifying the exhausted error does not need a second runtime import.
       if (isRetryableConnError(err)) {
         auditLogBatchExhausted(auditSite, batchSize, opts.maxRetries + 1, err);
       }
@@ -2453,7 +2476,9 @@ export class PostgresEngine implements BrainEngine {
     // is the LAST resort (fresh brain whose config row doesn't exist yet).
     let resolvedModel: string | null = null;
     try {
-      const gw = await import('./ai/gateway.ts');
+      // Keep the gateway lazy so module-load failure remains inside this soft
+      // fallback boundary; eager evaluation would bypass the config-row fallback.
+      const gw = await import('./ai/gateway.ts'); // engine-dynamic-import-ok
       resolvedModel = gw.getEmbeddingModel();
     } catch {
       try {
@@ -3986,7 +4011,6 @@ export class PostgresEngine implements BrainEngine {
   async mergeOntologyFact(obs: OntologyObservationInput): Promise<OntologyMergeResult> {
     const sql = this.sql;
     const sourceId = obs.sourceId ?? 'default';
-    const { valueHash, normalizeDimension, isNovelDimension } = await import('./chronicle/ontology.ts');
     const dimension = normalizeDimension(obs.dimension);
     const vh = valueHash(obs.value);
     const conf = obs.confidence ?? 0.7;
@@ -5873,12 +5897,10 @@ export class PostgresEngine implements BrainEngine {
     let isReap = false;
     if (ctx?.error !== undefined) {
       try {
-        const { isConnectionEndedError } = await import('./retry-matcher.ts');
         isReap = isConnectionEndedError(ctx.error);
       } catch { /* classification is best-effort */ }
     }
     try {
-      const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
       logPoolRecovery(isReap ? 'reap_detected' : 'reconnect_other', ctx?.error);
     } catch { /* audit is best-effort */ }
 
@@ -5902,7 +5924,6 @@ export class PostgresEngine implements BrainEngine {
       // New pool is live — discard the old one best-effort.
       if (oldSql) { try { await oldSql.end({ timeout: 5 }); } catch { /* swallow */ } }
       try {
-        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
         logPoolRecovery('reconnect_succeeded');
       } catch { /* best-effort */ }
     } catch (err) {
@@ -5914,7 +5935,6 @@ export class PostgresEngine implements BrainEngine {
       this._sql = oldSql;
       this.connectionManager = oldManager;
       try {
-        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
         logPoolRecovery('reconnect_failed', err);
       } catch { /* best-effort */ }
       throw err; // let batchRetry's backoff handle the retry
@@ -6351,7 +6371,6 @@ export class PostgresEngine implements BrainEngine {
     const recencyBias = opts.recency_bias ?? 'flat';
     let recencySql: string;
     if (recencyBias === 'on') {
-      const { resolveRecencyDecayMap, DEFAULT_FALLBACK } = await import('./search/recency-decay.ts');
       recencySql = buildRecencyComponentSql({
         slugColumn: 'p.slug',
         dateExpr: 'COALESCE(p.effective_date, p.updated_at)',
