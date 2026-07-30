@@ -63,6 +63,60 @@ describe('dedupResults', () => {
     expect(personCount).toBeGreaterThan(0);
     expect(conceptCount).toBeGreaterThan(0);
   });
+
+  // FRA-23396 — the type-diversity layer must not trim a single-type set.
+  // With one type there is no alternative to promote into a freed slot, so
+  // the ratio degenerates from a diversity control into a blind recall cap
+  // of ceil(maxRatio * n). At the 0.6 default that silently cut the
+  // nightly-7 quality probe's 3 gold chat sessions to 2, and the brain
+  // answered "2" to a gold-"three" counting question.
+  test('does not trim a homogeneous single-type set (FRA-23396)', () => {
+    // Distinct slugs AND page_ids so layers 1 and 4 (per-page caps) cannot
+    // be the trimmer — this isolates layer 3.
+    const results = Array.from({ length: 3 }, (_, i) =>
+      makeResult({
+        slug: `nightly-7-s${i + 1}`,
+        page_id: i + 1,
+        type: 'chat',
+        chunk_text: `wholly distinct session ${i} about a separate project launch`,
+      })
+    );
+    const deduped = dedupResults(results);
+    expect(deduped.length).toBe(3);
+    expect(deduped.map(r => r.slug).sort()).toEqual([
+      'nightly-7-s1', 'nightly-7-s2', 'nightly-7-s3',
+    ]);
+  });
+
+  // The same cap shape at n=4 (ceil(4 * 0.6) = 3) — pins that the guard is
+  // not an n=3 special case.
+  test('does not trim a homogeneous single-type set at n=4 (FRA-23396)', () => {
+    const results = Array.from({ length: 4 }, (_, i) =>
+      makeResult({
+        slug: `s${i}`,
+        page_id: i + 1,
+        type: 'chat',
+        chunk_text: `wholly distinct session ${i} about a separate project launch`,
+      })
+    );
+    expect(dedupResults(results).length).toBe(4);
+  });
+
+  // Guard the guard: a genuinely dominant type in a MULTI-type set must
+  // still be capped. Without this, "skip when homogeneous" could be
+  // over-applied into "never enforce diversity".
+  test('still caps a dominant type when a second type is present (FRA-23396)', () => {
+    const results = [
+      ...Array.from({ length: 9 }, (_, i) =>
+        makeResult({ slug: `p${i}`, page_id: i, score: 1 - i * 0.05, type: 'person', chunk_text: `person ${i} unique text content here` })
+      ),
+      makeResult({ slug: 'c0', page_id: 100, score: 0.1, type: 'concept', chunk_text: 'concept zero unique text content here' }),
+    ];
+    const deduped = dedupResults(results);
+    const personCount = deduped.filter(r => r.type === 'person').length;
+    // ceil(10 * 0.6) = 6 — the cap must still bite.
+    expect(personCount).toBeLessThan(9);
+  });
 });
 
 describe('compiled truth guarantee', () => {

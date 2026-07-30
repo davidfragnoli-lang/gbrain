@@ -89,6 +89,15 @@ interface ParsedArgs {
    * rate falls below this floor. Default unset = informational only.
    */
   byTypeFloor?: number;
+  /**
+   * FRA-23396 — which recall metric `--by-type-floor` gates on. `hit` (the
+   * default) is the historical ANY-hit rate, kept so the flag's meaning does
+   * not change under anyone without them asking. `full` gates on the strict
+   * all-gold-sessions-retrieved rate — the one that would have caught the
+   * nightly-7 drop. Opt-in because switching it re-baselines every existing
+   * floor value.
+   */
+  byTypeFloorMetric: 'hit' | 'full';
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -100,6 +109,7 @@ function parseArgs(args: string[]): ParsedArgs {
     topK: 8,
     noTrajectory: false,
     byType: false,
+    byTypeFloorMetric: 'hit',
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -121,6 +131,14 @@ function parseArgs(args: string[]): ParsedArgs {
       }
       out.byTypeFloor = v;
       out.byType = true; // --by-type-floor implies --by-type
+      continue;
+    }
+    if (a === '--by-type-floor-metric') {
+      const v = args[++i];
+      if (v !== 'hit' && v !== 'full') {
+        throw new Error(`--by-type-floor-metric must be hit|full (got: ${v})`);
+      }
+      out.byTypeFloorMetric = v;
       continue;
     }
     if (a === '--mode') {
@@ -171,6 +189,10 @@ function printHelp(): void {
     `                            recall_by_type:{...},aggregate:{...}}. Resume-safe: a prior\n` +
     `                            summary at the tail is REPLACED, not appended.\n` +
     `  --by-type-floor F         v0.40.1.0 — exit non-zero if any question_type rate < F\n` +
+    `  --by-type-floor-metric M  FRA-23396 — which rate the floor gates on: hit|full\n` +
+    `                            (default: hit). 'hit' is ANY gold session retrieved;\n` +
+    `                            'full' requires ALL of them. Multi-session questions can\n` +
+    `                            score 100%% under 'hit' while answering wrong.\n` +
     `                            (range [0, 1]). Implies --by-type. Default: no gate.\n` +
     `  -h, --help                Show this help.\n\n` +
     `Note: a full 500-question run takes ~20-60 minutes depending on flags. Use\n` +
@@ -293,6 +315,43 @@ function sessionIdFromSlug(slug: string): string {
   // slug is `chat/<session_id>` per adapter.ts.
   const idx = slug.indexOf('/');
   return idx >= 0 ? slug.slice(idx + 1) : slug;
+}
+
+/**
+ * FRA-23396 — recall against the gold session set.
+ *
+ * `hit` is the historical ANY-hit: true when at least one gold session was
+ * retrieved. It is preserved verbatim so existing artifacts stay comparable,
+ * but on multi-session questions it is close to meaningless — nightly-7 needs
+ * all 3 of its sessions to answer "three", retrieved 2, answered "2", and
+ * still scored a full hit. A metric that reports 100% on a run that produced
+ * a factually wrong answer cannot gate anything.
+ *
+ * `full` is the honest signal: every gold session was retrieved. `frac` is the
+ * graded version, so a 2-of-3 miss is distinguishable from a 0-of-3 miss.
+ * Single-gold-session questions are unaffected — there `full === hit`.
+ */
+export interface RecallBucket {
+  /** ANY-hit count — historical metric, preserved for artifact comparability. */
+  hit: number;
+  /** ALL-gold-sessions-retrieved count — the honest metric. */
+  full: number;
+  total: number;
+}
+
+export function computeRecall(
+  retrievedSessionIds: string[],
+  answerSessionIds: string[],
+): { hit: boolean; full: boolean; frac: number } {
+  const retrieved = new Set(retrievedSessionIds);
+  const gold = new Set(answerSessionIds);
+  let found = 0;
+  for (const g of gold) if (retrieved.has(g)) found++;
+  return {
+    hit: found > 0,
+    full: gold.size > 0 && found === gold.size,
+    frac: gold.size === 0 ? 0 : found / gold.size,
+  };
 }
 
 function uniqSessionIds(results: SearchResult[]): string[] {
@@ -440,20 +499,14 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
       // the existing file's rows. Skipping these steps would let a prior
       // run be resumed as "all done" and bypass the floor gate entirely.
       if (opts.byType && opts.outputPath) {
-        const seededBucket: Record<string, { hit: number; total: number }> = {};
+        const seededBucket: Record<string, RecallBucket> = {};
         seedRecallByTypeFromFile(opts.outputPath, seededBucket);
         const summary = buildByTypeSummary(seededBucket);
         emitByTypeSummary(opts.outputPath, summary);
         if (opts.byTypeFloor !== undefined) {
-          const floor = opts.byTypeFloor;
-          const breaches: string[] = [];
-          for (const [t, v] of Object.entries(summary.recall_by_type)) {
-            if (v.rate < floor) {
-              breaches.push(`${t}: ${(v.rate * 100).toFixed(1)}% < ${(floor * 100).toFixed(1)}%`);
-            }
-          }
+          const breaches = collectFloorBreaches(summary, opts.byTypeFloor, opts.byTypeFloorMetric);
           if (breaches.length > 0) {
-            process.stderr.write(`[longmemeval] FAIL --by-type-floor=${floor}: ${breaches.join(', ')}\n`);
+            process.stderr.write(`[longmemeval] FAIL --by-type-floor=${opts.byTypeFloor} (metric=${opts.byTypeFloorMetric}): ${breaches.join(', ')}\n`);
             process.exit(1);
           }
         }
@@ -508,7 +561,7 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
   progress.start('eval.longmemeval', questions.length);
 
   // Per-type accuracy counters (computed only when ground truth is reachable).
-  const recallByType: Record<string, { hit: number; total: number }> = {};
+  const recallByType: Record<string, RecallBucket> = {};
   // v0.40.1.0 (Track D / T2) — when --by-type AND --resume-from point at a
   // file, seed the bucket from existing rows so the final summary is
   // cumulative (covers prior + new questions, not just this run's).
@@ -581,10 +634,18 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
   const elapsed = Math.round((Date.now() - runStart) / 1000);
   process.stderr.write(`\n[longmemeval] done. ${questions.length} questions in ${elapsed}s. ${errorCount} errors.\n`);
   if (Object.keys(recallByType).length > 0) {
-    process.stderr.write(`[longmemeval] retrieval recall by question_type:\n`);
+    // FRA-23396 — print ANY-hit and full-hit side by side. The old line
+    // reported `multi-session: 1/1 (100.0%)` for a run whose single
+    // multi-session question retrieved 2 of its 3 gold sessions and answered
+    // wrong; a reader had no way to see the miss.
+    process.stderr.write(`[longmemeval] retrieval recall by question_type (any-hit | full-hit):\n`);
     for (const [t, v] of Object.entries(recallByType).sort()) {
       const pct = v.total === 0 ? 0 : (v.hit / v.total) * 100;
-      process.stderr.write(`  ${t}: ${v.hit}/${v.total} (${pct.toFixed(1)}%)\n`);
+      const fullPct = v.total === 0 ? 0 : (v.full / v.total) * 100;
+      process.stderr.write(
+        `  ${t}: ${v.hit}/${v.total} (${pct.toFixed(1)}%) | ` +
+        `full ${v.full}/${v.total} (${fullPct.toFixed(1)}%)\n`
+      );
     }
   }
   // v0.40.2.0 — extractor cache hit-rate (Codex Problem 14: empirical
@@ -606,13 +667,9 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     // Optional floor gate. Fail-loud: exit 1 with a stderr line per type that
     // breached the floor so the operator sees exactly which type regressed.
     if (opts.byTypeFloor !== undefined) {
-      const floor = opts.byTypeFloor;
-      const breaches: string[] = [];
-      for (const [t, v] of Object.entries(summary.recall_by_type)) {
-        if (v.rate < floor) breaches.push(`${t}: ${(v.rate * 100).toFixed(1)}% < ${(floor * 100).toFixed(1)}%`);
-      }
+      const breaches = collectFloorBreaches(summary, opts.byTypeFloor, opts.byTypeFloorMetric);
       if (breaches.length > 0) {
-        process.stderr.write(`[longmemeval] FAIL --by-type-floor=${floor}: ${breaches.join(', ')}\n`);
+        process.stderr.write(`[longmemeval] FAIL --by-type-floor=${opts.byTypeFloor} (metric=${opts.byTypeFloorMetric}): ${breaches.join(', ')}\n`);
         process.exit(1);
       }
     }
@@ -632,7 +689,7 @@ async function runOneQuestion(
   model: string,
   client: ThinkLLMClient,
   emitter: JsonlEmitter,
-  recallByType: Record<string, { hit: number; total: number }>,
+  recallByType: Record<string, RecallBucket>,
   traj: TrajectoryRunOpts,
 ): Promise<void> {
   await resetTables(engine);
@@ -678,13 +735,15 @@ async function runOneQuestion(
   }
 
   const retrievedSessionIds = uniqSessionIds(results);
-  // Recall: did any retrieved session match ground-truth answer_session_ids?
+  // Recall vs ground-truth answer_session_ids. FRA-23396: track ANY-hit and
+  // full-hit side by side — see computeRecall.
   if (q.answer_session_ids && q.answer_session_ids.length > 0) {
-    const gt = new Set(q.answer_session_ids);
-    const hit = retrievedSessionIds.some(s => gt.has(s));
-    const bucket = recallByType[q.question_type] ?? (recallByType[q.question_type] = { hit: 0, total: 0 });
+    const rc = computeRecall(retrievedSessionIds, q.answer_session_ids);
+    const bucket = recallByType[q.question_type] ??
+      (recallByType[q.question_type] = { hit: 0, full: 0, total: 0 });
     bucket.total++;
-    if (hit) bucket.hit++;
+    if (rc.hit) bucket.hit++;
+    if (rc.full) bucket.full++;
   }
 
   // v0.40.2.0 — trajectory routing for temporal / knowledge_update
@@ -745,10 +804,17 @@ async function runOneQuestion(
   // v0.40.1.0 (Track D / T2) — compute per-row hit/miss so resume runs can
   // rebuild the cumulative recallByType from the file alone. Undefined when
   // the dataset has no ground-truth answer_session_ids for this question.
+  // FRA-23396 — `recall_full` / `recall_frac` are emitted alongside so a
+  // resume run can rebuild the strict bucket too, and so an artifact reader
+  // can tell a 2-of-3 miss from a clean hit without re-running.
   let recallHit: boolean | undefined;
+  let recallFull: boolean | undefined;
+  let recallFrac: number | undefined;
   if (q.answer_session_ids && q.answer_session_ids.length > 0) {
-    const gt = new Set(q.answer_session_ids);
-    recallHit = retrievedSessionIds.some(s => gt.has(s));
+    const rc = computeRecall(retrievedSessionIds, q.answer_session_ids);
+    recallHit = rc.hit;
+    recallFull = rc.full;
+    recallFrac = rc.frac;
   }
 
   emitter.emit({
@@ -768,6 +834,8 @@ async function runOneQuestion(
     hypothesis,
     retrieved_session_ids: retrievedSessionIds,
     ...(recallHit !== undefined ? { recall_hit: recallHit } : {}),
+    ...(recallFull !== undefined ? { recall_full: recallFull } : {}),
+    ...(recallFrac !== undefined ? { recall_frac: recallFrac } : {}),
     // v0.32.3 — record the active mode in every per-question row so reviewers
     // can group/compare without re-running. Omitted when --mode is unset.
     ...(opts.mode ? { mode: opts.mode } : {}),
@@ -795,7 +863,7 @@ async function runOneQuestion(
  */
 export function seedRecallByTypeFromFile(
   outputPath: string,
-  bucket: Record<string, { hit: number; total: number }>,
+  bucket: Record<string, RecallBucket>,
 ): void {
   if (!existsSync(outputPath)) return;
   const raw = readFileSync(outputPath, 'utf8');
@@ -811,9 +879,14 @@ export function seedRecallByTypeFromFile(
     if (row.kind === 'by_type_summary') continue;
     if (typeof row.question_type !== 'string') continue;
     if (typeof row.recall_hit !== 'boolean') continue;
-    const b = bucket[row.question_type] ?? (bucket[row.question_type] = { hit: 0, total: 0 });
+    const b = bucket[row.question_type] ?? (bucket[row.question_type] = { hit: 0, full: 0, total: 0 });
     b.total++;
     if (row.recall_hit) b.hit++;
+    // FRA-23396 — rows written before recall_full existed have no strict
+    // field. Fall back to recall_hit so a mixed-vintage resume file still
+    // sums; single-gold-session rows (the majority) are identical either
+    // way, and the fallback can only over-count `full`, never invent a miss.
+    if (typeof row.recall_full === 'boolean' ? row.recall_full : row.recall_hit) b.full++;
   }
 }
 
@@ -828,22 +901,59 @@ export function seedRecallByTypeFromFile(
 export interface ByTypeSummary {
   schema_version: 1;
   kind: 'by_type_summary';
-  recall_by_type: Record<string, { hit: number; total: number; rate: number }>;
-  aggregate: { hit: number; total: number; rate: number | null };
+  recall_by_type: Record<string, {
+    hit: number; total: number; rate: number;
+    /** FRA-23396 — additive strict counterparts; `rate` keeps ANY-hit semantics. */
+    full: number; full_rate: number;
+  }>;
+  aggregate: {
+    hit: number; total: number; rate: number | null;
+    full: number; full_rate: number | null;
+  };
 }
 
+/**
+ * FRA-23396 — shared `--by-type-floor` breach detection for both call sites
+ * (normal completion and the no-op-resume path). Extracted so the two can
+ * never drift on which metric they gate.
+ */
+export function collectFloorBreaches(
+  summary: ByTypeSummary,
+  floor: number,
+  metric: 'hit' | 'full',
+): string[] {
+  const breaches: string[] = [];
+  for (const [t, v] of Object.entries(summary.recall_by_type)) {
+    const rate = metric === 'full' ? v.full_rate : v.rate;
+    if (rate < floor) {
+      breaches.push(`${t}: ${(rate * 100).toFixed(1)}% < ${(floor * 100).toFixed(1)}%`);
+    }
+  }
+  return breaches;
+}
+
+/**
+ * FRA-23396 — `rate` remains ANY-hit so existing artifacts and the
+ * `--by-type-floor` default stay comparable across the fix; `full_rate` is
+ * the strict signal. Emitting both (rather than redefining `rate` in place)
+ * means a reader can diff a pre-fix and post-fix summary without decoding
+ * which definition produced which number.
+ */
 export function buildByTypeSummary(
-  recallByType: Record<string, { hit: number; total: number }>,
+  recallByType: Record<string, RecallBucket>,
 ): ByTypeSummary {
   const sortedKeys = Object.keys(recallByType).sort();
-  const recall: Record<string, { hit: number; total: number; rate: number }> = {};
+  const recall: ByTypeSummary['recall_by_type'] = {};
   let aggHit = 0;
+  let aggFull = 0;
   let aggTotal = 0;
   for (const k of sortedKeys) {
     const v = recallByType[k];
     const rate = v.total === 0 ? 0 : v.hit / v.total;
-    recall[k] = { hit: v.hit, total: v.total, rate };
+    const fullRate = v.total === 0 ? 0 : v.full / v.total;
+    recall[k] = { hit: v.hit, total: v.total, rate, full: v.full, full_rate: fullRate };
     aggHit += v.hit;
+    aggFull += v.full;
     aggTotal += v.total;
   }
   return {
@@ -854,6 +964,8 @@ export function buildByTypeSummary(
       hit: aggHit,
       total: aggTotal,
       rate: aggTotal === 0 ? null : aggHit / aggTotal,
+      full: aggFull,
+      full_rate: aggTotal === 0 ? null : aggFull / aggTotal,
     },
   };
 }

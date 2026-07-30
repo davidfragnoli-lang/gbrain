@@ -359,12 +359,67 @@ describe('loadResumeSet (v0.35.1.0)', () => {
 // buildByTypeSummary (pure function — no PGLite, no LLM)
 // ---------------------------------------------------------------------------
 
+// FRA-23396 — computeRecall: ANY-hit vs full-hit.
+describe('computeRecall (FRA-23396)', () => {
+  test('the nightly-7 case: 2 of 3 gold sessions is a hit but not a full hit', async () => {
+    const { computeRecall } = await import('../src/commands/eval-longmemeval.ts');
+    const rc = computeRecall(
+      ['nightly-7-s1', 'nightly-7-s3'],
+      ['nightly-7-s1', 'nightly-7-s2', 'nightly-7-s3'],
+    );
+    expect(rc.hit).toBe(true);   // why the miss was invisible
+    expect(rc.full).toBe(false); // what should have been reported
+    expect(rc.frac).toBeCloseTo(2 / 3, 5);
+  });
+
+  test('single-gold-session questions are unaffected: full === hit', async () => {
+    const { computeRecall } = await import('../src/commands/eval-longmemeval.ts');
+    const got = computeRecall(['a', 'zz'], ['a']);
+    expect(got.hit).toBe(true);
+    expect(got.full).toBe(true);
+    const missed = computeRecall(['zz'], ['a']);
+    expect(missed.hit).toBe(false);
+    expect(missed.full).toBe(false);
+  });
+
+  test('all gold retrieved (plus extras) is a full hit; zero gold is neither', async () => {
+    const { computeRecall } = await import('../src/commands/eval-longmemeval.ts');
+    const all = computeRecall(['s1', 'noise', 's2', 's3'], ['s1', 's2', 's3']);
+    expect(all.full).toBe(true);
+    expect(all.frac).toBeCloseTo(1, 5);
+    const none = computeRecall(['noise'], ['s1', 's2']);
+    expect(none.hit).toBe(false);
+    expect(none.full).toBe(false);
+    expect(none.frac).toBe(0);
+  });
+
+  test('empty ground truth is never a full hit (no vacuous 100%)', async () => {
+    const { computeRecall } = await import('../src/commands/eval-longmemeval.ts');
+    const rc = computeRecall(['a'], []);
+    expect(rc.hit).toBe(false);
+    expect(rc.full).toBe(false);
+    expect(rc.frac).toBe(0);
+  });
+
+  test('duplicate gold ids do not inflate the fraction', async () => {
+    const { computeRecall } = await import('../src/commands/eval-longmemeval.ts');
+    // gt is de-duped into a Set, so 3 listed / 2 distinct means retrieving
+    // both distinct sessions is a FULL hit, not 2/3.
+    const rc = computeRecall(['s1', 's2'], ['s1', 's2', 's1']);
+    expect(rc.full).toBe(true);
+    expect(rc.frac).toBeCloseTo(1, 5);
+  });
+});
+
 describe('buildByTypeSummary (pure function)', () => {
   test('populated buckets produce sorted keys + rate math', async () => {
     const { buildByTypeSummary } = await import('../src/commands/eval-longmemeval.ts');
+    // FRA-23396 — `full` sits below `hit` on multi-session on purpose: that
+    // is the nightly-7 shape (every question retrieved SOME gold session,
+    // only 6 of 10 retrieved ALL of them).
     const summary = buildByTypeSummary({
-      'multi-session': { hit: 10, total: 10 },
-      'single-session-user': { hit: 18, total: 19 },
+      'multi-session': { hit: 10, full: 6, total: 10 },
+      'single-session-user': { hit: 18, full: 18, total: 19 },
     });
     expect(summary.kind).toBe('by_type_summary');
     expect(summary.schema_version).toBe(1);
@@ -375,6 +430,21 @@ describe('buildByTypeSummary (pure function)', () => {
     expect(summary.aggregate.hit).toBe(28);
     expect(summary.aggregate.total).toBe(29);
     expect(summary.aggregate.rate).toBeCloseTo(28 / 29, 5);
+    // The strict metric must NOT be masked by the ANY-hit 100%.
+    expect(summary.recall_by_type['multi-session'].full_rate).toBeCloseTo(0.6, 5);
+    expect(summary.aggregate.full).toBe(24);
+    expect(summary.aggregate.full_rate).toBeCloseTo(24 / 29, 5);
+  });
+
+  // FRA-23396 — the floor gate must be able to see a miss that ANY-hit hides.
+  test('collectFloorBreaches: metric=full catches what metric=hit misses', async () => {
+    const { buildByTypeSummary, collectFloorBreaches } = await import('../src/commands/eval-longmemeval.ts');
+    // The 07-30 nightly-7 shape: 1 multi-session question, ANY-hit 100%,
+    // full-hit 0% (2 of 3 gold sessions retrieved).
+    const summary = buildByTypeSummary({ 'multi-session': { hit: 1, full: 0, total: 1 } });
+    expect(collectFloorBreaches(summary, 0.9, 'hit')).toEqual([]);
+    expect(collectFloorBreaches(summary, 0.9, 'full')).toHaveLength(1);
+    expect(collectFloorBreaches(summary, 0.9, 'full')[0]).toContain('multi-session');
   });
 
   test('empty bucket map produces rate:null aggregate, not NaN', async () => {

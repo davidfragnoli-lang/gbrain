@@ -125,8 +125,25 @@ function dedupByTextSimilarity(results: SearchResult[], threshold: number): Sear
 
 /**
  * Layer 3: No page type exceeds maxRatio of total results.
+ *
+ * FRA-23396 — single-type guard. "Diversity" presupposes something else could
+ * take the freed slot. When every candidate shares one type there is no
+ * alternative to promote, so the ratio stops being a diversity control and
+ * becomes a blind recall cap of ceil(maxRatio * n): a homogeneous 3-candidate
+ * set is cut to 2, a 4-candidate set to 3, however relevant the dropped tail
+ * is. That is what silently dropped a gold session from the nightly-7 quality
+ * probe (3 gold sessions in, 2 returned, brain answered "2" to a gold-"three"
+ * counting question), and it hits any single-type corpus: a chat-only eval
+ * haystack, a `note`-only source, a code-only search.
+ *
+ * Skipping the layer here cannot reduce diversity — with <2 distinct types
+ * there is none to enforce — and cannot change any multi-type result, since
+ * the loop below already keeps everything when no type exceeds its share.
  */
 function enforceTypeDiversity(results: SearchResult[], maxRatio: number): SearchResult[] {
+  const distinctTypes = new Set(results.map(r => r.type)).size;
+  if (distinctTypes < 2) return results;
+
   const maxPerType = Math.max(1, Math.ceil(results.length * maxRatio));
   const typeCounts = new Map<string, number>();
   const kept: SearchResult[] = [];
