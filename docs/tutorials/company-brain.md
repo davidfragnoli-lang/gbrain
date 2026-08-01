@@ -554,7 +554,7 @@ What to do next:
 
 - **Wire ingestion** from external systems (Granola, Linear, Slack) using the [ingestion source contract](../skillpack-anatomy.md). Most companies want their meetings auto-ingested so the brain stays current without anyone typing notes.
 - **Set up team-specific dashboards** through the admin UI. Each team lead can have their own view of brain health and activity.
-- **Explore the rest of the brain layer.** `gbrain whoknows` (find the expert on a topic), `gbrain find_trajectory` (how a metric changed over time), `gbrain founder scorecard` (especially useful for VC and ops teams), the contradiction-detection cycle that surfaces conflicts between different people's notes.
+- **Explore the rest of the brain layer.** `gbrain whoknows` (find the expert on a topic), `gbrain find-trajectory` (how a metric changed over time), `gbrain founder scorecard` (especially useful for VC and ops teams), the contradiction-detection cycle that surfaces conflicts between different people's notes.
 
 If you're building in this space (which YC has flagged as the [company-brain category in its Request for Startups](https://www.ycombinator.com/rfs#company-brain)), you might as well build on this. Everything described above is open source, MIT licensed, and what I run in production behind my own AI agents.
 

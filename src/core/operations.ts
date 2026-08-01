@@ -1197,7 +1197,9 @@ const put_page: Operation = {
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
     try {
       const { runPostWriteLint } = await import('./output/post-write.ts');
-      const lint = await runPostWriteLint(ctx.engine, result.slug);
+      const lint = await runPostWriteLint(ctx.engine, result.slug, {
+        sourceId: ctx.sourceId ?? 'default',
+      });
       if (lint.ran) {
         writerLint = {
           error_count: lint.findings.filter(f => f.severity === 'error').length,
@@ -2707,9 +2709,7 @@ const get_versions: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    const versions = await ctx.engine.getVersions(p.slug as string, sourceOpts);
+    const versions = await ctx.engine.getVersions(p.slug as string, sourceScopeOpts(ctx));
     // Same takes-allow-list privacy boundary as get_page. Snapshots persist
     // historical compiled_truth verbatim, including the takes fence, so
     // a remote token bypassing get_page via /history would re-introduce
@@ -2760,12 +2760,18 @@ const sync_brain: Operation = {
   localOnly: true,
   handler: async (ctx, p) => {
     const { performSync } = await import('../commands/sync.ts');
+    // #2830: thread ctx.sourceId (D7 pattern, same as revert_version /
+    // put_page) so a no-`repo` call resolves the CALLER's sync anchor.
+    // Without it, performSync read the default source's repo_path/last_commit
+    // and silently synced against the wrong repo on multi-source brains.
+    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
     return performSync(ctx.engine, {
       repoPath: p.repo as string | undefined,
       dryRun: ctx.dryRun || (p.dry_run as boolean) || false,
       noEmbed: (p.no_embed as boolean) || false,
       noPull: (p.no_pull as boolean) || false,
       full: (p.full as boolean) || false,
+      ...sourceOpts,
     });
   },
   cliHints: { name: 'sync', hidden: true },
@@ -2800,9 +2806,7 @@ const get_raw_data: Operation = {
     source: { type: 'string', description: 'Filter by source' },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20 + D21): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceOpts);
+    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -2832,9 +2836,7 @@ const get_chunks: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getChunks(p.slug as string, sourceOpts);
+    return ctx.engine.getChunks(p.slug as string, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -5042,7 +5044,7 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: every mutation is validated against an in-memory manifest first, and the pack file is written to disk at most once, after the FULL batch has proven valid — so a failure at any point leaves the pack file byte-identical to its pre-batch state (never a partial write). Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {
@@ -5065,92 +5067,20 @@ const schema_apply_mutations: Operation = {
     const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : 'cli';
     const sourceId = ctx.sourceId;  // codex C5: write-side scoping
-    // Compose every mutation inside ONE withPackLock so the batch is
-    // truly atomic. The withMutation skeleton handles audit / cache
-    // invalidation per operation; we orchestrate the lock + iteration.
-    const { withPackLock } = await import('./schema-pack/pack-lock.ts');
-    const {
-      addTypeToPack, removeTypeFromPack, updateTypeOnPack,
-      addAliasToType, removeAliasFromType, addPrefixToType, removePrefixFromType,
-      addLinkTypeToPack, removeLinkTypeFromPack,
-      setExtractableOnType, setExpertRoutingOnType,
-      SchemaPackMutationError,
-    } = await import('./schema-pack/mutate.ts');
-    const baseMutateOpts = {
-      actor: actor as 'cli' | `mcp:${string}`,
-      batchId,
-      engine: ctx.engine,
-      ...(sourceId ? { sourceId } : {}),
-      ...(force ? { force: true } : {}),
-    };
-    const results: unknown[] = [];
+    // `applyMutationsAtomic` (issue #2581) owns the lock + single read +
+    // single write for the whole batch: every mutation is validated
+    // in-memory first, and the pack file is written at most once, only
+    // after the FULL batch checks out. That is what makes this actually
+    // atomic (a failure at any index can never leave earlier mutations on
+    // disk), vs. the old per-mutation-writes-as-it-goes shape.
+    const { applyMutationsAtomic } = await import('./schema-pack/mutate.ts');
     try {
-      // Outer lock: hold the pack for the whole batch so other writers
-      // can't slip in between mutations.
-      await withPackLock(pack, { force, lockDir: undefined }, async () => {
-        for (let i = 0; i < mutations.length; i++) {
-          const m = mutations[i]!;
-          // Each primitive acquires the lock internally; the outer
-          // withPackLock makes that re-entrant via fast-stale-detect
-          // (--force option for the inner call). To keep semantics
-          // simple, we pass {force:true} to the inner calls because
-          // they're nested inside our outer lock — we already own it.
-          const innerOpts = { ...baseMutateOpts, force: true };
-          let r: unknown;
-          switch (m.op) {
-            case 'add_type':
-              r = await addTypeToPack(pack, {
-                name: m.name as string,
-                primitive: m.primitive as never,
-                prefix: m.prefix as string,
-                extractable: m.extractable as boolean | undefined,
-                expertRouting: m.expert_routing as boolean | undefined,
-                aliases: m.aliases as string[] | undefined,
-              }, innerOpts);
-              break;
-            case 'remove_type':
-              r = await removeTypeFromPack(pack, m.name as string, innerOpts);
-              break;
-            case 'update_type':
-              r = await updateTypeOnPack(pack, { name: m.name as string, patch: (m.patch as object) ?? {} }, innerOpts);
-              break;
-            case 'add_alias':
-              r = await addAliasToType(pack, m.type as string, m.alias as string, innerOpts);
-              break;
-            case 'remove_alias':
-              r = await removeAliasFromType(pack, m.type as string, m.alias as string, innerOpts);
-              break;
-            case 'add_prefix':
-              r = await addPrefixToType(pack, m.type as string, m.prefix as string, innerOpts);
-              break;
-            case 'remove_prefix':
-              r = await removePrefixFromType(pack, m.type as string, m.prefix as string, innerOpts);
-              break;
-            case 'add_link_type':
-              r = await addLinkTypeToPack(pack, {
-                name: m.name as string,
-                inverse: m.inverse as string | undefined,
-                inference: m.inference as { regex?: string; page_type?: string; target_type?: string } | undefined,
-              }, innerOpts);
-              break;
-            case 'remove_link_type':
-              r = await removeLinkTypeFromPack(pack, m.name as string, innerOpts);
-              break;
-            case 'set_extractable':
-              r = await setExtractableOnType(pack, m.type as string, m.value as boolean, innerOpts);
-              break;
-            case 'set_expert_routing':
-              r = await setExpertRoutingOnType(pack, m.type as string, m.value as boolean, innerOpts);
-              break;
-            default:
-              throw new SchemaPackMutationError(
-                'INVALID_RESULT',
-                `unknown mutation op: '${m.op}' at index ${i}`,
-                { index: i, op: m.op },
-              );
-          }
-          results.push({ index: i, op: m.op, ...(r as object) });
-        }
+      const results = await applyMutationsAtomic(pack, mutations, {
+        actor: actor as 'cli' | `mcp:${string}`,
+        batchId,
+        engine: ctx.engine,
+        ...(sourceId ? { sourceId } : {}),
+        ...(force ? { force: true } : {}),
       });
       return {
         schema_version: 1,
@@ -5161,17 +5091,21 @@ const schema_apply_mutations: Operation = {
       };
     } catch (e) {
       const code = (e as { code?: string }).code ?? 'UNKNOWN';
+      const failedAtIndex = (e as { details?: { index?: number } }).details?.index;
       return {
         error: 'mutation_failed',
         code,
         message: (e as Error).message,
         batch_id: batchId,
-        // Partial results recorded so the agent can inspect which
-        // mutations landed before the failure (the atomic guarantee
-        // is at the LOCK level — individual mutations are sequential
-        // and each is atomic; pack state reflects everything up to the
-        // failed mutation).
-        partial_results: results,
+        // Nothing was written to disk — applyMutationsAtomic only writes
+        // once, after every mutation in the batch has validated cleanly.
+        // (Pre-fix, this field was `partial_results` and listed mutations
+        // that HAD already landed on disk, because the old implementation
+        // wrote as it went — that shape is gone; a failed batch can no
+        // longer imply partial application.)
+        mutations_applied: 0,
+        pack_unchanged: true,
+        ...(failedAtIndex !== undefined ? { failed_at_index: failedAtIndex } : {}),
       };
     }
   },

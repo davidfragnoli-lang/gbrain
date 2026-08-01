@@ -11,8 +11,8 @@
  */
 
 import express from 'express';
+import type { Socket } from 'net';
 import type { Request, Response, NextFunction } from 'express';
-import type { Server as HttpServer } from 'http';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
@@ -57,10 +57,35 @@ import { registerCleanup } from '../core/process-cleanup.ts';
  */
 export const HEALTH_TIMEOUT_MS = 3000;
 
-/** Exported so tests can type their structural fakes exactly (#3599). */
-export type HttpServerLifecycle = Pick<HttpServer, 'listening' | 'once' | 'off' | 'close'>;
-/** Exported so tests can type their structural fakes exactly (#3599). */
-export type SignalSource = Pick<NodeJS.Process, 'once' | 'off'>;
+/**
+ * The narrowest contract this module actually consumes: subscribe, unsubscribe.
+ * Every return value is discarded, so it is `unknown` rather than `this` — a
+ * `Pick<>` of the full Node types would demand a fidelity no caller needs and
+ * no test double can honestly provide.
+ */
+type EventSubscriber = {
+  once(event: string, listener: (...args: any[]) => void): unknown;
+  off(event: string, listener: (...args: any[]) => void): unknown;
+};
+/**
+ * Only what socket teardown needs. This one IS a `Pick` of the real type, on
+ * purpose: no typechecked test double has to satisfy it (fakes reach it through
+ * `emit`, which is untyped), so binding it to `net.Socket` costs nothing and
+ * buys drift detection. A hand-written structural shape here would be an
+ * unchecked assertion — method parameters are bivariant, so annotating the
+ * listener param would match our own declaration whatever a real socket does.
+ */
+type TrackedSocket = Pick<Socket, 'destroy' | 'once'>;
+type HttpServerLifecycle = EventSubscriber & {
+  readonly listening: boolean;
+  close(callback?: (error?: Error) => void): unknown;
+  // Narrowed to the one event this module subscribes with `on`, so the listener
+  // parameter is genuinely checked against TrackedSocket. A `(...args: any[])`
+  // signature here would make the annotation at the call site an unchecked
+  // assertion — the same defect this file was just cleaned of.
+  on(event: 'connection', listener: (socket: TrackedSocket) => void): unknown;
+};
+type SignalSource = EventSubscriber;
 type CleanupRegistrar = typeof registerCleanup;
 
 /**
@@ -79,6 +104,17 @@ export function waitForHttpServerLifecycle(
   const signals = options.signals ?? process;
   const register = options.register ?? registerCleanup;
 
+  // `close()` stops the listener and then waits for every open connection to
+  // drain. One attached admin-SSE EventSource — or any keep-alive socket —
+  // holds it open forever, so shutdown has to sever them itself. Bun 1.3.x
+  // ships `closeAllConnections()`/`closeIdleConnections()` as no-op stubs, so
+  // tracking is the only portable teardown.
+  const sockets = new Set<TrackedSocket>();
+  server.on('connection', (socket: TrackedSocket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     let closePromise: Promise<void> | null = null;
@@ -94,6 +130,9 @@ export function waitForHttpServerLifecycle(
           if (error) closeReject(error);
           else closeResolve();
         });
+        // After close() so the listener stops accepting first, then in-flight
+        // connections are severed rather than waited on.
+        for (const socket of sockets) socket.destroy();
       });
       return closePromise;
     };
@@ -202,8 +241,12 @@ export type ProbeHealthResult =
   | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
   | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
 
-/** Exported so tests can type their structural fakes exactly (#3598). */
-export type AdminSseResponse = Pick<Response, 'setHeader' | 'flushHeaders' | 'write'>;
+/** Narrowest contract the handshake consumes; see {@link EventSubscriber}. */
+type AdminSseResponse = {
+  setHeader(name: string, value: string): unknown;
+  flushHeaders(): void;
+  write(chunk: string): unknown;
+};
 
 /**
  * Complete the admin EventSource handshake immediately.
