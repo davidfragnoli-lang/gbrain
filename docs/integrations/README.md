@@ -44,6 +44,7 @@ These require manual setup (no self-installing recipe yet):
 |-------|-------------|
 | [Credential Gateway](credential-gateway.md) | Set up ClawVisor or Hermes for Gmail, Calendar, Contacts access |
 | [Meeting & Call Webhooks](meeting-webhooks.md) | Circleback meeting transcripts + Quo/OpenPhone SMS/calls |
+| [qm Harness](qm-harness.md) | gbrain as the company brain for a qm (multi-user agent harness) deployment — central HTTP MCP, per-scope clients, roster provisioning, write fencing |
 
 ## How to Read a Recipe
 

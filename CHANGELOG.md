@@ -2,6 +2,74 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.72.1] - 2026-08-02
+
+**Every issue and pull request now needs a human-written paragraph and a screenshot of gbrain actually being used.**
+
+Effective immediately, opening an issue or a PR requires two things from you personally: a paragraph you wrote yourself saying why you're opening it — what you were doing, what went wrong or what you needed, why it matters — and a screenshot of your terminal, agent session, or logs showing the real situation. Rough grammar is fine and preferred over polish. AI-generated or AI-polished intent text is not accepted; the paragraph is the human part. AI assistance for the *code* is still welcome.
+
+Issues and PRs missing either are closed without review, and can be reopened once both are added. Scrub private names, companies, keys, and brain contents from screenshots before attaching — a redacted screenshot is fine, a missing one is not.
+
+The requirement is stated in `CONTRIBUTING.md` and pre-filled in the bug-report and feature-request issue templates plus a new pull-request template, so the fields are in front of you when you open one.
+
+## [0.42.72.0] - 2026-08-01
+
+**Per-person write isolation inside a shared source, and a guide for putting gbrain behind a multi-user agent harness.**
+
+Until now, `--source` was the only write boundary: a client could write anywhere inside the source it was scoped to, and keeping each person in their own folder was a convention the agent had to honor by itself. Registering a client with `--bound-slug-prefixes` now makes that boundary real. Writes outside the bound prefixes are refused by the server, on every op that can name a page.
+
+**Adding a binding to an existing client narrows it on purpose.** Ops that write by something other than a page slug can't be confined to a prefix, so a bound client is refused them outright rather than left with an unfenced path: `extract_entities`, `extract_facts`, `forget_fact`, `ontology_propose`, `sources_add`/`sources_remove`, and `POST /ingest`. `put_page`'s automatic fact extraction is skipped for the same reason — it writes to entity pages the caller never named. Reads are unaffected, and unbound clients behave exactly as before. The gate keys on "anything that is not a plain read", so an op added in a future release is refused to bound clients until it is explicitly fenced.
+
+Both prefix spellings work: the `wiki/agents/alice/*` glob that `submit_agent` bindings already use, and the plainer `emp-alice/` form. Change a binding in place with `gbrain auth rescope-client <id> --bound-slug-prefixes <p1,p2|none>` — existing tokens pick it up on their next request, so no secret rotation is needed when someone joins or leaves a team.
+
+**New guide: [gbrain as the company brain for a qm deployment](docs/integrations/qm-harness.md).** qm is a multiplayer agent harness where each employee and each channel gets an isolated agent scope. The guide covers the whole path — one central `gbrain serve --http`, the thin-client binary baked into the sandbox image, one OAuth client per scope, and a roster-driven provisioning script that converges the brain to a list of people and channels. It also states plainly what the model does *not* give you: within a shared source, reads stay source-granular, so prefix isolation is a write boundary, not a privacy boundary.
+gbrain upgrade                    # or: bun install -g gbrain@0.42.72.0
+gbrain apply-migrations --yes     # required: the fence refuses writes it cannot evaluate
+```
+
+To fence an existing client to a folder:
+
+```bash
+gbrain auth rescope-client <client_id> --bound-slug-prefixes partners/alice-example/
+gbrain auth rescope-client <client_id> --bound-slug-prefixes none   # undo
+```
+
+Verify it took, from a client holding that credential — the first write should succeed and the second should be refused:
+
+```bash
+gbrain put partners/alice-example/notes/test --content "mine"
+gbrain put partners/bob-example/notes/test --content "not mine"
+```
+
+## [0.42.71.0] - 2026-08-01
+
+**GBrain now publishes real releases. Every version bump from here on lands on the [Releases page](https://github.com/garrytan/gbrain/releases) with organized notes and downloadable binaries — and binary self-update finally works.**
+
+Until now the repo had no releases at all: `gbrain check-update` could tell you a new version existed, but `gbrain self-upgrade` downloaded from an empty releases API and failed every time, and anyone trying to follow what shipped had to read raw commit history. That's what people have been (rightly) complaining about.
+
+From this release forward, every version bump automatically:
+
+- **Tags the commit** (`v0.42.71.0`) so versions are addressable in git.
+- **Publishes a GitHub Release** whose notes are that version's CHANGELOG entry — the same organized, user-facing writeup, not a commit dump.
+- **Attaches compiled binaries** for macOS (arm64) and Linux (x64), so `gbrain self-upgrade` and fresh binary installs work without a toolchain.
+
+The pipeline is idempotent: a partial release (tag exists, assets incomplete) is repaired on the next run instead of wedging. It runs post-merge, so a flaky release build can never turn master red. Releases for today's two fix waves (v0.42.69.0 and v0.42.70.0) have been backfilled with their CHANGELOG notes so the Releases page tells the whole story of the day; binaries attach from v0.42.71.0 onward.
+
+### To take advantage of v0.42.71.0
+
+```bash
+gbrain check-update            # now resolves against real releases
+gbrain self-upgrade            # now actually downloads a binary
+```
+
+Or browse https://github.com/garrytan/gbrain/releases for organized per-version notes.
+
+### For contributors
+
+`docs/RELEASING.md` gains the release-publication section; `scripts/changelog-entry.sh` extracts a version's CHANGELOG section (used for release notes — keep entries under the standard `## [X.Y.Z.W]` headers and they publish verbatim). The workflow keeps all actions SHA-pinned, tightens top-level permissions to `contents: read` with write scoped to the release job only, and env-binds all interpolations.
+
+Contributed by @time-attack (#3573, closing #3521).
+
 ## [0.42.70.0] - 2026-08-01
 
 **Community fix wave two: 18 contributed fixes. The headline: several things you asked gbrain to do were being quietly ignored — and now they aren't.**
@@ -17,10 +85,6 @@ All notable changes to GBrain will be documented in this file.
 **Windows and self-hosters.** Markdown files keep LF endings so frontmatter parsers stop mis-reading on Windows checkouts; the archive-crawler path gate no longer denies every real Windows path (and no longer fail-opens on NTFS case-insensitivity); a chat-synopsis tier that was hardcoded to one provider now follows your configured models; vector search asks the index for as many candidates as it was told to consider.
 
 **Quieter, more honest infrastructure.** `serve --http` no longer leaves an orphan holding the database lock after Ctrl-C; a minion child that fails to launch settles immediately instead of hanging its slot; doctor gains checks for content-hash duplicates, undeclared database-only pages, stale heartbeats, and a tamper-evident manifest for the skills directory; federated reads respect per-source isolation settings in two more paths; and the security docs were rewritten to describe fixes without cataloguing attack surface.
-
-### To take advantage of v0.42.70.0
-
-```bash
 gbrain upgrade
 gbrain extract --stale        # re-extracts links under the fixed resolver
 gbrain doctor                 # includes the new silent-failure checks
