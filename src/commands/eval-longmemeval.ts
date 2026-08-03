@@ -168,6 +168,14 @@ function printHelp(): void {
     `  --model M                 Override answer-generation model (default: resolveModel).\n` +
     `  --retrieval-only          Skip LLM answer generation; emit retrieved sessions instead.\n` +
     `  --keyword-only            Skip vector embedding; pure keyword retrieval.\n` +
+    `                            STRICT-AND, by design: this arm calls searchKeyword\n` +
+    `                            WITHOUT orFallback, so every non-stopword query term\n` +
+    `                            must co-occur in one chunk. A natural-language question\n` +
+    `                            ("How many projects has X launched this year?") therefore\n` +
+    `                            scores 0 whenever a term like "projects"/"year" is absent\n` +
+    `                            from the corpus — that is a correct strict-AND result, NOT\n` +
+    `                            a dead arm. Production hybridSearch sets orFallback and\n` +
+    `                            does retrieve these. See FRA-23405.\n` +
     `  --expansion               Enable multi-query expansion (off by default for benchmarks).\n` +
     `                            Costs one Haiku call per question; non-deterministic.\n` +
     `  --top-k K                 Retrieve K sessions per question (default: 8).\n` +
@@ -726,6 +734,12 @@ async function runOneQuestion(
 
   let results: SearchResult[];
   if (opts.keywordOnly) {
+    // FRA-23405: NO orFallback here, deliberately. The eval is one of the
+    // strict-AND precision consumers named at pglite-engine.ts:1715 — the
+    // keyword-only number is a measurement of strict conjunctive FTS, not of
+    // the production recall arm. Do NOT add orFallback to make a recall
+    // number move; that would silently redefine what this arm measures.
+    // hybridSearch (the else branch) is the arm that opts into the fallback.
     results = await engine.searchKeyword(q.question, { limit: opts.topK });
   } else {
     const searchOpts = opts.expansion
