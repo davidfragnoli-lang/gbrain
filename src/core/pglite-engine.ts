@@ -5440,7 +5440,7 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
-    `, [CHRONICLE_SOURCE_PAGE_TYPE_LIST]);
+    `);
 
     // Top 5 most connected entities by total link count (in + out).
     const { rows: connected } = await this.db.query(`
