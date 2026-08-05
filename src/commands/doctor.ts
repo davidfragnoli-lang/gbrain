@@ -5164,11 +5164,13 @@ export async function buildChecks(
     // Read/parse failure is itself best-effort; skip silently.
   }
 
-  // 3b-bis. Supervisor health (filesystem-only: PID liveness + audit log).
+  // 3b-bis. Jobs supervisor health (filesystem-only: PID liveness + audit log).
   // Reads the default PID file (`~/.gbrain/supervisor.pid` unless the user
   // overrode with GBRAIN_SUPERVISOR_PID_FILE) and the latest audit file
   // written by src/core/minions/handlers/supervisor-audit.ts. Surfaces
-  // supervisor_running / last_start / crashes_24h / max_crashes_exceeded.
+  // supervisor_running / last_start / crashes_24h / max_crashes_exceeded for
+  // `gbrain jobs supervisor`. This does NOT cover `gbrain autopilot`; a
+  // generic "supervisor" label here reads as coverage it does not provide.
   // Does NOT run the supervisor itself — this is a read-only health check.
   try {
     const { DEFAULT_PID_FILE } = await import('../core/minions/supervisor.ts');
@@ -5217,30 +5219,30 @@ export async function buildChecks(
     if (supervisorPid !== null || events.length > 0) {
       if (maxCrashesEvent) {
         checks.push({
-          name: 'supervisor',
+          name: 'jobs_supervisor',
           status: 'fail',
-          message: `Supervisor gave up at ${maxCrashesEvent.ts} (max_crashes_exceeded). Restart with: gbrain jobs supervisor start --detach`,
+          message: `Jobs supervisor gave up at ${maxCrashesEvent.ts} (max_crashes_exceeded). Restart with: gbrain jobs supervisor start --detach`,
         });
       } else if (!running && events.length > 0) {
         checks.push({
-          name: 'supervisor',
+          name: 'jobs_supervisor',
           status: 'warn',
-          message: `Supervisor not running (last_start=${lastStart ?? 'unknown'}). Restart with: gbrain jobs supervisor start --detach`,
+          message: `Jobs supervisor not running (last_start=${lastStart ?? 'unknown'}). Restart with: gbrain jobs supervisor start --detach`,
         });
       } else if (crashes24h >= 1) {
         // Threshold dropped from `>3` (pre-fix, inflated by clean exits being
         // miscounted) to `>=1` (any real crash is signal). Per-cause breakdown
         // gives operators triage context without grep'ing the JSONL.
         checks.push({
-          name: 'supervisor',
+          name: 'jobs_supervisor',
           status: 'warn',
-          message: `Worker crashed ${crashes24h}x in last 24h (${causeStr}). Check ~/.gbrain/audit/supervisor-*.jsonl for context.`,
+          message: `Jobs supervisor worker crashed ${crashes24h}x in last 24h (${causeStr}). Check ~/.gbrain/audit/supervisor-*.jsonl for context.`,
         });
       } else {
         checks.push({
-          name: 'supervisor',
+          name: 'jobs_supervisor',
           status: 'ok',
-          message: `running=true${detectedViaDbLock ? ' (detected via DB lock; pidfile not at the HOME-derived path)' : ` pid=${supervisorPid}`} last_start=${lastStart ?? 'unknown'} crashes_24h=${crashes24h} clean_exits_24h=${summary.clean_exits}`,
+          message: `Jobs supervisor running=true${detectedViaDbLock ? ' (detected via DB lock; pidfile not at the HOME-derived path)' : ` pid=${supervisorPid}`} last_start=${lastStart ?? 'unknown'} crashes_24h=${crashes24h} clean_exits_24h=${summary.clean_exits}`,
         });
       }
     }
