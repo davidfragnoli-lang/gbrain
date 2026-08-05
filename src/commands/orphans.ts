@@ -51,8 +51,19 @@ export interface OrphanResult {
  * of them (the gazetteer holds only ~dozens of entity buckets). `type` is
  * optional so existing slug-only callers keep working unchanged.
  */
-export function shouldExclude(slug: string, overrides?: OrphanPolicyOverrides): boolean {
-  return shouldExcludeFromOrphanReporting(slug, overrides);
+export function shouldExclude(
+  slug: string,
+  typeOrOverrides?: string | null | OrphanPolicyOverrides,
+  maybeOverrides?: OrphanPolicyOverrides,
+): boolean {
+  if (
+    typeOrOverrides === undefined ||
+    typeOrOverrides === null ||
+    typeof typeOrOverrides === 'string'
+  ) {
+    return shouldExcludeFromOrphanReporting(slug, maybeOverrides, typeOrOverrides);
+  }
+  return shouldExcludeFromOrphanReporting(slug, typeOrOverrides);
 }
 
 /**

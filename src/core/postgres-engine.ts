@@ -5577,7 +5577,7 @@ export class PostgresEngine implements BrainEngine {
     const embedCoverage = Number(h.embed_coverage);
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const orphanPages = Number(h.orphan_pages);
+    const orphanPages = pageScopeRows.filter(row => row.islanded).length;
     const linkablePages = pageScopeRows.filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type));
     const linkablePageCount = linkablePages.length;
     const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;

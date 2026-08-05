@@ -5474,8 +5474,14 @@ export class PGLiteEngine implements BrainEngine {
     const embedCoverage = Number(r.embed_coverage);
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const orphanPages = Number(r.orphan_pages);
-    const linkablePages = (pageScopeRows as { slug: string; type: string | null; islanded: boolean; has_timeline: boolean }[])
+    const rawPageScopeRows = pageScopeRows as {
+      slug: string;
+      type: string | null;
+      islanded: boolean;
+      has_timeline: boolean;
+    }[];
+    const orphanPages = rawPageScopeRows.filter(row => row.islanded).length;
+    const linkablePages = rawPageScopeRows
       .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type));
     const linkablePageCount = linkablePages.length;
     const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
