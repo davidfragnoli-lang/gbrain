@@ -5518,18 +5518,6 @@ export class PostgresEngine implements BrainEngine {
         -- in SQL so the brain-score math is unchanged.
         0 as stale_pages,
         0 as orphan_pages,
-        -- FRA-1459 — linkable universe = pages MINUS raw chronicle/source
-        -- types (email/event/…). The brain-score orphan component divides
-        -- linkable_orphan_pages / linkable_page_count so a large legitimate
-        -- ingest batch of raw source pages no longer collapses the score.
-        (SELECT count(*) FROM pages p
-         WHERE p.type <> ALL(${CHRONICLE_SOURCE_PAGE_TYPE_LIST}::text[])
-        ) as linkable_page_count,
-        (SELECT count(*) FROM pages p
-         WHERE p.type <> ALL(${CHRONICLE_SOURCE_PAGE_TYPE_LIST}::text[])
-           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
-           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
-        ) as linkable_orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
@@ -5604,17 +5592,17 @@ export class PostgresEngine implements BrainEngine {
     // #2264 + per-brain overrides).
     const orphanPages = pageScopeRows
       .filter(row => row.islanded
-        && (isChronicleSourceType(row.type) || !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides))).length;
+        && (isChronicleSourceType(row.type) || !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type))).length;
     // Linkable universe (SCORE + advisor scope) additionally excludes raw
     // chronicle/source TYPES (FRA-1459/FRA-1572) so a large mail/event ingest —
     // pages that carry no wikilinks by design — can't collapse the orphan/link/
     // timeline components or fire a false orphan alert.
-    const linkablePages = pageScopeRows.filter(row => !isChronicleSourceType(row.type) && !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const linkablePages = pageScopeRows.filter(
+      row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type),
+    );
     const linkablePageCount = linkablePages.length;
-    const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
-    // linkable_orphan_pages (consumed by advisor/collect-usage-shape + noOrphans):
-    // islanded pages within the chronicle-type-excluded linkable universe.
     const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
+    const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
     const deadLinks = Number(h.dead_links);
     const linkCount = Number(h.link_count);
 
@@ -5653,10 +5641,10 @@ export class PostgresEngine implements BrainEngine {
 
     return {
       page_count: pageCount,
-      linkable_page_count: linkablePageCount,
       embed_coverage: embedCoverage,
       stale_pages: stalePages,
       orphan_pages: orphanPages,
+      linkable_page_count: linkablePageCount,
       linkable_orphan_pages: linkableOrphanPages,
       missing_embeddings: Number(h.missing_embeddings),
       brain_score: brainScore,

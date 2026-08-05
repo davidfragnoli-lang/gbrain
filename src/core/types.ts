@@ -1546,6 +1546,12 @@ export interface BrainHealth {
    */
   orphan_pages: number;
   /**
+   * FRA-1459: pages eligible to be considered orphans for scoring — total
+   * pages MINUS raw chronicle/source types (see CHRONICLE_SOURCE_PAGE_TYPES).
+   * Denominator of the brain-score orphan component.
+   */
+  linkable_page_count: number;
+  /**
    * FRA-1459: islanded pages (zero inbound AND zero outbound links) among
    * {@link linkable_page_count} only — i.e. excluding raw chronicle/source
    * types. Numerator of the brain-score orphan component. Always <=

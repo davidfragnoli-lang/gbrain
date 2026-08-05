@@ -1136,6 +1136,14 @@ describe('supervisor crash classifier wiring (v0.35.x)', () => {
     expect(source).toContain('clean_exits_24h=');
   });
 
+  test('doctor.ts labels this surface as jobs_supervisor, not generic supervisor', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    expect(source).toContain("name: 'jobs_supervisor'");
+    expect(source).toContain('Jobs supervisor not running');
+    expect(source).toContain('Jobs supervisor running=true');
+    expect(source).not.toContain("name: 'supervisor'");
+  });
+
   test('jobs.ts supervisor status uses summarizeCrashes — same wiring as doctor', async () => {
     const source = await Bun.file(new URL('../src/commands/jobs.ts', import.meta.url)).text();
     // Both surfaces MUST go through the shared helper. Without this, the two

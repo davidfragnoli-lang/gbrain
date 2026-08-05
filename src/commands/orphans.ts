@@ -54,16 +54,19 @@ export interface OrphanResult {
  */
 export function shouldExclude(
   slug: string,
-  type?: string | null,
-  overrides?: OrphanPolicyOverrides,
+  typeOrOverrides?: string | null | OrphanPolicyOverrides,
+  maybeOverrides?: OrphanPolicyOverrides,
 ): boolean {
-  // FRA-1459: raw chronicle/source page types (email/event/…) are excluded by
-  // `type`, independent of slug — a large legitimate ingest batch of raw source
-  // pages must not be counted as orphans. Slug-based exclusions delegate to the
-  // shared upstream policy (orphan-policy.ts), which also honors per-brain
-  // config overrides (orphans.exclude_prefixes / orphans.exclude_slugs).
-  if (isChronicleSourceType(type)) return true;
-  return shouldExcludeFromOrphanReporting(slug, overrides);
+  // Preserve the legacy shouldExclude(slug, overrides) call shape while also
+  // allowing type-aware exclusions for raw chronicle/source pages.
+  if (
+    typeOrOverrides === undefined ||
+    typeOrOverrides === null ||
+    typeof typeOrOverrides === 'string'
+  ) {
+    return shouldExcludeFromOrphanReporting(slug, maybeOverrides, typeOrOverrides);
+  }
+  return shouldExcludeFromOrphanReporting(slug, typeOrOverrides);
 }
 
 /**
@@ -88,7 +91,7 @@ export function deriveDomain(frontmatterDomain: string | null | undefined, slug:
  */
 export async function queryOrphanPages(
   engine: BrainEngine,
-): Promise<{ slug: string; title: string; domain: string | null }[]> {
+): Promise<{ slug: string; title: string; domain: string | null; type: string }[]> {
   return engine.findOrphanPages();
 }
 
@@ -155,7 +158,7 @@ export async function findOrphans(
     // chronicle/source pages (email/event/…) via the same shouldExclude
     // predicate as the orphan numerator — else a large ingest batch stays
     // in `total_linkable` and inflates the orphan ratio.
-    const liveRows = await engine.executeRaw<{ slug: string; type: string }>(
+  const liveRows = await engine.executeRaw<{ slug: string; type: string }>(
       `SELECT slug, type FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
