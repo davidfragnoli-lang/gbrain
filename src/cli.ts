@@ -2926,7 +2926,8 @@ PAGES
   get <slug>                         Read a page
   put <slug> [< file.md]             Write/update a page
   delete <slug>                      Delete a page
-  list [--type T] [--tag T] [-n N]   List pages
+  list [--type T] [--tag T] [--limit N]
+                                     List pages
 
 SEARCH
   search <query>                     Keyword search (tsvector)
