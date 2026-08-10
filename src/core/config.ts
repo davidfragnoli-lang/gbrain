@@ -1101,15 +1101,21 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // consent reads this key, and enabling it is the documented path to
   // `gbrain takes extract --from-pages` — same unregistered-key class.
   'takes.bootstrap_enabled',
+  // Orphan reporting scope. These are consumed by core/orphan-policy.ts and
+  // documented there as the per-brain override path.
+  'orphans.exclude_prefixes',
+  'orphans.exclude_slugs',
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
   'embed.backfill_cooldown_min',
   'embed.backfill_max_usd_per_source_24h',
   'embed.backfill_max_usd',
-  // NOTE (FRA-1537, upstream merge 2026-07-18): the Fragno `auto_chronicle`
-  // registration (FRA-1310, eb644be8) was upstreamed verbatim by #2390 above —
-  // the duplicate entry here is removed and upstream's canonical registration
-  // is kept. See KNOWN_CONFIG_KEYS `auto_chronicle` earlier in this array.
+  // Brain-level default source. Read by source-resolver.ts tier 5
+  // (`engine.getConfig('sources.default')`) and written by
+  // `gbrain sources default <id>`. Listed here so `gbrain config set`
+  // stops claiming "Nothing in gbrain reads this" for a key the resolver
+  // reads on every unqualified call.
+  'sources.default',
 ];
 
 /**
@@ -1130,7 +1136,6 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
-  'chronicle.',         // v0.42.56 Life Chronicle (chronicle.tz projection tz)
 ];
 
 /**
