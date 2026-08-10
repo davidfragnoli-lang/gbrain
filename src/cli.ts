@@ -145,6 +145,36 @@ const CLI_ONLY_SELF_HELP = new Set([
   'migrate', 'retrieval-upgrade',
 ]);
 
+/**
+ * Commands in CLI_ONLY_SELF_HELP whose handler honours `--help` as its first
+ * action, before reading the engine. Dispatching them here keeps `--help`
+ * answerable with no brain configured.
+ *
+ * Membership is behaviour, not taste: each entry is pinned by
+ * test/cli-help-without-brain.test.ts, which runs the CLI with an empty
+ * GBRAIN_HOME and requires exit 0 plus real help output.
+ */
+const SELF_HELP_WITHOUT_ENGINE: Record<string, () => Promise<(engine: never, args: string[]) => unknown>> = {
+  models: async () => (await import('./commands/models.ts')).runModels as never,
+  watch: async () => (await import('./commands/watch.ts')).runWatch as never,
+  skillopt: async () => (await import('./commands/skillopt.ts')).runSkillOptCommand as never,
+  maintain: async () => (await import('./commands/maintain.ts')).runMaintain as never,
+  'extract-conversation-facts': async () =>
+    (await import('./commands/extract-conversation-facts.ts')).runExtractConversationFacts as never,
+};
+
+/** Returns true when the command's own help was printed. */
+async function printSelfHelpWithoutEngine(command: string, args: string[]): Promise<boolean> {
+  const load = SELF_HELP_WITHOUT_ENGINE[command];
+  if (!load) return false;
+  const run = await load();
+  // The engine is never read on the help path; passing a placeholder keeps the
+  // handler signatures untouched. skillopt already declares `BrainEngine | null`
+  // for exactly this reason.
+  await run(null as never, args);
+  return true;
+}
+
 // v114 (#1941): alias -> operation lookup, kept separate from `cliOps` so
 // aliases don't double-list in printHelp's auto-generated section. Collisions
 // with a primary CLI name, a CLI_ONLY command, or another alias throw at module
@@ -342,6 +372,12 @@ async function main() {
       printCliOnlyHelp(command);
       return;
     }
+    // Self-help members whose handler answers --help before it touches the
+    // engine. Without this they fall through to the normal dispatch, which
+    // connects first — so `gbrain models --help` on a machine with no brain
+    // exits 1 with "No brain configured", and the handler's own help block is
+    // unreachable. That is the state a reader is most likely to be in.
+    if (await printSelfHelpWithoutEngine(command, subArgs)) return;
   }
 
   // #2185: strict unknown-flag validation — pre-dispatch, pre-engine. A flag
