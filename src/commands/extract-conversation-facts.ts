@@ -69,6 +69,8 @@ import type { Page } from '../core/types.ts';
 import {
   extractFactsFromTurnWithOutcome,
   isFactsExtractionEnabled,
+  type ExtractInput,
+  type ExtractedFact,
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
@@ -366,6 +368,14 @@ export interface ExtractConversationFactsCoreOpts {
    * if you need exact-ceiling compliance.
    */
   workers?: number;
+  /**
+   * Injectable per-segment extractor (BrainBench decision 15). When unset,
+   * the production path is `extractFactsFromTurnWithOutcome` (fail-hard: a
+   * per-segment extraction failure aborts the page). The bench's deterministic
+   * CI mode injects a gold-facts extractor here so segmentation → insertFacts →
+   * dedup → provenance all execute THIS production pipeline with zero LLM calls.
+   */
+  extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
 }
 
 export interface ExtractConversationFactsResult {
@@ -784,6 +794,12 @@ interface ExtractCoreState {
   types: AllowedType[];
   signal: AbortSignal | undefined;
   /**
+   * Injected per-segment extractor (BrainBench decision 15). ONLY set when a
+   * caller overrides; when undefined the production fail-hard
+   * `extractFactsFromTurnWithOutcome` path runs.
+   */
+  extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
+  /**
    * v0.41.15.0 (D11): shared per-(sourceId, slug) checkpoint map mutated
    * in place from processPage callers. Map.set is atomic in JS's single-
    * threaded event loop so parallel workers (D9) don't clobber each
@@ -1119,41 +1135,43 @@ async function processPage(
       continue;
     }
 
-    const extraction = await extractFactsFromTurnWithOutcome({
-      turnText: text,
-      sessionId,
-      source: PER_SEGMENT_SOURCE_PREFIX,
-      engine: state.engine,
-      abortSignal: state.signal,
-      ...(state.extractionModel ? { model: state.extractionModel } : {}),
-    });
-    if (!extraction.ok) {
-      // FRA-22896: a cost-cap denial arrives here as reason:'provider_error'
-      // carrying the original BudgetExhausted. Wrapping it in a plain Error
-      // strips the BUDGET_EXHAUSTED tag that runSlidingPool's must-abort path
-      // (D13) keys on, so the pool kept claiming pages and every remaining one
-      // was denied and then reported as a genuine failure — 1,471 denials
-      // presented as 1,471 broken pages. Rethrow the tagged error unchanged so
-      // the cap halts the run on first denial and is accounted separately.
-      if (isMustAbortError(extraction.error)) {
-        state.result.pages_budget_denied++;
-        throw extraction.error;
+    // BrainBench may inject a deterministic extractor for hermetic eval runs.
+    // Production keeps the standard fail-hard extraction path.
+    let extracted: ExtractedFact[];
+    if (state.extractor) {
+      extracted = await state.extractor({
+        turnText: text,
+        sessionId,
+        source: PER_SEGMENT_SOURCE_PREFIX,
+        engine: state.engine,
+        abortSignal: state.signal,
+      });
+    } else {
+      const extraction = await extractFactsFromTurnWithOutcome({
+        turnText: text,
+        sessionId,
+        source: PER_SEGMENT_SOURCE_PREFIX,
+        engine: state.engine,
+        abortSignal: state.signal,
+        ...(state.extractionModel ? { model: state.extractionModel } : {}),
+      });
+      if (!extraction.ok) {
+        // Preserve must-abort budget denials so the worker pool halts instead
+        // of turning an exhausted budget into a page-failure flood.
+        if (isMustAbortError(extraction.error)) {
+          state.result.pages_budget_denied++;
+          throw extraction.error;
+        }
+        const detail = extraction.error instanceof Error
+          ? `: ${extraction.error.message}`
+          : '';
+        throw new Error(
+          `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
+          { cause: extraction.error },
+        );
       }
-      const detail = extraction.error instanceof Error
-        ? `: ${extraction.error.message}`
-        : '';
-      // FRA-22906: thread the original error through `cause`. The pool's
-      // error policy has to tell a provider-level rejection (the whole
-      // account is down) from a bad page (only this page is down), and the
-      // status code that says which lives on the SDK error underneath.
-      // Flattening it to a message string made every outage indistinguishable
-      // from 1,548 broken pages.
-      throw new Error(
-        `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
-        { cause: extraction.error },
-      );
+      extracted = extraction.facts;
     }
-    const extracted = extraction.facts;
 
     state.result.segments_processed++;
     segmentsThisPage++;
@@ -1390,6 +1408,7 @@ export async function runExtractConversationFactsCore(
     segmentLimit,
     types,
     signal,
+    extractor: opts.extractor,
     cpMap: new Map(),
     llmFallbackModel,
     extractionModel: opts.model,
