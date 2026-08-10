@@ -1057,7 +1057,11 @@ async function embedAllStale(
   if (dryRun) {
     result.would_embed += staleCount;
     result.total_chunks += staleCount;
-    if (onProgress) onProgress(1, 1, 0);
+    // No progress event: a dry run reads a count and processes zero pages, so
+    // there is no page total to report. The previous synthetic onProgress(1,1,0)
+    // made `embed.pages` claim total:1 next to a summary naming a much larger
+    // stale count. docs/progress-events.md allows omitting `total` when it is
+    // not known up front; it does not allow asserting a wrong one.
     if (!staleOpts?.quiet) slog(`[dry-run] Would embed ${staleCount} stale chunks`);
     return;
   }
