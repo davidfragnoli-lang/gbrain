@@ -1,5 +1,195 @@
 # TODOS
 
+## #2416 follow-ups (query-steering wave)
+
+- [ ] **P2 — MCP-envelope `hint` field for concept-shaped `search` calls.**
+  **What:** surface the concept→query nudge to remote/MCP agent callers, not
+  just the CLI. **Why:** MCP agents are the primary misrouting class the
+  #2416 issue describes; the shipped CLI stderr nudge covers the caller class
+  *least* at risk. **Context:** the `search` op returns a bare
+  `SearchResult[]` (`src/core/operations.ts` — both return sites), so a hint
+  needs an envelope change that ripples into `formatResult`, MCP
+  serialization, and array-shape tests — deliberately kept out of the atomic
+  #2416 commit. The pure classifier already exists
+  (`looksConceptShaped`/`conceptNudge` in `src/core/search/query-intent.ts`);
+  only the transport is missing. Consider a sibling metadata channel (like
+  `_meta.metric_glossary`) rather than changing the array shape.
+  **Depends on:** agreeing an envelope pattern that doesn't break existing
+  MCP consumers.
+
+## MEMORY_VERBS v1 follow-ups (filed v0.43.0.0 — Cathedral 1)
+
+Deferred from the Cathedral 1 ship (CEO review, EXPANSION mode). Both are
+additive to the frozen v1 contract — neither breaks it. See plan + GSTACK
+REVIEW REPORT at `~/.claude/plans/system-instruction-you-are-working-agile-iverson.md`
+and the scope record at `~/.gstack/projects/garrytan-gbrain/ceo-plans/2026-06-12-memory-verbs-protocol.md`.
+
+- [ ] **P3 — external-implementation certification PROGRAM.** The conformance
+  TOOLING shipped (`gbrain protocol conformance --target <endpoint>`); the
+  PROGRAM around it (badges, a registry of conformant implementations, listed
+  third-party servers) waits for a second implementation to exist. **Why:** the
+  protocol-not-product thesis only pays off once someone else implements
+  MEMORY_VERBS; until then a certification program certifies an empty set.
+  **Where:** new — would build on `src/commands/protocol.ts` conformance output.
+- [ ] **P3 — persistent open-threads model for the entity card.** v1 derives
+  `entity.open_threads` from active commitment-kind facts + recent timeline
+  entries (best-effort, possibly empty). A richer model (a real threads table:
+  conversation id, opened/closed state, last activity) would make open-threads
+  authoritative. **Why:** the card's open-threads field is the weakest signal
+  in v1; a first-class threads store would make it load-bearing. **Where:**
+  `src/core/verbs/entity-card.ts` open-threads assembly + a new schema table
+  (additive — the card field already exists, so this is a quality upgrade, not
+  a contract change).
+- [ ] **P2 — `recall` filter composition vs the spec (found by the v0.43.0.0
+  cross-model doc review).** The handler dispatch is first-match
+  (`supersessions` > `entity` > `session_id` > `since`), so `since` is
+  silently ignored when `entity`/`session_id` is supplied, and `limit` has no
+  server-side cap. Either compose the filters (additive — the spec's "filters
+  the FACTS arm" wording already reads that way) or spell the precedence out
+  in `docs/protocol/MEMORY_VERBS_v1.md`. **Where:** the `recall` handler in
+  `src/core/operations.ts`.
+- [ ] **P3 — widen `synthesize`'s `unavailable` mapping.** Only the
+  missing-key gateway warning maps to the `unavailable` error today; other
+  no-usable-model failures can surface as `internal` (contract-legal but less
+  actionable) or, worst case, a stubbed success. Audit the gateway failure
+  modes and map every model-unusable path to `unavailable` with a fix
+  suggestion. **Where:** the `synthesize` handler in `src/core/verbs.ts`.
+## Fix-wave 1 follow-ups (upgrade-wedge + trust-seam wave, 2026-08)
+
+Deferred from the un-wedge-v121 hotfix wave (eng review + codex outside voice
+CLEARED; every item an explicit review decision). Waves 2–6 of the sequence are
+planned separately (provider-compat rescue is next; its original 2026-07-24
+DeepSeek-deprecation deadline has now PASSED — re-verify each cluster against
+master before starting, several fixes landed independently).
+
+- [ ] **P2 — Shared strict `parseFlags` helper as the #2185 end-state (eng
+  review 2B).** This wave ships the generated known-flags registry +
+  pre-dispatch validator (parser and registry can drift only until the
+  freshness guard fires). The structural end-state migrates commands onto one
+  shared strict parser so parser == registry by construction; mechanical but
+  touches 60+ command files — its own PR. Where: `src/commands/*.ts`,
+  `src/cli.ts`, `scripts/generate-flag-registry.ts` (retires).
+- [ ] **P2 — `whoknows` CLI routing (surfaced by the #2035-class sweep).**
+  `handleCliOnly`'s `whoknows` case (the dedicated CLI renderer with
+  thin-client routing) is dead code — the command resolves via the
+  `find_experts` op alias, and adding it to CLI_ONLY trips the alias-collision
+  guard. Decide the intended surface alongside PR #2509 (whoknows --explain
+  per-result factor breakdown) and delete whichever lane loses. Where:
+  `src/cli.ts`, `src/commands/whoknows.ts`, PR #2509.
+- [ ] **P3 — #2544 second half: per-put_page `getAllSlugs` full scan.** The
+  getChunks egress half shipped in this wave (explicit non-vector column
+  list). The remaining Postgres-egress cost is put_page's per-call
+  `getAllSlugs` table scan — needs a targeted existence probe or cached slug
+  set. Where: `src/core/operations.ts` put_page path, both engines.
+- [ ] **P3 — #1558 admin-UI register form.** The `/admin/api/register-client`
+  API now accepts `source` + `federatedRead` (this wave, PR #2016 absorbed);
+  the admin SPA form fields + `/admin/api/sources` picker are the UI layer.
+  Where: `src/commands/serve-http.ts` admin SPA blob.
+- [ ] **P3 — jsonb-integrity surfaces: batch + share (ship-review follow-up).**
+  doctor's jsonbIntegrityCheck runs 2 queries per target (16 round-trips) and
+  duplicates the TARGETS table with repair-jsonb (already drifted once on the
+  jsonPayloadOnly predicate before being mirrored by hand). Batch the counts
+  into one UNION ALL query and extract a shared targets constant
+  (src/core/jsonb-integrity-targets.ts) consumed by both. Where:
+  `src/commands/doctor.ts` jsonbIntegrityCheck, `src/commands/repair-jsonb.ts`.
+- [ ] **P3 — register-client HTTP-level e2e (ship-review follow-up).** The
+  source/federatedRead lane is covered by unit normalizers + a structural
+  route pin; a DATABASE_URL-gated serve-http e2e (register with bindings →
+  assert stored client via /admin/api/agents; invalid source → 400
+  invalid_source) closes the wire-level gap. Where:
+  `test/e2e/serve-http-oauth.test.ts`.
+- [ ] **P3 — get_chunks `__all__` sentinel narrows to 'default' (red-team,
+  Wave 3 territory).** `sourceScopeOpts` returns `{}` for a trusted local
+  `--source __all__` caller (documented "spans the brain"), but both engines'
+  getChunks map empty scope to the 'default' floor — the one read op where
+  `{}` is reinterpreted. Fold into the Wave 3 source-federation cluster's
+  `__all__` work (an explicit unscoped signal in the engine signature, or
+  handler-side expansion for trusted callers). Where: `src/core/operations.ts`
+  get_chunks, both engines' getChunks.
+- [ ] **P3 — #2536 wedged-migration diagnostics.** The v121 wedge aborted
+  initSchema BEFORE runMigrations, so the wedged-migration diagnostics row was
+  never written — operators got a bare SQL error with no remediation hint.
+  Write the diagnostics row (or a stderr remediation block) from the blob-replay
+  catch path too. Where: `src/core/migrate.ts`, `src/commands/apply-migrations.ts`.
+## WAL-repair wave follow-ups (#223/#1670/#2575)
+
+- [ ] **P2 — gate auto-repair on an unclean-shutdown marker (adversarial F7).** The classifier
+  deliberately over-matches (`RuntimeError`/`unreachable` → `wasm-abort`). If an unclean
+  shutdown leaves a REPLAYABLE WAL tail (normal crash recovery would restore those committed
+  txns) and the reopen then fails on a transient WASM error (OOM), auto-repair fires, layout
+  validation can't tell torn from replayable, and resetWal discards the tail while the notice
+  says "data preserved." Bounded today (backup always taken + restore + honest failure + repeated
+  attempts capped), but a false-positive-with-successful-retry silently drops committed data.
+  Fix direction (probe-verified): PGLite removes `postmaster.pid` on clean close, so gate AUTO
+  repair (not the manual command) on `postmaster.pid` presence — a clean dir that aborts is not
+  torn-WAL. Requires making the serial regression test stamp a `postmaster.pid` before corrupting
+  (it currently clean-disconnects then corrupts, which the red-team flagged as unfaithful anyway).
+  Needs a recall/precision call before landing.
+- [ ] **P3 — live non-gbrain PGLite consumer not caught by the postmaster.pid liveness guard
+  (adversarial F8).** PGLite writes a sentinel `postmaster.pid` of `-42`; the liveness refusal in
+  `validateWalRepairTarget` requires `pid > 0`, so it protects native Postgres dirs but not a
+  non-gbrain pglite app that has the dir open (such an app writes no `.gbrain-lock`). Deliberate
+  misuse of `pglite-repair --path <foreign pglite dir>` required. Option: refuse when
+  postmaster.pid holds pid ≤ 0 with a very recent mtime, or document the boundary.
+- [ ] **P3 — mixed-version torn-lock read (adversarial F10 residual).** The heartbeat + initial
+  lock writes are atomic (tmp+rename) now, but an OLD gbrain binary writing heartbeats IN PLACE
+  while a NEW binary poll-reads can still catch a torn read → corrupt-lock verdict → a live
+  holder's lock reaped → two writers (the #2348 class, version-skew-triggered). The reap marker
+  quarantines repair, not the concurrent open. Cheap hardening: double-read the lock file (~50ms
+  apart) before declaring it corrupt.
+
+
+- [ ] **P2 — graceful PGLite close on SIGTERM for the remaining long-running paths.**
+  The torn-WAL genesis this wave repairs is an unclean shutdown: `src/core/process-cleanup.ts`
+  releases locks on SIGTERM but never closes the PGlite handle, so `serve` / `jobs work` /
+  `sync` killed mid-write (macOS-upgrade reboot, `systemctl stop`) leave the WAL torn.
+  Autopilot already ships the pattern (d2fd1f29, #3178/#1872: `registerCleanup('autopilot-engine-close', ...)`
+  — abort in-flight work → ≤2s bounded wait inside the 3s cleanup deadline →
+  `engine.disconnect()`, double-call safe; rationale comment at autopilot.ts:438-452).
+  Extend that exact pattern to the remaining long-running PGLite paths (register in
+  connect()/command scope; dedupe so autopilot doesn't double-close), pinned by a serial
+  lifecycle test. Interacts with #2084 exitCode containment + #1337 close ordering — read
+  those comments in pglite-engine.ts first. Auto-repair makes recurrence self-healing
+  meanwhile, so this is prevention, not recovery.
+- [ ] **P3 — pglite upgrade blocker tracker.** Two couplings make a "routine" pglite bump a
+  breaking change: (a) pglite ≥0.5 removes the `@electric-sql/pglite/vector` export that
+  `pglite-engine.ts` imports (verified against npm); (b) the pg_resetwal port
+  (`src/core/pglite-resetwal.ts`) is coupled to the PG17 pg_control layout
+  (`PG_CONTROL_VERSION` 1700 — guarded at runtime by `WalResetUnsupportedError`, so a
+  mismatched bump makes the repair tool refuse every dir rather than corrupt, but it still
+  means the repair feature silently dies). Any future pglite upgrade wave must revisit BOTH
+  together and re-derive the ControlFileData offset table for the new PG major.
+
+## serve --http takes-holders + agent-voice hardening follow-ups (filed v0.42.74.0)
+
+Deferred from the #2529/#2477 security-fix wave (plan-eng-review + codex outside
+voice CLEARED). None block the wave.
+
+- [ ] **P2 — Per-OAuth-client `takes_holders` storage (#2529 follow-up).** Legacy
+  bearer tokens honor `access_tokens.permissions.takes_holders` through
+  `verifyAccessToken`; OAuth clients have no equivalent column on `oauth_clients`,
+  so OAuth-minted tokens fail closed to `['world']`. Needs a schema migration
+  (`oauth_clients.takes_holders` JSONB or TEXT[]) + a `register-client` flag +
+  the `verifyAccessToken` JOIN projection. Include surfacing the EFFECTIVE
+  takes-holder scope in `whoami` output as part of this follow-up, so operators
+  can self-diagnose the legacy-vs-OAuth semantic split instead of reading docs.
+  Where: `src/schema.sql`, `src/core/migrate.ts`, `src/core/oauth-provider.ts`,
+  `src/commands/auth.ts`, `src/core/operations.ts` (whoami).
+- [ ] **P3 — agent-voice Host-header allowlist (DNS-rebinding hardening).** The
+  #2477 fix ships default-deny CORS + an Origin gate on `/session`/`/tool`, but
+  the gate derives self-origin from the `Host` header, so a DNS-rebound page
+  (attacker origin whose host resolves to the operator's loopback) still passes.
+  Validate `Host` against `localhost`/`127.0.0.1`/operator-configured hosts and
+  403 otherwise; slots beside `originAllowed()` in the router. Issue #2477
+  explicitly deferred this. Where: `recipes/agent-voice/code/server.mjs`.
+- [ ] **P3 — Debounce `last_used_at` in the oauth-provider legacy path.** The
+  legacy branch of `verifyAccessToken` fires an unconditional
+  `UPDATE access_tokens SET last_used_at = now()` on EVERY request, while the
+  legacy HTTP transport debounces the same write to once per 60s via a WHERE
+  clause (`src/mcp/http-transport.ts` validateToken). Apply the same pattern —
+  one fewer write per request on the `serve --http` hot path.
+  Where: `src/core/oauth-provider.ts`.
+
 ## v0.42.67.0 follow-ups (Windows build tooling)
 
 Filed as follow-ups from v0.42.67.0 (`.gitattributes` LF pin for `*.sh` +
