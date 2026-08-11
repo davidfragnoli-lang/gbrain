@@ -74,8 +74,13 @@ describe('extract-conversation-facts — exported helpers (T5)', () => {
 
 describe('extract-conversation-facts — structural contracts (T5)', () => {
   test('imports runSlidingPool from worker-pool helper', () => {
+    // The named-import list is open-ended on purpose: FRA-22896 added
+    // `isMustAbortError` alongside runSlidingPool and this assertion went red
+    // for six days, because it pinned the punctuation of the import rather
+    // than the contract it exists to protect (the pool comes from the shared
+    // helper, never a local reimplementation).
     expect(SRC).toMatch(
-      /import\s*\{\s*runSlidingPool\s*\}\s*from\s*['"]\.\.\/core\/worker-pool\.ts['"]/,
+      /import\s*\{[^}]*\brunSlidingPool\b[^}]*\}\s*from\s*['"]\.\.\/core\/worker-pool\.ts['"]/,
     );
   });
 

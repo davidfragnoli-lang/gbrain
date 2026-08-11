@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { runCorrectnessGate } from '../../src/core/bench/correctness-gate.ts';
 import type { QrelsFile } from '../../src/core/bench/qrels-file.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
+import { RerankUnavailableError } from '../../src/core/search/rerank.ts';
 
 // The correctness gate's only engine touchpoint is `searchFn`, which is
 // injectable. Tests pass a fake engine + a deterministic search stub.
@@ -144,5 +145,63 @@ describe('correctness-gate: per-query iteration + aggregate math', () => {
     // 1 of 1 query with expected_top1 matched (q1).
     expect(result.summary.expected_top1_denominator).toBe(1);
     expect(result.summary.expected_top1_hit_rate).toBe(1);
+  });
+});
+
+describe('correctness-gate: reranker outages are inconclusive, not failures (FRA-22966)', () => {
+  test('a RerankUnavailableError is counted separately from a brain error', async () => {
+    const qrels = makeQrels([
+      { query_id: 'q-reranker-down', query: 'x', relevant: [{ source_id: 'default', slug: 'a' }] },
+      { query_id: 'q-brain-error', query: 'y', relevant: [{ source_id: 'default', slug: 'b' }] },
+      { query_id: 'q-works', query: 'z', relevant: [{ source_id: 'default', slug: 'c' }] },
+    ]);
+    const result = await runCorrectnessGate(fakeEngine, qrels, {
+      k: 10,
+      searchFn: async (_e, q) => {
+        if (q === 'x') throw new RerankUnavailableError('timeout', 'upstream took too long');
+        if (q === 'y') throw new Error('connection to postgres failed');
+        return [{ source_id: 'default', slug: 'c' }];
+      },
+    });
+
+    expect(result.summary.queries_errored).toBe(2);
+    // Only the reranker outage counts here — the postgres error is a real failure.
+    expect(result.summary.queries_reranker_unavailable).toBe(1);
+
+    const byId = Object.fromEntries(result.per_query.map(p => [p.query_id, p]));
+    expect(byId['q-reranker-down']!.reranker_unavailable).toBe(true);
+    expect(byId['q-brain-error']!.reranker_unavailable).toBeUndefined();
+    expect(byId['q-works']!.errored).toBeUndefined();
+  });
+
+  test('a fully healthy run reports zero reranker-unavailable queries', async () => {
+    const qrels = makeQrels([
+      { query_id: 'q1', query: 'x', relevant: [{ source_id: 'default', slug: 'a' }] },
+    ]);
+    const result = await runCorrectnessGate(fakeEngine, qrels, {
+      k: 10,
+      searchFn: async () => [{ source_id: 'default', slug: 'a' }],
+    });
+    expect(result.summary.queries_reranker_unavailable).toBe(0);
+  });
+
+  test('outage queries are excluded from the aggregates, not scored as zero', async () => {
+    // The lenient-looking part of Finding 2D still holds: a throw never
+    // contributes a 0.0 to mean_recall. What changes is that the caller can
+    // now tell WHY the denominator shrank.
+    const qrels = makeQrels([
+      { query_id: 'q-down', query: 'x', relevant: [{ source_id: 'default', slug: 'a' }] },
+      { query_id: 'q-perfect', query: 'y', relevant: [{ source_id: 'default', slug: 'b' }] },
+    ]);
+    const result = await runCorrectnessGate(fakeEngine, qrels, {
+      k: 10,
+      searchFn: async (_e, q) => {
+        if (q === 'x') throw new RerankUnavailableError('network', 'ECONNRESET');
+        return [{ source_id: 'default', slug: 'b' }];
+      },
+    });
+    expect(result.summary.queries_run).toBe(1);
+    expect(result.summary.mean_recall_at_k).toBe(1);
+    expect(result.summary.queries_reranker_unavailable).toBe(1);
   });
 });

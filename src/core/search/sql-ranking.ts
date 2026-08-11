@@ -19,6 +19,7 @@
 
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
+import { machineGeneratedFragment, resolveMachineGeneratedFactor } from '../machine-generated.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -57,6 +58,8 @@ function buildLikePrefixLiteral(prefix: string): string {
  *                     supplied by the engine, never from user input.
  * @param boostMap   — prefix → factor map (defaults merged with env override)
  * @param detail     — query detail level; `'high'` disables source-boost
+ * @param unverifiedGuardColumn — see the extraction-quarantine note below
+ * @param machineGeneratedGuardColumn — see the derivative-register note below
  *
  * @returns raw SQL fragment, e.g. `(CASE WHEN p.slug LIKE 'originals/%' THEN 1.5 ... ELSE 1.0 END)`
  */
@@ -65,6 +68,7 @@ export function buildSourceFactorCase(
   boostMap: Record<string, number>,
   detail: 'low' | 'medium' | 'high' | undefined,
   unverifiedGuardColumn?: string,
+  machineGeneratedGuardColumn?: string,
 ): string {
   // Loose-string guard: agents passing `"HIGH"` or `"high "` over MCP/JSON
   // should still hit the temporal-bypass path. TypeScript narrows `detail`
@@ -75,8 +79,6 @@ export function buildSourceFactorCase(
   const entries = Object.entries(boostMap)
     .filter(([prefix, factor]) => prefix.length > 0 && Number.isFinite(factor) && factor >= 0)
     .sort((a, b) => b[0].length - a[0].length); // longest-prefix-match wins
-
-  if (entries.length === 0) return '1.0';
 
   const whens = entries.map(([prefix, factor]) =>
     `WHEN ${slugColumn} LIKE ${buildLikePrefixLiteral(prefix)} THEN ${factor}`
@@ -101,7 +103,32 @@ export function buildSourceFactorCase(
       ? `WHEN ${unverifiedExtractionFragment(alias)} THEN 1.0 `
       : '';
 
-  return `(CASE ${unverifiedGuard}${whens} ELSE 1.0 END)`;
+  // FRA-23172 — machine-generated derivative registers (OCR / caption / ASR
+  // roll-ups) are DEMOTED, provenance-derived rather than slug-derived. Same
+  // two projection forms as the unverified guard above: table-qualified slug
+  // column reads `frontmatter` inline; the vector arm's re-rank CTE has no
+  // frontmatter column, so it projects the predicate as a boolean and passes
+  // the column name here.
+  //
+  // Emitted BEFORE the prefix WHENs on purpose. CASE takes the first true
+  // branch, so this makes the demote win over any namespace boost — a
+  // register filed under `people/` must not collect the 1.2x entity-page
+  // authority. It also precedes the unverified guard, which only WITHHOLDS
+  // authority (factor 1.0); a page that is both is still a register and the
+  // stricter factor is the correct read.
+  const machineGeneratedFactor = resolveMachineGeneratedFactor();
+  const machineGeneratedPredicate = machineGeneratedGuardColumn
+    ?? (alias ? machineGeneratedFragment(alias) : null);
+  // Skip the branch entirely at factor 1.0 so operators can disable the demote
+  // via env without leaving a no-op CASE arm in every search query.
+  const machineGeneratedGuard =
+    machineGeneratedPredicate && machineGeneratedFactor !== 1
+      ? `WHEN ${machineGeneratedPredicate} THEN ${machineGeneratedFactor} `
+      : '';
+
+  if (!whens && !unverifiedGuard && !machineGeneratedGuard) return '1.0';
+
+  return `(CASE ${machineGeneratedGuard}${unverifiedGuard}${whens} ELSE 1.0 END)`;
 }
 
 /**

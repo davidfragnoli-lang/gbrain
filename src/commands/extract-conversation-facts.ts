@@ -87,7 +87,8 @@ import { createHash } from 'crypto';
 // per-page advisory lock + delete-orphans-first replay safety. See plan
 // `~/.claude/plans/system-instruction-you-are-working-fancy-creek.md`
 // decisions D2, D6, D9, D11, D12, D13, D15.
-import { runSlidingPool } from '../core/worker-pool.ts';
+import { runSlidingPool, isMustAbortError } from '../core/worker-pool.ts';
+import { isRequestRejectedBeforeGeneration } from '../core/ai/errors.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
@@ -192,6 +193,77 @@ export function pageTypesForAllowed(types: readonly AllowedType[]): string[] {
  */
 export const PAGE_LIST_BATCH = 10;
 
+/**
+ * FRA-22906: how many CONSECUTIVE request-level provider rejections end the
+ * source instead of marching on.
+ *
+ * A 4xx-non-429 means the provider refused before running the model, so the
+ * failure is a property of the account or the request envelope, never of the
+ * page. Nothing about attempting page 4 makes it likelier to succeed than page
+ * 3 did. On 2026-07-27 the credit balance emptied and the loop attempted all
+ * 1,548 pages twice, then reported `pages_failed: 1548` — a provider outage
+ * wearing the costume of a corpus-wide data-quality problem.
+ *
+ * 3 rather than 1 so a genuinely per-request 4xx (one oversized payload, one
+ * transient auth blip) still only costs that page. Counted consecutively —
+ * any other outcome resets it — so a long healthy run is never ended by
+ * rejections scattered across thousands of pages.
+ */
+export const PROVIDER_REJECTION_ABORT_THRESHOLD = 3;
+
+/** Circuit breaker over consecutive request-level provider rejections. */
+export interface ProviderRejectionBreaker {
+  /** Record an item that completed — restarts the streak. */
+  onSuccess(): void;
+  /** Classify a failure and say whether the caller should keep going. */
+  onFailure(error: unknown): 'continue' | 'abort';
+  /** True once the streak reached the threshold. */
+  readonly tripped: boolean;
+  /** Message of the rejection that tripped it, or null. */
+  readonly reason: string | null;
+}
+
+/**
+ * FRA-22906: build a breaker for one source's enumeration.
+ *
+ * Extracted from the worker-pool callback so the abort rule is testable
+ * without a seeded brain and a live provider — the incident it exists to
+ * prevent is precisely the one nobody can reproduce on demand.
+ *
+ * Counting is safe from the pool's parallel workers: mutations happen only
+ * inside `onItem`/`onError`, which run on JS's single thread, so no two
+ * workers interleave a read-modify-write.
+ */
+export function createProviderRejectionBreaker(
+  threshold: number = PROVIDER_REJECTION_ABORT_THRESHOLD,
+): ProviderRejectionBreaker {
+  let consecutive = 0;
+  let reason: string | null = null;
+  return {
+    onSuccess() {
+      // Any completed page proves the provider is answering, so the streak
+      // restarts. "Consecutive" is what keeps a healthy multi-thousand-page
+      // run from being ended by 4xx scattered across it.
+      consecutive = 0;
+    },
+    onFailure(error: unknown): 'continue' | 'abort' {
+      if (!isRequestRejectedBeforeGeneration(error)) {
+        consecutive = 0;
+        return 'continue';
+      }
+      consecutive++;
+      reason = error instanceof Error ? error.message : String(error);
+      return consecutive >= threshold ? 'abort' : 'continue';
+    },
+    get tripped() {
+      return consecutive >= threshold;
+    },
+    get reason() {
+      return this.tripped ? reason : null;
+    },
+  };
+}
+
 /** Op name for the checkpoint primitive. */
 export const CHECKPOINT_OP = 'extract-conversation-facts';
 
@@ -275,6 +347,14 @@ export interface ExtractConversationFactsCoreOpts {
   /** Bypass `facts.extraction_enabled=false`. Power-user escape. */
   overrideDisabled?: boolean;
   /**
+   * Override the fact-extraction chat model for this run only (e.g.
+   * `anthropic:claude-haiku-4-5-20251001` for a cost-efficient bulk email
+   * drain). When unset the extractor reads `facts.extraction_model` /
+   * models.tier.reasoning as usual. Does NOT mutate global config, so a
+   * concurrent real-time / atoms path keeps its configured model.
+   */
+  model?: string;
+  /**
    * v0.41.15.0 (D9 wrapper): in-process worker count for the per-page
    * fan-out. Default 1 (back-compat). Recommended 5-20 for LLM-bound
    * work; PGLite engines silently clamp to 1 with a stderr warn. Cross-
@@ -313,6 +393,22 @@ export interface ExtractConversationFactsResult {
   /** Pages whose claim reached extraction but failed before durable outcome. */
   pages_failed: number;
   /**
+   * FRA-22896: pages the cost cap refused to extract. These are NOT failures
+   * — nothing is wrong with the page, we simply ran out of authorized spend.
+   * Counted apart from `pages_failed` because conflating the two is what made
+   * a capped run's coverage number readable as "nothing left to do".
+   */
+  pages_budget_denied: number;
+  /**
+   * FRA-22906: pages whose extraction was rejected by the provider before it
+   * generated anything (4xx-non-429 — bad key, bad model, exhausted credit
+   * balance). Like `pages_budget_denied` these are NOT page defects: the page
+   * was never read by a model. Kept out of `pages_failed` because reporting
+   * "1,548 pages failed" for one zero-credit outage sends diagnosis after a
+   * data-quality problem that does not exist.
+   */
+  pages_provider_rejected: number;
+  /**
    * Pages whose built-in parse returned `no_match` and whose messages were
    * recovered by the explicitly enabled LLM fallback.
    */
@@ -336,6 +432,15 @@ export interface ExtractConversationFactsResult {
   facts_extracted: number;
   facts_inserted: number;
   budget_exhausted?: boolean;
+  /**
+   * FRA-22906: the run stopped early because the provider was rejecting every
+   * request. Same contract as `budget_exhausted` — a partial, honestly-halted
+   * result, not a thrown failure. The remaining backlog was never enumerated,
+   * so every count above is a lower bound.
+   */
+  provider_unavailable?: boolean;
+  /** Message of the provider rejection that tripped the circuit breaker. */
+  provider_error?: string;
   spent_usd?: number;
 }
 
@@ -391,6 +496,13 @@ export interface SplitSegmentsOpts {
   maxMessages?: number;
   /** Drop messages with timestamp <= this ISO before splitting. */
   sinceIso?: string;
+  /**
+   * Minimum messages required for a segment to be emitted. Defaults to
+   * MIN_SEGMENT_MESSAGES (2) — a lone chat line isn't a conversation. Email
+   * pages (FRA-22807) pass 1: a single authored email is one message but
+   * still carries real facts, so it must produce one segment.
+   */
+  minMessages?: number;
 }
 
 export function splitIntoSegments(
@@ -399,6 +511,7 @@ export function splitIntoSegments(
 ): ConversationSegment[] {
   const gapMs = (opts.gapMinutes ?? DEFAULT_SEGMENT_GAP_MINUTES) * 60_000;
   const maxMessages = opts.maxMessages ?? DEFAULT_SEGMENT_MAX_MESSAGES;
+  const minMessages = opts.minMessages ?? MIN_SEGMENT_MESSAGES;
   const sinceMs = opts.sinceIso ? Date.parse(opts.sinceIso) : NaN;
 
   const filtered = Number.isFinite(sinceMs)
@@ -410,7 +523,7 @@ export function splitIntoSegments(
   let lastTs: number | null = null;
 
   const flush = () => {
-    if (cur.length < MIN_SEGMENT_MESSAGES) {
+    if (cur.length < minMessages) {
       cur = [];
       return;
     }
@@ -700,6 +813,8 @@ interface ExtractCoreState {
    * parser path.
    */
   llmFallbackModel: string | null;
+  /** Per-run fact-extraction model override (opts.model); undefined = default. */
+  extractionModel: string | undefined;
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -894,8 +1009,14 @@ async function processPage(
   // `parseConversationMessages(body)` shape only saw the body, which
   // meant Telegram-bracket pages with frontmatter dates landed at
   // 1970-01-01. Now they pick up the correct date.
+  //
+  // FRA-22807: for `email`-type pages the orchestrator routes internally
+  // through the email adapter (strip HTML / decode entities → one sender
+  // message) and returns phase='email'. Those single-message emails carry
+  // real facts, so we relax the segmenter's 2-message minimum to 1 below.
   const parseResult = parseConversation(body, { page });
   let messages = parseResult.messages;
+  const minSegmentMessages = parseResult.phase === 'email' ? 1 : undefined;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
   }
@@ -926,8 +1047,11 @@ async function processPage(
       );
     }
   }
-  const allSegments = splitIntoSegments(messages);
-  const segments = splitIntoSegments(messages, { sinceIso });
+  const allSegments = splitIntoSegments(messages, { minMessages: minSegmentMessages });
+  const segments = splitIntoSegments(messages, {
+    sinceIso,
+    minMessages: minSegmentMessages,
+  });
   if (segments.length === 0) {
     state.result.pages_skipped++;
     if (
@@ -995,11 +1119,25 @@ async function processPage(
     const text = renderSegmentForExtraction(page.title || page.slug, seg);
     const sessionId = `${PER_SEGMENT_SOURCE_PREFIX}:${page.slug}`;
 
-    // BrainBench (decision 15) may inject a deterministic extractor; when it
-    // does, use it (returns facts directly — the hermetic gold path). The
-    // DEFAULT production path is master's fail-hard-with-reason contract: a
-    // per-segment extraction failure aborts the page rather than silently
-    // dropping facts.
+    // A dry run is a preview: it answers "which pages and how many segments
+    // need work", and it must cost nothing. Extraction is the only paid call
+    // on this path, so it is skipped entirely rather than merely having its
+    // writes suppressed below. Without this guard --dry-run billed the full
+    // extraction and discarded every fact, which is strictly worse than not
+    // running it: the operator pays real money for zero durable rows, and
+    // once the cost cap trips the remaining pages report as "failed", so the
+    // coverage number the preview exists to produce comes back truncated and
+    // is easily misread as "nothing left to do".
+    if (state.dryRun) {
+      state.result.segments_processed++;
+      segmentsThisPage++;
+      newestEnd = seg.endIso;
+      continue;
+    }
+
+    // BrainBench may inject a deterministic extractor for hermetic eval runs.
+    // Production keeps master's fail-hard-with-reason contract: a per-segment
+    // extraction failure aborts the page rather than silently dropping facts.
     let extracted: ExtractedFact[];
     if (state.extractor) {
       extracted = await state.extractor({
@@ -1016,13 +1154,21 @@ async function processPage(
         source: PER_SEGMENT_SOURCE_PREFIX,
         engine: state.engine,
         abortSignal: state.signal,
+        ...(state.extractionModel ? { model: state.extractionModel } : {}),
       });
       if (!extraction.ok) {
+        // Preserve must-abort budget denials so the worker pool halts instead
+        // of turning an exhausted budget into a page-failure flood.
+        if (isMustAbortError(extraction.error)) {
+          state.result.pages_budget_denied++;
+          throw extraction.error;
+        }
         const detail = extraction.error instanceof Error
           ? `: ${extraction.error.message}`
           : '';
         throw new Error(
           `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
+          { cause: extraction.error },
         );
       }
       extracted = extraction.facts;
@@ -1056,7 +1202,9 @@ async function processPage(
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
     } else {
-      // dry-run: count for reporting, no DB write.
+      // Nothing extracted from this segment, so there is no row to write —
+      // advance the accumulator only. (Dry runs never reach here: they skip
+      // extraction entirely above.)
       rowNum += extracted.length;
     }
 
@@ -1102,8 +1250,12 @@ async function processPage(
     state.cpMap.set(cpMapKey(state.sourceId, page.slug), newestEnd);
   }
 
+  // A dry run inserts nothing by construction, so "0 facts inserted" would read
+  // as "this page yields nothing" rather than "this page is queued for work".
   process.stderr.write(
-    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
+    state.dryRun
+      ? `[extract-conversation-facts] ${page.slug}: ${segmentsThisPage} segment(s) need extraction (dry run)\n`
+      : `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
   );
 
   state.result.pages_processed++;
@@ -1188,6 +1340,8 @@ export async function runExtractConversationFactsCore(
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
     pages_failed: 0,
+    pages_budget_denied: 0,
+    pages_provider_rejected: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1258,6 +1412,7 @@ export async function runExtractConversationFactsCore(
     extractor: opts.extractor,
     cpMap: new Map(),
     llmFallbackModel,
+    extractionModel: opts.model,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
@@ -1356,6 +1511,9 @@ export async function runExtractConversationFactsCore(
       // honors AbortSignal at each claim boundary and threads
       // BudgetExhausted abort (D13) automatically.
       let processedPagesCount = 0;
+      // FRA-22906: one breaker for the whole source, so a streak that spans
+      // a batch boundary still trips.
+      const breaker = createProviderRejectionBreaker();
       pageLoop: for (const type of concreteTypes) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
@@ -1401,8 +1559,12 @@ export async function runExtractConversationFactsCore(
             items: claimable,
             workers,
             signal,
-            onItem: (page) => processPageWithLock(page),
-            onError: (error) => (isAbortError(error) ? 'abort' : 'continue'),
+            onItem: async (page) => {
+              await processPageWithLock(page);
+              breaker.onSuccess();
+            },
+            onError: (error) =>
+              isAbortError(error) ? 'abort' : breaker.onFailure(error),
             failureLabel: (page) => page.slug,
           });
           const cancellation = poolResult.failures.find((failure) =>
@@ -1415,14 +1577,39 @@ export async function runExtractConversationFactsCore(
               name: 'AbortError',
             });
           }
-          result.pages_failed += poolResult.errored;
+          // FRA-22906: split provider rejections out of the failure count.
+          // These pages were never shown to a model, so calling them failures
+          // points diagnosis at the corpus instead of at the account.
+          let rejectedThisBatch = 0;
           for (const failure of poolResult.failures) {
             const message = failure.error instanceof Error
               ? failure.error.message
               : String(failure.error);
+            if (isRequestRejectedBeforeGeneration(failure.error)) {
+              rejectedThisBatch++;
+              process.stderr.write(
+                `[extract-conversation-facts] ${failure.label} rejected by provider ` +
+                `(not a page defect): ${message}\n`,
+              );
+              continue;
+            }
             process.stderr.write(
               `[extract-conversation-facts] ${failure.label} failed: ${message}\n`,
             );
+          }
+          result.pages_provider_rejected += rejectedThisBatch;
+          result.pages_failed += poolResult.errored - rejectedThisBatch;
+
+          if (breaker.tripped) {
+            result.provider_unavailable = true;
+            result.provider_error = breaker.reason ?? 'provider rejected the request';
+            process.stderr.write(
+              `[extract-conversation-facts] provider rejected ` +
+              `${PROVIDER_REJECTION_ABORT_THRESHOLD} requests in a row; ending this source ` +
+              `instead of attempting the rest of the backlog. ` +
+              `Cause: ${result.provider_error}\n`,
+            );
+            break pageLoop;
           }
 
           processedPagesCount += claimable.length;
@@ -1504,7 +1691,8 @@ export async function runExtractConversationFactsCore(
       engine,
       sourceId,
       result,
-      /* halted */ result.budget_exhausted === true,
+      /* halted */ result.budget_exhausted === true ||
+        result.provider_unavailable === true,
     );
   }
 
@@ -1617,6 +1805,8 @@ interface ParsedArgs {
   overrideDisabled?: boolean;
   /** v0.41.15.0 (D9): in-process parallel workers per source. */
   workers?: number;
+  /** Per-run fact-extraction model override (FRA-22807 cost-efficient drain). */
+  model?: string;
   yes?: boolean;
   help?: boolean;
   error?: string;
@@ -1633,6 +1823,7 @@ function parseArgs(args: string[]): ParsedArgs {
     if (a === '--override-disabled') { out.overrideDisabled = true; continue; }
     if (a === '--slug') { out.slug = args[++i]; continue; }
     if (a === '--source-id') { out.sourceId = args[++i]; continue; }
+    if (a === '--model') { out.model = args[++i]; continue; }
     if (a === '--since') { out.sinceIso = args[++i]; continue; }
     if (a === '--types') {
       const v = args[++i] ?? '';
@@ -1719,6 +1910,9 @@ Options:
                          silently clamps to 1 (single-writer engine). Cross-process
                          safety is guaranteed by the per-page advisory lock + replay
                          safety (delete-orphans-first on each page claim).
+  --model <id>           Override the fact-extraction model for this run only
+                         (e.g. anthropic:claude-haiku-4-5-20251001 for a cheap
+                         bulk email drain). Does NOT change global config.
   --override-disabled    Bypass facts.extraction_enabled=false brain-wide kill-switch.
   --background           Submit as a Minion job; print job_id; exit (use 'gbrain jobs follow').
   --yes                  Auto-confirm cost preview in non-TTY contexts.
@@ -1753,6 +1947,7 @@ function buildJobParams(args: string[]): Record<string, unknown> {
     // round-trips. The handler in src/commands/jobs.ts reads
     // job.data.workers and passes to runExtractConversationFactsCore.
     workers: parsed.workers,
+    model: parsed.model,
   };
 }
 
@@ -1784,8 +1979,18 @@ export async function runExtractConversationFacts(
 
   // Chat gateway is required for non-dry-run. Recover a cold singleton before
   // reporting an availability error (#2590).
-  if (!parsed.dryRun && !isAvailable('chat')) configureGatewayIfUninitialized();
-  if (!parsed.dryRun && !isAvailable('chat')) {
+  //
+  // Gate against `--model` when the caller supplied one (FRA-22903): a run
+  // pointed at `claude-cli:*` bills a Claude subscription seat and needs no
+  // ANTHROPIC_API_KEY, but the unqualified check resolves the global
+  // `chat_model` default and demands *its* recipe's key — so an API-credit
+  // outage aborted runs that were explicitly routed away from the API. With no
+  // flag there is no engine yet to read the DB-plane `facts.extraction_model`,
+  // so this stays a best-effort fast-fail; the authoritative per-call gate is
+  // in extractFactsFromTurnWithOutcome, which sees the resolved model.
+  const preflightModel = parsed.model;
+  if (!parsed.dryRun && !isAvailable('chat', preflightModel)) configureGatewayIfUninitialized();
+  if (!parsed.dryRun && !isAvailable('chat', preflightModel)) {
     console.error('Chat gateway unavailable. Configure an Anthropic or compatible chat model, or pass --dry-run to preview segmentation.');
     process.exit(1);
   }
@@ -1801,6 +2006,8 @@ export async function runExtractConversationFacts(
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
     pages_failed: 0,
+    pages_budget_denied: 0,
+    pages_provider_rejected: 0,
     pages_llm_fallback: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
@@ -1810,6 +2017,7 @@ export async function runExtractConversationFacts(
   };
   let totalSpent = 0;
   let anyBudgetExhausted = false;
+  let providerUnavailable: string | null = null;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
@@ -1835,6 +2043,7 @@ export async function runExtractConversationFacts(
         maxCostUsd: parsed.maxCostUsd,
         overrideDisabled: parsed.overrideDisabled,
         workers: parsed.workers,
+        model: parsed.model,
       });
 
       aggregate.pages_considered += perSource.pages_considered;
@@ -1846,6 +2055,8 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
       aggregate.pages_failed += perSource.pages_failed;
+      aggregate.pages_budget_denied += perSource.pages_budget_denied;
+      aggregate.pages_provider_rejected += perSource.pages_provider_rejected;
       aggregate.pages_llm_fallback += perSource.pages_llm_fallback;
       aggregate.pages_lock_skipped += perSource.pages_lock_skipped;
       aggregate.orphan_facts_cleaned += perSource.orphan_facts_cleaned;
@@ -1856,18 +2067,34 @@ export async function runExtractConversationFacts(
       if (perSource.spent_usd) totalSpent += perSource.spent_usd;
 
       progress.tick(1, `${sourceId}: ${perSource.facts_inserted} facts inserted`);
+
+      // FRA-22906: the provider refusing every request is an account-level
+      // condition, not a per-source one. Without this break the breaker just
+      // re-arms and pays its threshold again for every remaining source.
+      if (perSource.provider_unavailable) {
+        providerUnavailable = perSource.provider_error ?? 'provider rejected the request';
+        break;
+      }
     }
   } finally {
     progress.finish();
   }
 
-  const verb = parsed.dryRun ? '(dry run) would extract' : 'extracted';
+  // A dry run never calls the provider, so it cannot know how many facts it
+  // "would" extract — reporting a fact count here would read as "0 facts to
+  // find" when it actually means "did not look". Report the work outstanding,
+  // which is the number the preview can honestly produce.
   console.log(
-    `\nDone: ${verb} ${aggregate.facts_extracted} facts ` +
-    `(${aggregate.facts_inserted} inserted) across ${aggregate.segments_processed} segments ` +
-    `from ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
-    `in ${sourceIds.length} source(s). ` +
-    `Spent ~$${totalSpent.toFixed(4)}.`,
+    parsed.dryRun
+      ? `\nDone: (dry run) ${aggregate.segments_processed} segment(s) need extraction ` +
+        `across ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
+        `in ${sourceIds.length} source(s). ` +
+        `Spent ~$${totalSpent.toFixed(4)} (a dry run makes no paid calls).`
+      : `\nDone: extracted ${aggregate.facts_extracted} facts ` +
+        `(${aggregate.facts_inserted} inserted) across ${aggregate.segments_processed} segments ` +
+        `from ${aggregate.pages_processed}/${aggregate.pages_considered} pages ` +
+        `in ${sourceIds.length} source(s). ` +
+        `Spent ~$${totalSpent.toFixed(4)}.`,
   );
   if (aggregate.pages_skipped > 0) {
     console.log(`  Skipped ${aggregate.pages_skipped} page(s) with no new segments since last checkpoint.`);
@@ -1890,6 +2117,24 @@ export async function runExtractConversationFacts(
   if (aggregate.pages_failed > 0) {
     console.error(`  Failed ${aggregate.pages_failed} page(s); they remain unfinished and will retry.`);
   }
+  // FRA-22896: kept distinct from the failure line above. A cap denial says
+  // "out of authorized spend", not "this page is broken", and a run that ends
+  // here has NOT enumerated the rest of the backlog — so its coverage number
+  // is a floor, never an all-clear.
+  if (aggregate.pages_budget_denied > 0) {
+    console.log(
+      `  Halted ${aggregate.pages_budget_denied} page(s) at the cost cap (not failures). ` +
+      `Pages beyond the cap were never examined, so the counts above are a lower bound.`,
+    );
+  }
+  // FRA-22906: same reasoning as the cap line — "the provider refused" is a
+  // different instruction to the operator than "these pages are broken".
+  if (aggregate.pages_provider_rejected > 0) {
+    console.log(
+      `  Provider rejected ${aggregate.pages_provider_rejected} page(s) before generating ` +
+      `anything (not page defects; nothing was charged).`,
+    );
+  }
   if (aggregate.pages_llm_fallback > 0) {
     console.log(`  Parsed ${aggregate.pages_llm_fallback} page(s) with the opt-in LLM fallback.`);
   }
@@ -1902,6 +2147,15 @@ export async function runExtractConversationFacts(
   if (anyBudgetExhausted) {
     console.log(`  Budget cap reached. Re-run with a higher --max-cost-usd to continue.`);
   }
+  if (providerUnavailable) {
+    console.error(
+      `\n  STOPPED: the provider rejected ${PROVIDER_REJECTION_ABORT_THRESHOLD} requests in a row, ` +
+      `so the rest of the backlog was not attempted.\n` +
+      `  Cause: ${providerUnavailable}\n` +
+      `  This is an account/config condition (key, model, or credit balance), not a corpus ` +
+      `problem. Fix it and re-run; nothing above is a page defect.`,
+    );
+  }
 
   // v0.41.15.0 (codex #3): exit 3 when pages were skipped due to
   // lock-busy AND no hard failures fired. "Incomplete run, please
@@ -1910,6 +2164,12 @@ export async function runExtractConversationFacts(
   // above already tells the user what to do, and exit 0 is the right
   // signal for "ran to the cap intentionally."
   if (aggregate.pages_failed > 0) {
+    process.exit(1);
+  }
+  // FRA-22906: a provider outage is a hard failure of the run even though no
+  // individual page failed. Exiting 0 here would let a nightly cycle record a
+  // clean extract that never called the model once.
+  if (providerUnavailable) {
     process.exit(1);
   }
   if (aggregate.pages_lock_skipped > 0 && !anyBudgetExhausted) {

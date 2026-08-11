@@ -10,6 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
+import { BULK_JOB_PRIORITY } from './minions/queue-lanes.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags, stampUnverifiedExtractions } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
@@ -6098,8 +6099,9 @@ const volunteer_chronicle: Operation = {
 const chronicle_backfill: Operation = {
   name: 'chronicle_backfill',
   description:
-    'Life Chronicle: sweep existing meeting/conversation/calendar pages into timeline events by ' +
-    'enqueuing chronicle_extract jobs (one per eligible page). --dry-run counts without enqueuing. ' +
+    'Life Chronicle: sweep existing meeting/conversation/calendar/email pages into timeline events by ' +
+    'enqueuing chronicle_extract jobs (one per eligible page; mail emits a deterministic header event). ' +
+    '--dry-run counts without enqueuing. ' +
     'Local-only bulk op. CLI: `gbrain chronicle-backfill [--since YYYY-MM-DD] [--limit N] [--dry-run]`.',
   scope: 'admin',
   mutating: true,
@@ -6111,12 +6113,16 @@ const chronicle_backfill: Operation = {
   },
   handler: async (ctx, p) => {
     const { isChronicleEligible } = await import('./chronicle/eligibility.ts');
-    const TYPES = ['meeting', 'conversation', 'calendar-event'] as const;
+    // email (FRA-1316): mail is an event source too — sweep it into deterministic
+    // header events alongside transcript-shaped pages.
+    const TYPES = ['meeting', 'conversation', 'calendar-event', 'email'] as const;
     const limit = typeof p.limit === 'number' ? p.limit : 1000;
     const updated_after = typeof p.since === 'string' ? p.since : undefined;
     const dryRun = p.dry_run === true;
     const scope = sourceScopeOpts(ctx);
-    type QueueLike = { add: (n: string, d: Record<string, unknown>) => Promise<unknown> };
+    type QueueLike = {
+      add: (n: string, d: Record<string, unknown>, o?: { priority?: number }) => Promise<unknown>;
+    };
     let queue: QueueLike | null = null;
     if (!dryRun) {
       const { MinionQueue } = await import('./minions/queue.ts');
@@ -6134,7 +6140,19 @@ const chronicle_backfill: Operation = {
         eligible++;
         if (dryRun || !queue) continue;
         try {
-          await queue.add('chronicle_extract', { slug: page.slug, sourceId: ctx.sourceId ?? 'default' });
+          // FRA-23078: this loop is the system's biggest bulk submitter —
+          // `limit` is PER TYPE, so the nightly's `--limit 8000` can enqueue up
+          // to 4×8000 rows in one pass. At the implicit priority 0 those rows
+          // sorted ahead of every later `default` submission (claim order is
+          // `priority ASC, created_at ASC`), which is how two `embed-backfill`
+          // jobs at priority 5 sat waiting for hours on 2026-07-29. Submitting
+          // at BULK_JOB_PRIORITY parks the backfill behind ordinary work
+          // without slowing its own drain — it still saturates idle workers.
+          await queue.add(
+            'chronicle_extract',
+            { slug: page.slug, sourceId: ctx.sourceId ?? 'default' },
+            { priority: BULK_JOB_PRIORITY },
+          );
           enqueued++;
         } catch (e) {
           // Never swallow — surface per-page failures (the #2057 no-swallow pattern).

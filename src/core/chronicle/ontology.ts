@@ -20,11 +20,19 @@ const DIMENSION_ALIASES: Record<string, string> = {
   risk_appetite: 'risk_tolerance',
   comms_style: 'communication_style', communication: 'communication_style',
   employer_name: 'employer', company: 'employer', org: 'employer',
+  // Supplier/project dimensions (FRA-1317): canonicalize the common drift so
+  // "engagement status" / "deal stage" / "project phase" don't fragment.
+  state: 'status', engagement_status: 'status', account_status: 'status',
+  lifecycle_status: 'status', stage: 'phase', deal_stage: 'phase',
+  project_phase: 'phase', engagement_phase: 'phase', lifecycle_phase: 'phase',
 };
 
 const KNOWN_DIMENSIONS = new Set<string>([
   'role', 'relation', 'risk_tolerance', 'decision_style', 'communication_style',
   'reliability', 'expertise', 'affect', 'location', 'employer',
+  // Supplier/project dimensions (FRA-1317): seed lexicon so status/phase resolve
+  // as active instead of quarantining. Genuinely novel dims still quarantine.
+  'status', 'phase',
 ]);
 
 /** Normalize a dimension name (case/space/hyphen + alias lexicon). */

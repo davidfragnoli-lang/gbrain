@@ -67,6 +67,61 @@ export const ALL_PAGE_TYPES: readonly string[] = [
 ] as const;
 
 /**
+ * FRA-1459: Raw chronicle / source page types — pages materialized directly
+ * from an ingest source (mail, calendar, chat transcripts, life-chronicle
+ * events) rather than authored/synthesized into the canonical knowledge graph.
+ *
+ * These pages are structurally NOT expected to carry inbound wikilinks: they
+ * ARE the raw source material the canonical graph (person/company/concept/wiki
+ * pages) is distilled FROM, and the gazetteer only holds ~dozens of entity
+ * buckets, so a large legitimate ingest batch (e.g. thousands of emails +
+ * timeline events materialized overnight) leaves them all "orphaned" by the
+ * strict no-inbound-link definition.
+ *
+ * The brain-score orphan component and the `orphan_ratio` doctor check EXCLUDE
+ * these types from BOTH the orphan numerator AND the linkable denominator, so
+ * health reflects the canonical graph, not raw ingest volume. Without this, a
+ * nightly chronicle ingest collapses brain_score to ~0/100 and fires a false
+ * "unhealthy" recap despite the canonical graph being fine.
+ *
+ * Membership rationale (mirrors chronicle/eligibility.ts ELIGIBLE_TYPES +
+ * the temporal chronicle OUTPUT + private interiority + extraction receipts):
+ *   - email, slack, calendar-event, meeting, conversation, source — raw
+ *     ingest / transcript source pages.
+ *   - event — life-chronicle timeline atoms (the extraction OUTPUT).
+ *   - diary — first-person interiority, never mined into the graph.
+ *   - extract_receipt — extraction-run receipts, already demoted / loop-excluded.
+ *
+ * NOT included (canonical graph members that SHOULD accrue links): person,
+ * company, deal, concept, wiki types, note, atom, media, etc.
+ */
+export const CHRONICLE_SOURCE_PAGE_TYPES: ReadonlySet<string> = new Set([
+  'email',
+  'slack',
+  'calendar-event',
+  'meeting',
+  'conversation',
+  'source',
+  'event',
+  'diary',
+  'extract_receipt',
+]);
+
+/**
+ * Sorted array form of {@link CHRONICLE_SOURCE_PAGE_TYPES}, for SQL `type IN (...)`
+ * / `type = ANY(...)` clauses and stable test output. Derived from the Set so
+ * the two can never drift.
+ */
+export const CHRONICLE_SOURCE_PAGE_TYPE_LIST: readonly string[] = [
+  ...CHRONICLE_SOURCE_PAGE_TYPES,
+].sort();
+
+/** True when a page type is a raw chronicle/source type (see {@link CHRONICLE_SOURCE_PAGE_TYPES}). */
+export function isChronicleSourceType(type: string | null | undefined): boolean {
+  return type != null && CHRONICLE_SOURCE_PAGE_TYPES.has(type);
+}
+
+/**
  * v0.38: PageType is now `string`. The pre-v0.38 `assertNever` helper used
  * to enforce exhaustive switches over the closed PageType union; with the
  * open-type model, that pattern moves to per-primitive switches (the
@@ -1110,9 +1165,27 @@ export interface SearchOpts {
     topNOut: number | null;
     model?: string;
     timeoutMs?: number;
+    // FRA-22966 — throw RerankUnavailableError instead of degrading silently.
+    // Eval/bench paths only; see `rerankerFailClosed` for the ergonomic form.
+    failClosed?: boolean;
     // Test seam — never set in production code.
     rerankerFn?: (input: { query: string; documents: string[]; topN?: number; model?: string; signal?: AbortSignal; timeoutMs?: number }) => Promise<{ index: number; relevanceScore: number }[]>;
   };
+  /**
+   * FRA-22966 — measurement posture for the reranker, WITHOUT having to
+   * restate the whole `reranker` bundle. When true, a reranker failure throws
+   * `RerankUnavailableError` out of hybridSearch instead of silently falling
+   * back to un-reranked RRF order. Composes with mode-bundle resolution: the
+   * mode still decides `enabled`/`topNIn`/`model`, this only changes what
+   * happens when the upstream call fails.
+   *
+   * Set by the qrels correctness gate and baseline replay so a reranker
+   * outage reads as `inconclusive` rather than as a retrieval regression
+   * (un-reranked ordering collapses first_relevant_hit 0.571 → 0.143).
+   * Production search MUST NOT set this — search reliability beats reranker
+   * quality outside measurement.
+   */
+  rerankerFailClosed?: boolean;
   /**
    * v0.35.6.0 — floor-ratio gate for metadata-axis boost stages.
    * Number in [0, 1] or undefined (default = no gate). When set, each gated
@@ -1464,8 +1537,20 @@ export interface BrainHealth {
    * aims at "pages I forgot to connect to anything", not the stricter
    * graph-theory "no inbound" definition. Both engines share this
    * semantics after Bug 11 doc-drift fix.
+   *
+   * FRA-1459: this raw count still includes chronicle/source pages (email,
+   * event, …) so nothing is hidden from inspection. The brain-score orphan
+   * component, however, is derived from {@link linkable_orphan_pages} /
+   * {@link linkable_page_count} below, which exclude those types — so a
+   * legitimate raw-ingest batch no longer collapses brain_score.
    */
   orphan_pages: number;
+  /**
+   * Islanded pages (zero inbound AND zero outbound links) among the canonical
+   * {@link linkable_page_count} scope. Numerator of the brain-score orphan
+   * component. Always <= {@link orphan_pages}.
+   */
+  linkable_orphan_pages: number;
   missing_embeddings: number;
   /**
    * Composite quality score, 0-100. Weighted sum of five components: embed

@@ -76,12 +76,13 @@ import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts'
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
 import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
-import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
+import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL, CHRONICLE_SOURCE_PAGE_TYPE_LIST, isChronicleSourceType } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
+import { machineGeneratedFragment } from './machine-generated.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import {
@@ -2320,7 +2321,7 @@ export class PGLiteEngine implements BrainEngine {
     // issue #160: guard predicate projected as `unverified_stub` in
     // hnsw_candidates (parity with postgres-engine) so unverified stubs get
     // factor 1.0, not the people/ 1.2x, inside the pre-LIMIT re-rank.
-    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub');
+    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail, 'unverified_stub', 'machine_generated');
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const innerLimit = offset + Math.max(limit * 5, 100);
@@ -2403,6 +2404,7 @@ export class PGLiteEngine implements BrainEngine {
              THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            (${unverifiedExtractionFragment('p')}) AS unverified_stub,
+           (${machineGeneratedFragment('p')}) AS machine_generated,
            1 - (cc.${col} <=> ${castSql}) AS raw_score
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
@@ -3784,7 +3786,7 @@ export class PGLiteEngine implements BrainEngine {
   async findOrphanPages(opts?: {
     sourceId?: string;
     sourceIds?: string[];
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+  }): Promise<Array<{ slug: string; title: string; domain: string | null; type: string }>> {
     // Soft-delete filter on BOTH sides:
     //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
     //   - link source: src.deleted_at IS NULL — links FROM soft-deleted pages don't count as inbound
@@ -3809,7 +3811,8 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug,
          COALESCE(p.title, p.slug) AS title,
-         p.frontmatter->>'domain' AS domain
+         p.frontmatter->>'domain' AS domain,
+         p.type AS type
        FROM pages p
        WHERE p.deleted_at IS NULL
          ${sourceFilter}
@@ -3823,7 +3826,7 @@ export class PGLiteEngine implements BrainEngine {
        ORDER BY p.slug`,
       params
     );
-    return rows as Array<{ slug: string; title: string; domain: string | null }>;
+    return rows as Array<{ slug: string; title: string; domain: string | null; type: string }>;
   }
 
   // Tags
@@ -5630,9 +5633,12 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
+        -- stale_pages + orphan_pages are computed in TS below (upstream #3015):
+        -- stale_pages via countStalePagesForExtraction (extraction-staleness),
+        -- orphan_pages via the shared slug-based orphan-reporting policy applied
+        -- to the islanded set. The FRA-1459 linkable-universe SCORE inputs stay
+        -- in SQL so the brain-score math is unchanged.
         0 as stale_pages,
-        -- Bug 11 — orphan = islanded (no inbound AND no outbound). The raw
-        -- list is filtered in TS using the shared orphan-reporting policy.
         0 as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
@@ -5675,7 +5681,7 @@ export class PGLiteEngine implements BrainEngine {
     // participate in the curated graph. Filtered in TS because the policy
     // includes per-brain config overrides.
     const { rows: pageScopeRows } = await this.db.query(`
-      SELECT p.slug,
+      SELECT p.slug, p.type,
              (NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
               AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
@@ -5686,23 +5692,46 @@ export class PGLiteEngine implements BrainEngine {
     const r = h as Record<string, unknown>;
     const pageCount = Number(r.page_count);
     const embedCoverage = Number(r.embed_coverage);
+    // stale_pages + orphan_pages: upstream #3015 computes these in TS.
+    // linkable_* stay from SQL (FRA-1459/FRA-1572) and drive the score.
     const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const scopeRows = pageScopeRows as { slug: string; type: string | null; islanded: boolean; has_timeline: boolean }[];
+    // orphan_pages (raw inspection count, FRA-1459 "nothing hidden"): islanded
+    // pages that are EITHER a raw chronicle/source TYPE (email/event/… — always
+    // surfaced so a large ingest volume stays visible for inspection) OR a
+    // non-chronicle page the slug policy keeps in scope. NOT the actionable
+    // audit count: `gbrain orphans` / doctor orphan_ratio (getOrphansData) AND
+    // the advisor drop chronicle types via {@link linkable_orphan_pages}; only
+    // this reported field keeps them visible. Slug policy still applies to
+    // non-chronicle pages (raw/, archive, generated, daily-log, life/events
+    // #2264 + per-brain overrides).
+    const orphanPages = scopeRows
+      .filter(row => row.islanded
+        && (isChronicleSourceType(row.type) || !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type))).length;
+    // Linkable universe (SCORE + advisor scope) additionally excludes raw
+    // chronicle/source TYPES (FRA-1459/FRA-1572) so a large mail/event ingest —
+    // pages that carry no wikilinks by design — can't collapse the orphan/link/
+    // timeline components or fire a false orphan alert.
+    const linkablePages = scopeRows
+      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, row.type));
     const linkablePageCount = linkablePages.length;
-    const orphanPages = linkablePages.filter(row => row.islanded).length;
+    const linkableOrphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
     const deadLinks = Number(r.dead_links);
     const linkCount = Number(r.link_count);
 
-    const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
+    // FRA-1572: link density scored over the LINKABLE universe (not raw
+    // pageCount) so a large raw chronicle/source ingest can't collapse the
+    // links component. Re-applied over upstream #3015, which reverted this
+    // denominator to pageCount; orphan + timeline already scope to linkable.
+    const linkDensity = linkablePageCount > 0 ? Math.min(linkCount / linkablePageCount, 1) : 0;
     // linkablePageCount === 0 gets full marks for the orphan / timeline
     // components (same vacuous-truth rule as the empty-brain fix below):
     // an all-archive brain has no curated graph to penalize.
     const timelineCoverageDensity =
       linkablePageCount > 0 ? Math.min(linkableTimelinePages / linkablePageCount, 1) : 1;
-    const noOrphans = linkablePageCount > 0 ? 1 - (orphanPages / linkablePageCount) : 1;
+    const noOrphans = linkablePageCount > 0 ? 1 - (linkableOrphanPages / linkablePageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Bug 11 — per-component points. Sum equals brainScore by construction
     // so `doctor` can render a breakdown that adds up to the total.
@@ -5722,10 +5751,11 @@ export class PGLiteEngine implements BrainEngine {
 
     return {
       page_count: pageCount,
-      linkable_page_count: linkablePageCount,
       embed_coverage: embedCoverage,
       stale_pages: stalePages,
       orphan_pages: orphanPages,
+      linkable_page_count: linkablePageCount,
+      linkable_orphan_pages: linkableOrphanPages,
       missing_embeddings: Number(r.missing_embeddings),
       brain_score: brainScore,
       dead_links: deadLinks,

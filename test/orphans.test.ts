@@ -118,9 +118,11 @@ describe('shouldExclude', () => {
       excludePrefixes: ['my-private-folder/'],
       excludeSlugs: ['one-off-fixture-page'],
     };
-    expect(shouldExclude('my-private-folder/some-secret-ref.md', overrides)).toBe(true);
-    expect(shouldExclude('one-off-fixture-page', overrides)).toBe(true);
-    expect(shouldExclude('people/jane-doe', overrides)).toBe(false);
+    // Merged signature is shouldExclude(slug, type?, overrides?): FRA-1459
+    // type-based exclusion is the 2nd arg, per-brain overrides the 3rd.
+    expect(shouldExclude('my-private-folder/some-secret-ref.md', undefined, overrides)).toBe(true);
+    expect(shouldExclude('one-off-fixture-page', undefined, overrides)).toBe(true);
+    expect(shouldExclude('people/jane-doe', undefined, overrides)).toBe(false);
   });
 
   test('does NOT exclude a normal content page', () => {

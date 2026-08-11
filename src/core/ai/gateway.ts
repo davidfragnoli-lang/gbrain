@@ -56,7 +56,12 @@ import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
-import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import {
+  AIConfigError,
+  AITransientError,
+  normalizeAIError,
+  isRequestRejectedBeforeGeneration,
+} from './errors.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import { buildGatewayConfig } from './build-gateway-config.ts';
@@ -3544,9 +3549,18 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   } catch (err) {
     // Pessimistic fallback (A3 amended): when err.usage isn't there, charge
     // the worst-case ceiling — better to overcount on failure than under.
+    //
+    // FRA-22903 narrows that to failures that could actually have generated
+    // output. A 4xx-non-429 is a request-level rejection (bad key, bad model,
+    // exhausted credit balance): the model never ran, so both counts are
+    // genuinely zero and the ceiling is not conservative, just wrong. Billing
+    // those at maxOutputTokens let 78 instant failures burn a $5 cap in 26
+    // seconds and wrote $64.80 of never-charged spend into the same ledger the
+    // daily ceiling is enforced against.
+    const rejectedBeforeGeneration = isRequestRejectedBeforeGeneration(err);
     const fallback = _extractUsageFromError(err, {
-      inputTokens: estimatedInputTokens,
-      outputTokens: maxOutputTokens,
+      inputTokens: rejectedBeforeGeneration ? 0 : estimatedInputTokens,
+      outputTokens: rejectedBeforeGeneration ? 0 : maxOutputTokens,
     });
     _recordBudget(`${recipe.id}:${modelId}`, fallback.inputTokens, fallback.outputTokens);
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`);

@@ -15,6 +15,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { isChronicleSourceType } from '../core/types.ts';
 import {
   shouldExcludeFromOrphanReporting,
   loadOrphanPolicyOverrides,
@@ -40,11 +41,32 @@ export interface OrphanResult {
 // --- Filter logic ---
 
 /**
- * Returns true if a slug should be excluded from orphan reporting by default.
+ * Returns true if a page should be excluded from orphan reporting by default.
  * These are pages where having no inbound links is expected / not a content problem.
+ *
+ * FRA-1459: exclusion now also considers page `type`. Raw chronicle/source
+ * types (email, event, calendar-event, meeting, conversation, slack, source,
+ * diary, extract_receipt — see CHRONICLE_SOURCE_PAGE_TYPES) are excluded
+ * regardless of slug: a large legitimate ingest batch of raw source pages
+ * must not be counted as orphans, since the canonical graph never links most
+ * of them (the gazetteer holds only ~dozens of entity buckets). `type` is
+ * optional so existing slug-only callers keep working unchanged.
  */
-export function shouldExclude(slug: string, overrides?: OrphanPolicyOverrides): boolean {
-  return shouldExcludeFromOrphanReporting(slug, overrides);
+export function shouldExclude(
+  slug: string,
+  typeOrOverrides?: string | null | OrphanPolicyOverrides,
+  maybeOverrides?: OrphanPolicyOverrides,
+): boolean {
+  // Preserve the legacy shouldExclude(slug, overrides) call shape while also
+  // allowing type-aware exclusions for raw chronicle/source pages.
+  if (
+    typeOrOverrides === undefined ||
+    typeOrOverrides === null ||
+    typeof typeOrOverrides === 'string'
+  ) {
+    return shouldExcludeFromOrphanReporting(slug, maybeOverrides, typeOrOverrides);
+  }
+  return shouldExcludeFromOrphanReporting(slug, typeOrOverrides);
 }
 
 /**
@@ -69,7 +91,7 @@ export function deriveDomain(frontmatterDomain: string | null | undefined, slug:
  */
 export async function queryOrphanPages(
   engine: BrainEngine,
-): Promise<{ slug: string; title: string; domain: string | null }[]> {
+): Promise<{ slug: string; title: string; domain: string | null; type: string }[]> {
   return engine.findOrphanPages();
 }
 
@@ -107,7 +129,7 @@ export async function findOrphans(
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('orphans.scan');
   const stopHb = startHeartbeat(progress, 'scanning pages for missing inbound links…');
-  let allOrphans: { slug: string; title: string; domain: string | null }[];
+  let allOrphans: { slug: string; title: string; domain: string | null; type: string }[];
   let total: number;
   let excludedAll: number;
   const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
@@ -132,14 +154,18 @@ export async function findOrphans(
       liveParams.push(sourceId);
       scopeClause = ` AND source_id = $${liveParams.length}`;
     }
-    const liveRows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL${scopeClause}`,
+    // FRA-1459: select `type` too so the denominator can drop raw
+    // chronicle/source pages (email/event/…) via the same shouldExclude
+    // predicate as the orphan numerator — else a large ingest batch stays
+    // in `total_linkable` and inflates the orphan ratio.
+  const liveRows = await engine.executeRaw<{ slug: string; type: string }>(
+      `SELECT slug, type FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, r.type, overrides) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -147,7 +173,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug, overrides));
+    : allOrphans.filter(row => !shouldExclude(row.slug, row.type, overrides));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,

@@ -1615,6 +1615,9 @@ export async function registerBuiltinHandlers(
       // `gbrain extract-conversation-facts --background --workers 20`
       // works end-to-end.
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
+      // FRA-22807: round-trip --model so a background email drain can pin a
+      // cost-efficient extraction model (e.g. Haiku) without touching config.
+      model: typeof job.data.model === 'string' ? job.data.model : undefined,
     });
     return result;
   });
@@ -1630,12 +1633,23 @@ export async function registerBuiltinHandlers(
     const { runChronicleExtract } = await import('../core/chronicle/extract-events.ts');
     const { chronicleTz } = await import('../core/chronicle/config.ts');
     const tz = await chronicleTz(engine);
-    return await runChronicleExtract(engine, {
-      slug,
-      sourceId,
-      tz,
-      signal: (job as { signal?: AbortSignal }).signal,
-    });
+    const signal = (job as { signal?: AbortSignal }).signal;
+    const events = await runChronicleExtract(engine, { slug, sourceId, tz, signal });
+
+    // FRA-1317 — also extract per-entity ontology dimensions (supplier/project
+    // status/phase/role) from the same page, so `gbrain orient`/`ontology` return
+    // real values instead of {}. Best-effort: an ontology-lane failure must NOT
+    // fail (or retry) the event extraction that already succeeded. An AbortError
+    // still propagates so cancellation is honored.
+    let ontology: import('../core/chronicle/extract-ontology.ts').OntologyExtractResult | { status: 'error'; reason: string };
+    try {
+      const { runOntologyExtract } = await import('../core/chronicle/extract-ontology.ts');
+      ontology = await runOntologyExtract(engine, { slug, sourceId, signal });
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') throw e;
+      ontology = { status: 'error', reason: e instanceof Error ? e.message : String(e) };
+    }
+    return { ...events, ontology };
   });
 
   // v0.41.39 (#1700) — enrich. NOT in PROTECTED_JOB_NAMES: per-call cost is

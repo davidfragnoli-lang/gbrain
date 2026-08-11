@@ -20,7 +20,7 @@ import { join } from 'node:path';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { runEvalGate } from '../src/commands/eval-gate.ts';
+import { runEvalGate, resolveVerdict } from '../src/commands/eval-gate.ts';
 import {
   BASELINE_FILE_SCHEMA_VERSION,
   DEFAULT_THRESHOLDS,
@@ -255,5 +255,34 @@ describe('eval gate: latency math (corrected per codex round-2 #2)', () => {
     const baselineMean = 0;
     const isFinitePos = Number.isFinite(baselineMean) && baselineMean > 0;
     expect(isFinitePos).toBe(false);
+  });
+});
+
+describe('eval gate: verdict resolution with a reranker outage (FRA-22966)', () => {
+  const outage = { metric: 'reranker_unavailable', observed: 1, threshold: 0 };
+  const realBreach = { metric: 'mean_recall_at_k', observed: 0.2, threshold: 0.7 };
+
+  test('no breaches → pass', () => {
+    expect(resolveVerdict(undefined, undefined)).toBe('pass');
+    expect(resolveVerdict([], [])).toBe('pass');
+  });
+
+  test('ordinary breaches → fail', () => {
+    expect(resolveVerdict(undefined, [realBreach])).toBe('fail');
+    expect(resolveVerdict([realBreach], undefined)).toBe('fail');
+  });
+
+  test('a reranker outage on either gate → inconclusive', () => {
+    expect(resolveVerdict(undefined, [outage])).toBe('inconclusive');
+    expect(resolveVerdict([outage], undefined)).toBe('inconclusive');
+  });
+
+  test('an outage outranks a co-occurring quality breach', () => {
+    // The surviving queries were scored over a shrunken denominator, so the
+    // recall number is not comparable to any prior run. Reporting `fail` here
+    // is the bug this issue exists to fix — a reranker blip must not read as
+    // a retrieval regression. The breach itself stays in the envelope.
+    expect(resolveVerdict(undefined, [outage, realBreach])).toBe('inconclusive');
+    expect(resolveVerdict([realBreach], [outage])).toBe('inconclusive');
   });
 });

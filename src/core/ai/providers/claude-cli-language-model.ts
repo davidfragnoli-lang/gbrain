@@ -49,12 +49,26 @@ function claudeBin(): string {
   return process.env.GBRAIN_CLAUDE_CLI_BIN ?? 'claude';
 }
 const CLAUDE_CWD = join(tmpdir(), `gbrain-claude-cli-cwd-${process.pid}`);
-let cwdEnsured = false;
+/**
+ * Re-asserted on every call rather than latched behind a `cwdEnsured` boolean.
+ * `mkdirSync(recursive)` on an existing directory is a single cheap syscall,
+ * which is noise next to spawning a whole CLI process — and the latch had a
+ * failure mode worth more than that syscall: nothing guarantees the directory
+ * survives for the life of the process. `tmpdir()` honours `TMPDIR`, and an
+ * orchestrator may point that at a run-scoped directory it deletes when the
+ * run exits (Paperclip does exactly this). A long drain outliving its
+ * launching run then had its cwd removed underneath it, and because the latch
+ * was already `true` it was never recreated.
+ *
+ * The resulting failure is badly misleading: `spawn` reports a missing *cwd*
+ * as `ENOENT ... posix_spawn 'claude'`, naming the binary. That reads as
+ * "claude is not installed" and sends you hunting a PATH problem while the
+ * binary sits on PATH the whole time. Seen in FRA-22943: 198 pages extracted,
+ * then 1,359 consecutive identical ENOENT failures the moment the parent run
+ * was cleaned up.
+ */
 function ensureCleanCwd(): string {
-  if (!cwdEnsured) {
-    mkdirSync(CLAUDE_CWD, { recursive: true });
-    cwdEnsured = true;
-  }
+  mkdirSync(CLAUDE_CWD, { recursive: true });
   return CLAUDE_CWD;
 }
 

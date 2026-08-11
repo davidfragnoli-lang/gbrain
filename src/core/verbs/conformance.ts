@@ -151,6 +151,7 @@ export async function runConformance(
   const marker = opts.marker ?? `run-${Date.now().toString(36)}`;
   const ids = new Map<string, string>();
   const results: CaseResult[] = [];
+  const seededSlug = `test/conformance-${marker}`;
 
   // Seed the conformance entity PAGE when the target exposes put_page (full
   // surface). entity() resolves pages; verbs-only targets with no seeding
@@ -158,8 +159,8 @@ export async function runConformance(
   let seededEntity = false;
   try {
     const seed = await client.callTool('put_page', {
-      slug: `people/conformance-${marker}`,
-      content: `---\ntitle: Conformance ${marker}\ntype: person\n---\n\n# Conformance ${marker}\n\nSynthetic entity for a MEMORY_VERBS conformance run.\n`,
+      slug: seededSlug,
+      content: `---\ntitle: Conformance ${marker}\ntype: person\n---\n`,
     });
     seededEntity = !seed.isError;
   } catch {

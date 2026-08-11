@@ -4496,7 +4496,17 @@ See also:
   const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
   const resolved = await resolveSourceWithTier(engine, explicitSource);
   const sourceId: string = resolved.source_id;
-  if (resolved.tier === 'sole_non_default') {
+  // FRA-1702: suppress the sole-non-default auto-route nudge under `--all`.
+  // The `--all` fan-out below re-queries every source with a local_path and
+  // syncs each under its own per-source lock/anchor; the single `sourceId`
+  // resolved here is unused on that path (skip-failed takes the global branch,
+  // the fan-out keys off `src.id`). Printing "routing to source 'swatch-mail'"
+  // there is actively misleading — it implies only swatch-mail syncs when in
+  // fact BOTH default and swatch-mail do. The nudge exists to warn a user who
+  // typed a bare `gbrain sync` that a single write silently routed to a
+  // non-default source; `--all` is the explicit multi-source opt-in, so there
+  // is nothing to warn about.
+  if (!syncAll && resolved.tier === 'sole_non_default') {
     const nudge = formatSoleNonDefaultNudge(sourceId);
     if (nudge) process.stderr.write(nudge + '\n');
   }

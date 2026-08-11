@@ -33,8 +33,10 @@ import { slugifyPath } from './sync.ts';
 // inferTypeByDir fix (unevidenced people/ -> companies/ adjacency now infers
 // 'mentions' instead of 'works_at') AND the #2576 bug-2 fix (the DIR_PATTERN
 // whitelist no longer drops markdown links / bare-slug refs / slash-shaped
-// wikilinks in non-whitelisted directories). Pages stamped by earlier sweeps
-// are re-flagged so the next --stale sweep re-extracts under both fixes.
+// wikilinks in non-whitelisted directories). This also supersedes the FRA-788
+// watermark for `brain/`-prefixed links and its `ideas`/`operations` dirs.
+// Pages stamped by earlier sweeps are re-flagged so the next --stale sweep
+// re-extracts under all of these fixes.
 // The watermark MUST NOT be in the future: the stamp path clamps
 // links_extracted_at up to the watermark (so a fresh extraction isn't
 // immediately re-listed), which means a future watermark masks concurrent
@@ -93,16 +95,46 @@ export type LinkResolutionType = 'qualified' | 'unqualified';
 
 /**
  * Directory prefix whitelist. These are the canonical top-level slug dirs
- * (gbrain-base pack dirs + historical extensions). #2576 (bug 2): this list
- * is NO LONGER a drop-gate for markdown links, bare-slug prose refs, or
- * slash-shaped wikilinks — those now match ANY_DIR_SEGMENT and rely on the
- * downstream page-existence checks that every persist path already runs
- * (resolveCandidateSources in extract.ts, the allSlugs filter in put_page
- * auto-link, and addLinksBatch's INNER JOINs as the final backstop). The
- * whitelist survives only as the typed fast-path for pass-2b wikilinks;
+ * (gbrain-base pack dirs + historical and Fragno extensions). #2576 (bug 2):
+ * this list is NO LONGER a drop-gate for markdown links, bare-slug prose refs,
+ * or slash-shaped wikilinks — those now match ANY_DIR_SEGMENT and rely on the
+ * downstream page-existence checks that every persist path already runs.
+ * The whitelist survives as the typed fast-path for pass-2b wikilinks, while
  * non-whitelisted `[[dir/...]]` get equivalent treatment in pass 2c.
+ *
+ * FRA-788: our canonical brain stores entity pages under a `brain/` source
+ * root (DB slugs are `brain/<dir>/<slug>`, e.g. `brain/concepts/foo`), and the
+ * canonical README references them with the matching `[[brain/<dir>/<slug>]]`
+ * wikilink form. An optional leading `brain/` segment is admitted so those
+ * links match; the captured slug keeps the `brain/` prefix (it must, to equal
+ * the stored slug on resolution), while `entityDir()` derives the entity dir
+ * from the segment AFTER the prefix so downstream dir logic is unaffected.
+ *
+ * FRA-788: `ideas` and `operations` were added because the brain's own README
+ * taxonomy (`## Current Top-Level Taxonomy`) now declares both as canonical
+ * primary homes, and README links to them via the same `[[brain/ideas/<slug>]]`
+ * / `[[brain/operations/<slug>]]` form. Without them ~40% of README's wikilinks
+ * fell through the gated pass; the generic basename pass could not rescue them
+ * (it matches bare tails, not a multi-segment `brain/ideas/<slug>` literal), so
+ * README-only idea/operations pages stayed false orphans — the exact bug here.
  */
-const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities|reference)';
+// FRA-788 overlay: our `brain/`-prefix, `ideas`/`operations` extensions, and the
+// `entityDir()` helper are preserved. Upstream relanded #2071 (recognize reference
+// wikilinks, #3303) after its earlier revert; we track that reland and re-admit
+// `reference` here too (harmless to us — additive dir, no brain/ `reference/` yet).
+const DIR_PATTERN = '(?:brain\\/)?(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|ideas|operations|entities|reference)';
+
+/**
+ * FRA-788: the entity directory of a (possibly `brain/`-prefixed) slug —
+ * the first path segment, skipping an optional leading `brain/` source-root
+ * prefix. `brain/companies/acme` → `companies`; `companies/acme` → `companies`.
+ * Returns '' for a bare basename with no `/`.
+ */
+function entityDir(slug: string): string {
+  const parts = slug.split('/');
+  if (parts[0] === 'brain') return parts[1] ?? '';
+  return parts[0] ?? '';
+}
 
 /**
  * #2576 (bug 2): a plausible top-level slug directory — lowercase alnum
@@ -347,7 +379,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     const name = match[1];
     const fullPath = match[2];
     const slug = fullPath;
-    const dir = fullPath.split('/')[0];
+    const dir = entityDir(fullPath);
     refs.push({ name, slug, dir });
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
@@ -364,7 +396,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[3] || slug).trim();
-    const dir = slug.split('/')[0];
+    const dir = entityDir(slug);
     refs.push({ name: displayName, slug, dir, sourceId });
     qualifiedRanges.push([match.index, match.index + match[0].length]);
   }
@@ -380,7 +412,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
-    const dir = slug.split('/')[0];
+    const dir = entityDir(slug);
     refs.push({ name: displayName, slug, dir });
     unqualifiedRanges.push([match.index, match.index + match[0].length]);
   }
@@ -412,7 +444,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
     if (slug.includes(':')) continue; // qualified-syntax token; 2a owns these
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
     const displayName = (match[2] || slug).trim();
-    const dir = slug.includes('/') ? slug.split('/')[0] : '';
+    const dir = slug.includes('/') ? entityDir(slug) : '';
     refs.push({ name: displayName, slug, dir, needsResolution: true });
   }
 
@@ -815,7 +847,10 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   // also sit on boards ("board seat at portfolio company") which a naive
   // employee/advisor match would mis-classify; keep investor first so those
   // phrasings resolve correctly.
-  if (pageType === 'person' && globalContext && targetSlug?.startsWith('companies/')) {
+  // FRA-788: strip an optional `brain/` source-root prefix so the prior fires
+  // for both `companies/acme` and canonical `brain/companies/acme` slugs.
+  const targetEntity = targetSlug?.replace(/^brain\//, '');
+  if (pageType === 'person' && globalContext && targetEntity?.startsWith('companies/')) {
     if (PARTNER_ROLE_RE.test(globalContext)) return 'invested_in';
     if (ADVISOR_ROLE_RE.test(globalContext)) return 'advises';
     if (EMPLOYEE_ROLE_RE.test(globalContext)) return 'works_at';
@@ -1260,6 +1295,24 @@ const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[|\-–—]+\s*
 // 年/月 markers so plain ASCII `- 2020-01-02 - text` does NOT match — non-bold
 // ASCII dates were never timeline entries and must stay that way.
 const TIMELINE_LINE_RE_CN = /^\s*-?\s*(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*[|\-–—]+\s*(.+?)\s*$/;
+// Non-bold bullet: `- YYYY-MM-DD — summary`. This is the shape curated entity
+// pages actually use under their `## Timeline` heading, and requiring the bold
+// markers above made every one of them invisible (measured on a real brain:
+// 639 entries across 121 of 216 entity pages, i.e. timeline_coverage 65% vs a
+// true 90%).
+//
+// Deliberately gated on being INSIDE a Timeline section (see the
+// `inTimelineSection` pass in parseTimelineEntries) rather than relaxing
+// TIMELINE_LINE_RE. That preserves the invariant the CN pattern documents
+// above — a plain `- 2020-01-02 - text` bullet in ordinary prose is not an
+// event — while still reading the dates a Timeline section exists to declare.
+// A leading bullet marker is required so prose sentences opening with a date
+// cannot match.
+const TIMELINE_LINE_RE_PLAIN = /^\s*[-*]\s+(\d{4}-\d{2}-\d{2})\s*[|\-–—]+\s*(.+?)\s*$/;
+// A markdown heading whose text mentions "timeline" opens a timeline section;
+// any other heading closes it. Matches `## Timeline`, `## Timeline / evidence`,
+// `### Timeline (verified)`, etc.
+const TIMELINE_HEADING_RE = /^#{1,6}\s*(.*)$/;
 
 /**
  * Parse timeline entries from content. Looks at:
@@ -1274,9 +1327,23 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   const result: TimelineCandidate[] = [];
   const lines = content.split('\n');
 
+  // Per-line: is this line under a "Timeline" heading? Non-bold ASCII date
+  // bullets only count as entries there (see TIMELINE_LINE_RE_PLAIN).
+  const inTimelineSection: boolean[] = new Array(lines.length).fill(false);
+  let sectionOpen = false;
+  for (let k = 0; k < lines.length; k++) {
+    const h = TIMELINE_HEADING_RE.exec(lines[k]);
+    if (h) {
+      sectionOpen = /timeline/i.test(h[1]);
+      continue; // the heading line itself is never an entry
+    }
+    inTimelineSection[k] = sectionOpen;
+  }
+
   let i = 0;
   while (i < lines.length) {
-    // Try English format first, then Chinese
+    // Try English format first, then Chinese, then the non-bold bullet form
+    // (Timeline sections only).
     const m = TIMELINE_LINE_RE.exec(lines[i]);
     let date: string;
     let summary: string;
@@ -1285,10 +1352,16 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
       summary = m[2].trim();
     } else {
       const cm = TIMELINE_LINE_RE_CN.exec(lines[i]);
-      if (!cm) { i++; continue; }
-      // Normalize Chinese date to YYYY-MM-DD
-      date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
-      summary = cm[4].trim();
+      if (cm) {
+        // Normalize Chinese date to YYYY-MM-DD
+        date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
+        summary = cm[4].trim();
+      } else {
+        const pm = inTimelineSection[i] ? TIMELINE_LINE_RE_PLAIN.exec(lines[i]) : null;
+        if (!pm) { i++; continue; }
+        date = pm[1];
+        summary = pm[2].trim();
+      }
     }
     if (!isValidDate(date) || summary.length === 0) { i++; continue; }
     // Collect optional detail lines (indented, until next date or heading).
@@ -1297,6 +1370,8 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     while (j < lines.length) {
       const next = lines[j];
       if (TIMELINE_LINE_RE.test(next)) break;
+      // An indented plain date bullet is the NEXT entry, not this one's detail.
+      if (inTimelineSection[j] && TIMELINE_LINE_RE_PLAIN.test(next)) break;
       if (/^#{1,6}\s/.test(next)) break;
       if (next.trim().length === 0 && detailLines.length === 0) {
         // skip leading blank line; if we hit a blank after detail content
@@ -1325,8 +1400,12 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   // Format 3 (the fs-source path). Lines already captured by the timeline
   // bullet pass are skipped (a bullet often carries its own citation).
   const citationRe = /\[Source:\s*([^\]]+?),\s*(\d{4}-\d{2}-\d{2})\s*\]/g;
-  for (const line of lines) {
+  for (let k = 0; k < lines.length; k++) {
+    const line = lines[k];
     if (TIMELINE_LINE_RE.test(line)) continue;
+    // Same skip for plain bullets now captured by the pass above, so a
+    // Timeline bullet carrying its own [Source: ...] is not filed twice.
+    if (inTimelineSection[k] && TIMELINE_LINE_RE_PLAIN.test(line)) continue;
     const matches = [...line.matchAll(citationRe)];
     if (matches.length === 0) continue;
     const summary = line

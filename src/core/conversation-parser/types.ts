@@ -49,8 +49,18 @@ export interface MatchedMessage {
  *   - 'llm_fallback': all regex paths returned 0 messages; LLM
  *     fallback was called and returned this output.
  *   - 'no_match': nothing parsed; returned [] of messages.
+ *   - 'email': FRA-22807 — the email adapter projected an `email`-type
+ *     page (HTML/entity-encoded body) into a single sender message. Never
+ *     produced by the regex orchestrator; set by
+ *     `extract-conversation-facts` when it routes an email page through
+ *     `parseEmailToMessages`.
  */
-export type ParsePhase = 'regex_match' | 'polish' | 'llm_fallback' | 'no_match';
+export type ParsePhase =
+  | 'regex_match'
+  | 'polish'
+  | 'llm_fallback'
+  | 'no_match'
+  | 'email';
 
 /**
  * Verdict from the orchestrator. Surfaced in audit JSONL and the

@@ -44,11 +44,19 @@ async function seed(
   queue: string,
   name: string,
   status: string,
-  extra: { lockUntilSql?: string; updatedAtSql?: string; createdAtSql?: string } = {},
+  extra: {
+    lockUntilSql?: string;
+    updatedAtSql?: string;
+    createdAtSql?: string;
+    // FRA-23078: the backlog-vs-wedge split reads finished_at (drain rate) and
+    // started_at (in-flight work), so seeds need to set them.
+    finishedAtSql?: string;
+    startedAtSql?: string;
+  } = {},
 ): Promise<void> {
   await base.executeRaw(
-    `INSERT INTO minion_jobs (name, queue, status, lock_until, updated_at, created_at)
-     VALUES ($1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'}, ${extra.createdAtSql ?? 'now()'})`,
+    `INSERT INTO minion_jobs (name, queue, status, lock_until, updated_at, created_at, finished_at, started_at)
+     VALUES ($1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'}, ${extra.createdAtSql ?? 'now()'}, ${extra.finishedAtSql ?? 'NULL'}, ${extra.startedAtSql ?? 'NULL'})`,
     [name, queue, status],
   );
 }
@@ -77,7 +85,96 @@ describe('issue #2557 — queue_health catches deferred embed with no worker', (
       oldWaitingHours: 1,
     });
     expect(check.status).toBe('ok');
-    expect(check.message).toContain('no old embed-backfill jobs without a worker');
+    // FRA-23078 widened the no-worker sweep from embed-backfill alone to the
+    // maintenance job names too, so the ok-message names both classes.
+    expect(check.message).toContain('no old maintenance/embed-backfill jobs without a worker');
+  });
+
+  // FRA-23078: the same no-worker signal must now fire for maintenance jobs.
+  // The maintenance lane is served only by autopilot's managed worker, so
+  // "queue up, worker down" is the one starvation surface the lane adds —
+  // this test is what keeps it observable.
+  it('warns when old maintenance jobs have no live worker for their queue', async () => {
+    await seed('maintenance', 'extract-atoms-drain', 'waiting', {
+      createdAtSql: "now() - interval '3 hours'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      readWorkers: () => [{ queue: 'default' }],
+      oldWaitingHours: 1,
+    });
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('extract-atoms-drain');
+    expect(check.message).toContain('no live worker');
+    expect(check.message).toContain('gbrain jobs work --queue maintenance');
+  });
+});
+
+// FRA-23078 — depth alone conflated a healthy bulk backfill with a wedge, so
+// a 6-hour chronicle_extract drain and a dead worker produced the same warn.
+describe('FRA-23078 — queue_health distinguishes draining backlog from wedge', () => {
+  it('reports a deep queue with recent completions as a backlog, not a warn', async () => {
+    for (let i = 0; i < 12; i++) await seed('default', 'chronicle_extract', 'waiting');
+    // Drain evidence: completions for the SAME (name, queue) inside the window.
+    for (let i = 0; i < 6; i++) {
+      await seed('default', 'chronicle_extract', 'completed', {
+        finishedAtSql: "now() - interval '2 min'",
+      });
+    }
+    const check = await computeQueueHealthCheck(pgLike, {
+      waitingDepthThreshold: 10,
+      drainWindowMinutes: 15,
+      readWorkers: () => [{ queue: 'default' }],
+    });
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('Draining backlog (not a wedge)');
+    expect(check.message).toContain('chronicle_extract@default=12');
+  });
+
+  it('warns for a deep queue with nothing running and no completions', async () => {
+    for (let i = 0; i < 12; i++) await seed('default', 'chronicle_extract', 'waiting');
+    const check = await computeQueueHealthCheck(pgLike, {
+      waitingDepthThreshold: 10,
+      drainWindowMinutes: 15,
+      readWorkers: () => [{ queue: 'default' }],
+    });
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('appears WEDGED');
+    expect(check.message).toContain('chronicle_extract');
+  });
+
+  it('treats a slow handler with a live-locked job in flight as not wedged', async () => {
+    // The false-positive this guards: 12 queued jobs, none finished inside the
+    // window because each one takes longer than the window itself.
+    for (let i = 0; i < 12; i++) await seed('default', 'autopilot-cycle', 'waiting');
+    await seed('default', 'autopilot-cycle', 'active', {
+      lockUntilSql: "now() + interval '5 min'",
+      startedAtSql: "now() - interval '20 min'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      waitingDepthThreshold: 10,
+      drainWindowMinutes: 15,
+      readWorkers: () => [{ queue: 'default' }],
+    });
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('slow handler, not wedged');
+  });
+
+  it('warns when a deep queue has recent failures even if some completed', async () => {
+    for (let i = 0; i < 12; i++) await seed('default', 'chronicle_extract', 'waiting');
+    await seed('default', 'chronicle_extract', 'completed', {
+      finishedAtSql: "now() - interval '2 min'",
+    });
+    await seed('default', 'chronicle_extract', 'dead', {
+      finishedAtSql: "now() - interval '1 min'",
+    });
+    const check = await computeQueueHealthCheck(pgLike, {
+      waitingDepthThreshold: 10,
+      drainWindowMinutes: 15,
+      readWorkers: () => [{ queue: 'default' }],
+    });
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('appears WEDGED');
+    expect(check.message).toContain('1 failed/dead');
   });
 });
 

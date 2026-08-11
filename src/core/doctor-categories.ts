@@ -168,6 +168,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stale_locks',
   'subagent_capability',
   'subagent_health',
+  'jobs_supervisor',
   'supervisor',
   'supervisor_niceness',
   'supervisor_singleton',

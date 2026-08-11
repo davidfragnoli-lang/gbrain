@@ -214,6 +214,68 @@ describe('extractEntityRefs', () => {
     expect(refs.length).toBe(1);
     expect(refs[0].slug).toBe('real-link');
   });
+
+  // ─── FRA-788: canonical `brain/<dir>/<slug>` prefixed wikilinks ──────────
+  // Our brain stores entity pages under a `brain/` source root; README links
+  // to them as `[[brain/concepts/foo]]`. These must match the DIR_PATTERN pass
+  // (NOT fall through to the generic basename pass) and keep the `brain/`
+  // prefix on the slug (so it equals the stored DB slug on resolution) while
+  // `dir` is the real entity dir.
+  test('extracts brain/-prefixed wikilink (README form) via the gated pass', () => {
+    const refs = extractEntityRefs(
+      'See [[brain/concepts/network-context-and-relationship-memory|Network Context]].',
+    );
+    expect(refs.length).toBe(1);
+    expect(refs[0].slug).toBe('brain/concepts/network-context-and-relationship-memory');
+    expect(refs[0].dir).toBe('concepts');
+    expect(refs[0].name).toBe('Network Context');
+    // Gated pass (2b), not the generic basename pass (2c).
+    expect(refs[0].needsResolution).toBeUndefined();
+  });
+
+  test('extracts brain/-prefixed markdown link', () => {
+    const refs = extractEntityRefs('Met [Alice](brain/people/alice-chen) recently.');
+    expect(refs.length).toBe(1);
+    expect(refs[0].slug).toBe('brain/people/alice-chen');
+    expect(refs[0].dir).toBe('people');
+  });
+
+  test('non-brain slugs are unaffected (dir/slug unchanged)', () => {
+    const refs = extractEntityRefs('See [[people/alice-chen]] and [[companies/acme]].');
+    expect(refs.map(r => r.slug)).toEqual(['people/alice-chen', 'companies/acme']);
+    expect(refs.map(r => r.dir)).toEqual(['people', 'companies']);
+  });
+
+  test('brain/ prefix requires a real entity dir after it', () => {
+    // `brain/notes/x` has a non-entity second segment → not a gated match;
+    // falls through to the generic basename pass (needsResolution).
+    const refs = extractEntityRefs('See [[brain/notes/random-thing]].');
+    expect(refs.length).toBe(1);
+    expect(refs[0].needsResolution).toBe(true);
+  });
+
+  // FRA-788: `ideas` and `operations` are canonical top-level homes in the
+  // brain's README taxonomy; README links to them via the same `[[brain/...]]`
+  // form. They must resolve through the gated pass (multi-segment slugs the
+  // generic basename pass cannot rescue), keeping the `brain/` prefix + real dir.
+  test('extracts brain/ideas and brain/operations wikilinks via the gated pass', () => {
+    const refs = extractEntityRefs(
+      'See [[brain/ideas/maiteam-agent-platform|MaiTeam]] and [[brain/operations/wms-warehouse-standards]].',
+    );
+    expect(refs.map(r => r.slug)).toEqual([
+      'brain/ideas/maiteam-agent-platform',
+      'brain/operations/wms-warehouse-standards',
+    ]);
+    expect(refs.map(r => r.dir)).toEqual(['ideas', 'operations']);
+    // Gated pass, not the generic basename pass.
+    expect(refs.every(r => r.needsResolution === undefined)).toBe(true);
+  });
+
+  test('unprefixed ideas/operations slugs also resolve (dir whitelist, not just brain/)', () => {
+    const refs = extractEntityRefs('See [[ideas/maiteam-agent-platform]] and [[operations/lean-qc-methodology]].');
+    expect(refs.map(r => r.dir)).toEqual(['ideas', 'operations']);
+    expect(refs.every(r => r.needsResolution === undefined)).toBe(true);
+  });
 });
 
 // ─── extractPageLinks ──────────────────────────────────────────

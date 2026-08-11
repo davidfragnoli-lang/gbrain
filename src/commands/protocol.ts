@@ -18,6 +18,10 @@
  * drift is caught by the same fixtures that certify servers [c8].
  */
 
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { operationsByName } from '../core/operations.ts';
 import {
   RESPONSE_SCHEMAS,
@@ -141,6 +145,8 @@ async function runConformanceCommand(args: string[]): Promise<void> {
   const client = new Client({ name: 'gbrain-conformance', version: '1.0.0' }, { capabilities: {} });
 
   let transport: { close(): Promise<void> };
+  let cleanupScratchHome: (() => void) | null = null;
+  let childEnv: Record<string, string> | null = null;
   if (target && /^https?:\/\//.test(target)) {
     const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
     const t = new StreamableHTTPClientTransport(new URL(target), {
@@ -157,6 +163,8 @@ async function runConformanceCommand(args: string[]): Promise<void> {
       command = parts[0];
       cmdArgs = parts.slice(1);
     } else {
+      const scratch = makeScratchConformanceHome();
+      cleanupScratchHome = scratch.cleanup;
       // Self-certification: spawn our own server. Dev (bun run src/cli.ts)
       // vs compiled binary both resolve to "this gbrain, serve".
       const entry = process.argv[1] ?? '';
@@ -167,8 +175,9 @@ async function runConformanceCommand(args: string[]): Promise<void> {
         command = process.execPath;
         cmdArgs = ['serve'];
       }
+      childEnv = { GBRAIN_HOME: scratch.home };
     }
-    const env: Record<string, string> = {};
+    const env: Record<string, string> = childEnv ?? {};
     for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
     const t = new StdioClientTransport({ command, args: cmdArgs, env });
     await client.connect(t);
@@ -214,7 +223,26 @@ async function runConformanceCommand(args: string[]): Promise<void> {
   } finally {
     try { await client.close(); } catch { /* best-effort */ }
     try { await transport.close(); } catch { /* best-effort */ }
+    try { cleanupScratchHome?.(); } catch { /* best-effort */ }
   }
+}
+
+export function makeScratchConformanceHome(): { home: string; cleanup: () => void } {
+  const home = mkdtempSync(join(tmpdir(), 'gbrain-protocol-conformance-'));
+  const configDir = join(home, '.gbrain');
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    join(configDir, 'config.json'),
+    JSON.stringify({
+      engine: 'pglite',
+      database_path: join(configDir, 'conformance.pglite'),
+      mcp_surface: 'full',
+    }, null, 2),
+  );
+  return {
+    home,
+    cleanup: () => { rmSync(home, { recursive: true, force: true }); },
+  };
 }
 
 // ─── protocol stats ──────────────────────────────────────────────────────────

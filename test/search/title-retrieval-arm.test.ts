@@ -228,6 +228,63 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
     const hits = await engine.searchKeyword('zzznothinghere', { limit: 10, orFallback: true });
     expect(hits.length).toBe(0);
   });
+
+  // FRA-23405: the same strict-AND contract, but with a REAL natural-language
+  // question instead of a synthetic 'zzzmissingtoken'. This is the longmemeval
+  // nightly-7 shape. The absent terms are ordinary English words the asker
+  // used and the corpus never did ('projects', 'year') — which is exactly why
+  // a 0 here reads as a broken BM25 arm rather than a correct conjunction.
+  // Pinned so the next reader sees the mechanism instead of re-diagnosing it.
+  describe('natural-language question vs strict AND (nightly-7 shape)', () => {
+    const QUESTION = 'How many projects has alice-example launched this year?';
+    async function seedLaunchPages(): Promise<void> {
+      const bodies: [string, string][] = [
+        ['chat/n7-s1', 'alice-example launched widget-co/payments in January'],
+        ['chat/n7-s2', 'alice-example launched widget-co/identity in March'],
+        ['chat/n7-s3', 'alice-example launched widget-co/reporting in June'],
+      ];
+      for (const [slug, body] of bodies) {
+        await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: body });
+        await engine.upsertChunks(slug, [
+          { chunk_index: 0, chunk_text: body, chunk_source: 'compiled_truth' },
+        ]);
+      }
+    }
+
+    test('the query terms that DO occur match every page (not a tokenizer bug)', async () => {
+      await seedLaunchPages();
+      // Refutes "the tokenizer splits alice-example so it no longer matches"
+      // and "the tsvector is empty" — both terms hit 3/3 on their own.
+      expect((await engine.searchKeyword('alice-example', { limit: 10 })).length).toBe(3);
+      expect((await engine.searchKeyword('launched', { limit: 10 })).length).toBe(3);
+      expect((await engine.searchKeyword('alice-example launched', { limit: 10 })).length).toBe(3);
+    });
+
+    test('the full question returns zero under strict AND ("projects"/"year" are nowhere)', async () => {
+      await seedLaunchPages();
+      expect((await engine.searchKeyword('projects', { limit: 10 })).length).toBe(0);
+      expect((await engine.searchKeyword('year', { limit: 10 })).length).toBe(0);
+      // websearch_to_tsquery is conjunctive: 'mani' & 'project' &
+      // 'alice-exampl' <-> 'alic' <-> 'exampl' & 'launch' & 'year'.
+      expect((await engine.searchKeyword(QUESTION, { limit: 10 })).length).toBe(0);
+    });
+
+    test('the OR fallback recovers all three pages (the arm is not dead)', async () => {
+      await seedLaunchPages();
+      const hits = await engine.searchKeyword(QUESTION, { limit: 10, orFallback: true });
+      expect(hits.map(r => r.slug).sort()).toEqual(['chat/n7-s1', 'chat/n7-s2', 'chat/n7-s3']);
+    });
+
+    test('hybridSearch retrieves all three with NO vectors — keyword arm alone carries it', async () => {
+      await seedLaunchPages();
+      // The pages above were never embedded, so the vector arm contributes
+      // nothing. A full 3-of-3 here can only come from the keyword arm's
+      // orFallback — the direct refutation of "hybrid is effectively
+      // vector-only for this query class".
+      const results = await hybridSearch(engine, QUESTION, { limit: 10 });
+      expect(results.map(r => r.slug).sort()).toEqual(['chat/n7-s1', 'chat/n7-s2', 'chat/n7-s3']);
+    });
+  });
 });
 
 describe('buildOrFallbackWebsearchQuery — pure', () => {

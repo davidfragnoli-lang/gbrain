@@ -29,6 +29,7 @@ import {
   resetGateway,
   __setEmbedTransportForTests,
 } from '../../src/core/ai/gateway.ts';
+import { isRerankUnavailableError } from '../../src/core/search/rerank.ts';
 import type { PageInput, SearchOpts } from '../../src/core/types.ts';
 import type { RerankInput, RerankResult } from '../../src/core/ai/gateway.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -293,5 +294,80 @@ describe('hybridSearch — fail-open contract end-to-end', () => {
     });
     // Same items, same order — applyReranker fail-open.
     expect(reranked.map(r => r.slug)).toEqual(baseline.map(r => r.slug));
+  });
+});
+
+describe('hybridSearch — FRA-22966 rerankerFailClosed plumbing', () => {
+  // hybrid.ts spreads the fail-closed flag onto the reranker bundle and then
+  // casts to `any` at the applyReranker call, so TypeScript cannot catch a
+  // broken hand-off here. These pin the wiring end-to-end.
+
+  test('rerankerFailClosed=true turns a reranker throw into RerankUnavailableError', async () => {
+    let caught: unknown;
+    try {
+      await hybridSearch(engine, 'alpha keyword', {
+        limit: 10,
+        rerankerFailClosed: true,
+        reranker: {
+          enabled: true,
+          topNIn: 30,
+          topNOut: null,
+          rerankerFn: async () => { throw new Error('upstream down'); },
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(isRerankUnavailableError(caught)).toBe(true);
+  });
+
+  test('rerankerFailClosed composes with mode-bundle resolution (no explicit bundle)', async () => {
+    // The correctness gate passes ONLY rerankerFailClosed and lets the
+    // resolved mode decide enabled/topNIn/model. If the flag were dropped on
+    // that branch the gate would silently score un-reranked ordering.
+    const rerankerOpts = {
+      enabled: true,
+      topNIn: 30,
+      topNOut: null,
+      rerankerFn: async () => { throw new Error('upstream down'); },
+    };
+    await expect(
+      hybridSearch(engine, 'alpha keyword', {
+        limit: 10,
+        rerankerFailClosed: true,
+        reranker: rerankerOpts,
+      }),
+    ).rejects.toThrow(/reranker unavailable/);
+    // ...and the caller-supplied bundle is not mutated by the spread.
+    expect('failClosed' in rerankerOpts).toBe(false);
+  });
+
+  test('rerankerFailClosed omitted → unchanged fail-open behaviour', async () => {
+    const baseline = await hybridSearch(engine, 'alpha keyword', { limit: 10 });
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: {
+        enabled: true,
+        topNIn: 30,
+        topNOut: null,
+        rerankerFn: async () => { throw new Error('upstream down'); },
+      },
+    });
+    expect(out.map(r => r.slug)).toEqual(baseline.map(r => r.slug));
+  });
+
+  test('rerankerFailClosed=true is inert when the reranker succeeds', async () => {
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      rerankerFailClosed: true,
+      reranker: {
+        enabled: true,
+        topNIn: 30,
+        topNOut: null,
+        rerankerFn: async (input) =>
+          input.documents.map((_, i) => ({ index: i, relevanceScore: 1 - i * 0.01 })),
+      },
+    });
+    expect(out.length).toBeGreaterThan(0);
   });
 });

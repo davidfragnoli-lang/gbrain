@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { logQualityProbeEvent, readRecentQualityProbeEvents } from '../audit-quality-probe.ts';
+import { resolveAuditDir } from '../minions/handlers/shell-audit.ts';
 
 /** Run-once gate window in ms. 24h matches the "nightly" cadence. */
 const NIGHTLY_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -33,6 +34,45 @@ const DEFAULT_MAX_USD = 5.0;
 
 /** Committed fixture used as the probe's input dataset. */
 const NIGHTLY_FIXTURE_REL_PATH = 'test/fixtures/longmemeval-nightly.jsonl';
+
+/** Subdir of the audit dir where non-PASS probe working files are retained. */
+const PROBE_ARTIFACTS_DIRNAME = 'quality-probe-artifacts';
+
+/**
+ * FRA-22884 — copy a non-PASS run's working files into the audit dir so the
+ * `nightly_quality_probe_health` warn can be diagnosed without paying to
+ * re-run the probe. Best-effort and never throws: losing artifacts must not
+ * turn a graded run into an error.
+ *
+ * Returns the retained directory, or undefined if nothing could be kept.
+ */
+function retainProbeArtifacts(
+  workDir: string,
+  outcome: string,
+  now: Date,
+): string | undefined {
+  try {
+    const stamp = now.toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(resolveAuditDir(), PROBE_ARTIFACTS_DIRNAME, `${stamp}-${outcome}`);
+    fs.mkdirSync(dest, { recursive: true });
+    let kept = 0;
+    for (const entry of fs.readdirSync(workDir)) {
+      const from = path.join(workDir, entry);
+      if (!fs.statSync(from).isFile()) continue;
+      fs.copyFileSync(from, path.join(dest, entry));
+      kept++;
+    }
+    if (kept === 0) {
+      fs.rmSync(dest, { recursive: true, force: true });
+      return undefined;
+    }
+    return dest;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[nightly-quality-probe] artifact retention failed (${msg}); probe continues\n`);
+    return undefined;
+  }
+}
 
 /** Result reported back to the cycle dispatcher / Minion handler. */
 export interface NightlyProbeResult {
@@ -217,6 +257,11 @@ export async function runNightlyQualityProbe(deps: NightlyProbeDeps): Promise<Ni
       return 'error';
     })();
 
+    // FRA-22884 — a non-PASS verdict is only actionable if the per-question
+    // hypotheses survive. Retain them before the `finally` drops the tmpdir.
+    const artifactsPath =
+      outcome === 'pass' ? undefined : retainProbeArtifacts(workDir, outcome, deps.now());
+
     logQualityProbeEvent({
       outcome,
       exit_code: exitCode,
@@ -226,6 +271,7 @@ export async function runNightlyQualityProbe(deps: NightlyProbeDeps): Promise<Ni
       error_count: summary?.error_count ?? 0,
       est_cost_usd: summary?.est_cost_usd ?? 0,
       fixture_sha8: fixtureSha8,
+      ...(artifactsPath ? { artifacts_path: artifactsPath } : {}),
     });
 
     return { outcome, exit_code: exitCode };

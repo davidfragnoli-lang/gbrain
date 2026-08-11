@@ -342,6 +342,35 @@ link_types:
     inverse: authored_by
   - name: attributed_to
 
+# v0.41 T3 phase participation. `phases:` is additive, not subtractive —
+# the 17 core cycle phases run regardless; this list only opens the
+# pack-flavored ones that `packDeclaresPhase` gates in cycle.ts.
+#
+# extract_atoms was deliberately absent here for the pack's whole life:
+# it is a PAID generative phase and the base taxonomy pack stayed free of
+# generative cost. The consequence was that `atom` (declared above, with
+# its own subtypes, aliases and Cluster-4 retype rules) was a type this
+# pack could classify but never produce, so the routine cycle skipped the
+# phase with `not_in_active_pack` and the backlog only ever moved via
+# autopilot's compensating `--drain` escape hatch (issue #1685 GAP D).
+#
+# Turned on by David's explicit decision on FRA-22884 (2026-07-29), which
+# chose "enable it on the base pack" over leaving the doctor warn standing:
+# atoms now extract in the nightly cycle in bounded batches. Cost is real
+# compute in the nightly window but $0 API credit — generative work is
+# subscription-routed (FRA-22903).
+#
+# Turning this ON also turns the compensator OFF: autopilot submits its
+# auto-drain only `if (!packDeclaresPhase(engine, 'extract_atoms'))`
+# (autopilot.ts:813-817), so the two paths swap rather than stack. That is
+# intended — one lane, not two.
+#
+# synthesize_concepts stays off: it is still a stub with no real
+# eligibility predicate (see doctor.ts Codex #12), so declaring it would
+# buy a phase that cannot do work.
+phases:
+  - extract_atoms
+
 mapping_rules:
   # All retype rules write frontmatter.legacy_type per D8 (unless
   # subtype_field IS legacy_type, in which case it supplies legacy_type

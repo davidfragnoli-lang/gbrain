@@ -228,12 +228,13 @@ targets they skip honestly. `--synthesize` is cost-gated: with no LLM key it
 asserts the clean `unavailable` error (what CI does); with a key it spends
 real tokens.
 
-Conformance is a LIVE test that WRITES: it seeds a marker-suffixed synthetic
-entity page (`people/conformance-<marker>`, when the target exposes
-`put_page`) and writes/expires facts through `remember`/`forget`. Point it at
-write-capable credentials and a brain you're comfortable leaving those
-synthetic artifacts in — they're marker-named for easy cleanup, not
-auto-deleted. The fixture set ships as data
+Conformance is a LIVE test that WRITES. Default self-certification is hermetic:
+`gbrain protocol conformance` now spawns `gbrain serve` under a temporary
+`GBRAIN_HOME` backed by scratch PGLite, so it never touches your live brain.
+Explicit external targets still receive marker-suffixed synthetic writes under
+the hidden `test/conformance-<marker>` slug prefix when they expose `put_page`,
+plus fact writes through `remember`/`forget`. Point non-hermetic targets at
+write-capable credentials and a brain/sandbox you control. The fixture set ships as data
 (`test/fixtures/memory-verbs/cases.json`) and seeds BrainBench's
 protocol-compliance arm. gbrain's CI certifies its own stdio + HTTP
 transports; external certification is best-effort tooling until a second

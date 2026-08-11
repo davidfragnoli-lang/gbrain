@@ -27,7 +27,7 @@ import { applyAutocut, type AutocutDecision } from './autocut.ts';
 import { buildRelationalArm } from './relational-recall.ts';
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
-import { applyReranker } from './rerank.ts';
+import { applyReranker, type RerankDocStrategy } from './rerank.ts';
 import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
 import { isTitlePhraseMatch } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
@@ -75,6 +75,37 @@ export function shouldBoostCompiledTruth(detail: string | null | undefined): boo
   return detail === 'low';
 }
 const pendingCacheWrites = new Set<Promise<unknown>>();
+
+/**
+ * FRA-23173 — fetch a candidate page's text chunks for the reranker's
+ * evidence window, ordered by how well each chunk matches the query using the
+ * same `ts_rank` the keyword arm uses. Ordering by relevance (not chunk index)
+ * is what makes a truncated window carry the page's best evidence.
+ *
+ * Fail-soft by contract: returns `[]` on any error so `buildDocuments` falls
+ * back to the narrow title+best-chunk document instead of breaking search.
+ */
+async function fetchRerankChunks(
+  engine: BrainEngine,
+  r: SearchResult,
+  query: string,
+  limit: number,
+): Promise<string[]> {
+  try {
+    const rows = await engine.executeRaw<{ chunk_text: string }>(
+      `select c.chunk_text,
+              ts_rank(c.search_vector, websearch_to_tsquery('english', $3)) as s
+         from content_chunks c join pages p on p.id = c.page_id
+        where p.slug = $1 and p.source_id = $2 and p.deleted_at is null and c.modality = 'text'
+        order by s desc, c.chunk_index asc
+        limit $4`,
+      [r.slug, r.source_id ?? 'default', query, Math.max(1, limit)],
+    );
+    return rows.map((x) => x.chunk_text ?? '').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
 /**
  * v0.42 (issue #1699) agent-warning channel. Stamps `SearchResult.content_flag`
@@ -1655,12 +1686,26 @@ export async function hybridSearch(
   // from the resolved mode bundle (tokenmax → enabled, others → disabled).
   // The resolved mode's fields already participate in knobsHash, so cache
   // rows naturally segregate by reranker config.
-  const rerankerOpts = opts?.reranker ?? {
-    enabled: resolvedMode.reranker_enabled,
-    topNIn: resolvedMode.reranker_top_n_in,
-    topNOut: resolvedMode.reranker_top_n_out,
-    model: resolvedMode.reranker_model,
-    timeoutMs: resolvedMode.reranker_timeout_ms,
+  //
+  // FRA-22966: `rerankerFailClosed` layers on top of BOTH branches so eval
+  // callers get the measurement posture without restating the mode bundle.
+  // It only changes failure handling, never which reranker runs.
+  const rerankerOpts = {
+    ...(opts?.reranker ?? {
+      enabled: resolvedMode.reranker_enabled,
+      topNIn: resolvedMode.reranker_top_n_in,
+      topNOut: resolvedMode.reranker_top_n_out,
+      model: resolvedMode.reranker_model,
+      timeoutMs: resolvedMode.reranker_timeout_ms,
+    }),
+    ...(opts?.rerankerFailClosed ? { failClosed: true } : {}),
+    // FRA-23173 — reranker evidence window. Default `best_chunk` keeps
+    // production byte-identical; the wider windows are opt-in via
+    // GBRAIN_RERANK_DOC so they get measured against the qrels correctness
+    // gate before any of them ships as a default. applyReranker holds no
+    // engine handle, so the chunk fetch is injected from here.
+    docStrategy: (process.env.GBRAIN_RERANK_DOC as RerankDocStrategy | undefined) ?? 'best_chunk',
+    chunkFetcher: (r: SearchResult, limit: number) => fetchRerankChunks(engine, r, query, limit),
   };
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, rerankerOpts as any)

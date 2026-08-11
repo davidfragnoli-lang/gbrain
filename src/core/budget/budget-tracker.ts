@@ -36,10 +36,15 @@ import { canonicalLookup } from '../model-pricing.ts';
 import { EMBEDDING_PRICING, lookupEmbeddingPrice } from '../embedding-pricing.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
+import {
+  readDailySpendUsd,
+  resolveDailyCapUsd,
+  NEAR_CAP_FRACTION,
+} from './daily-ledger-cap.ts';
 
 export type BudgetKind = 'chat' | 'embed' | 'rerank';
 
-export type BudgetReason = 'cost' | 'runtime' | 'no_pricing';
+export type BudgetReason = 'cost' | 'runtime' | 'no_pricing' | 'daily_cost';
 
 export interface BudgetEstimate {
   modelId: string;
@@ -78,6 +83,17 @@ export interface BudgetTrackerOpts {
   label: string;
   /** Override the audit file path (tests + custom installers). */
   auditPath?: string;
+  /**
+   * FRA-22903: ceiling on ALL gbrain LLM spend for the current UTC day, summed
+   * from the shared budget ledger across every process. Unlike `maxCostUsd`
+   * (which bounds this one invocation and resets on every new tracker), this
+   * bounds a repeating caller — an autopilot phase capped at $5/cycle running
+   * every ~10min otherwise has a structural ceiling of ~$720/day.
+   *
+   * Defaults to `GBRAIN_MAX_DAILY_COST_USD`, else DEFAULT_MAX_DAILY_COST_USD.
+   * Set to 0 (or env `off`) to disable for a deliberately authorised program.
+   */
+  maxDailyCostUsd?: number;
 }
 
 export class BudgetExhausted extends Error {
@@ -101,6 +117,9 @@ export class BudgetExhausted extends Error {
 
 /** One-process memo: warn-once on missing pricing per (modelId, kind). */
 const _unpricedWarnings = new Set<string>();
+
+/** Monotonic suffix making each tracker's ledger rows distinguishable. */
+let _trackerSeq = 0;
 
 /** Test seam: reset warn-once memo so unit tests can re-trigger the path. */
 export function _resetBudgetTrackerWarningsForTest(): void {
@@ -157,6 +176,33 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Provider id prefixes billed against a flat-rate subscription rather than
+ * metered API credit, so they price at $0 in this ledger.
+ *
+ * `claude-cli` shells out to the Claude Code binary with ANTHROPIC_API_KEY /
+ * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL scrubbed from the child env (see
+ * providers/claude-cli-language-model.ts), so the call authenticates against
+ * the operator's Claude subscription seat and draws **zero** API credit.
+ *
+ * Pre-fix, lookupPricing fell through to the `provider:model` tail lookup and
+ * priced `claude-cli:claude-sonnet-4-6` off ANTHROPIC_PRICING['claude-sonnet-4-6']
+ * at the metered $3/$15 per 1M. That charged subscription traffic to the API
+ * dollar cap — so routing work to the subscription to *save* credit would
+ * instead trip the daily ceiling (FRA-22903) and halt the run, having spent
+ * nothing. The two budgets are physically different resources; conflating them
+ * made the cheaper route look like the expensive one.
+ *
+ * $0 here means "consumes no API credit", NOT "unlimited": subscription seats
+ * carry their own rate limits, which are bounded by call/token volume, not
+ * dollars. The ledger still records the real token counts under the
+ * `claude-cli:*` model id, so subscription volume stays auditable — it is only
+ * the *dollar* cap it no longer draws against.
+ */
+const SUBSCRIPTION_FLAT_RATE_PROVIDERS: ReadonlySet<string> = new Set([
+  'claude-cli',
+]);
+
+/**
  * Chat sibling of FREE_LOCAL_EMBED_PROVIDERS / FREE_LOCAL_RERANK_PROVIDERS.
  *
  * Local inference costs electricity, not tokens, so these providers price at
@@ -197,6 +243,14 @@ const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
  *     not tokens); else unknown.
  */
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
+  // Subscription-billed providers draw no API credit — check before any
+  // pricing table, since the `provider:model` tail would otherwise resolve
+  // against the metered Anthropic prices. Kind-independent: the seat covers
+  // whatever the recipe routes through it.
+  const { provider: subProvider } = splitProviderModelId(modelId);
+  if (subProvider && SUBSCRIPTION_FLAT_RATE_PROVIDERS.has(subProvider)) {
+    return { input: 0, output: 0 };
+  }
   if (kind === 'embed') {
     const hit = lookupEmbeddingPrice(modelId);
     if (hit.kind === 'known') {
@@ -274,10 +328,38 @@ export class BudgetTracker {
   private readonly auditPath: string;
   private readonly onExhaustedCbs: Array<() => void> = [];
   private exhaustedFired = false;
+  /** FRA-22903: resolved UTC-day ceiling, or undefined when the gate is off. */
+  private readonly dailyCapUsd: number | undefined;
+  /** Ledger files that may hold today's rows (see readDailySpendUsd). */
+  private readonly dailyLedgerPaths: readonly string[];
+  /**
+   * FRA-22903: identifies THIS tracker's rows in the shared ledger, so the
+   * daily total can exclude them and use `cumulativeUsd` instead. Our own
+   * spend is then always exact and never subject to the ledger read throttle —
+   * which is what makes a fast burst inside one tracker enforceable.
+   */
+  private readonly trackerId: string;
 
   constructor(private readonly opts: BudgetTrackerOpts) {
     this.startedAt = Date.now();
     this.auditPath = opts.auditPath ?? defaultAuditPath();
+    this.dailyCapUsd = resolveDailyCapUsd(opts.maxDailyCostUsd);
+    this.trackerId = `${process.pid}-${this.startedAt}-${++_trackerSeq}`;
+    // Include the CURRENT default path alongside our own: a long-lived process
+    // that started before an ISO-week rotation still writes to last week's
+    // file, so today's rows can be split across the two. Day-filtering makes
+    // the union safe — a row lives in exactly one file.
+    this.dailyLedgerPaths =
+      opts.auditPath !== undefined
+        ? [this.auditPath]
+        : [this.auditPath, defaultAuditPath()];
+    // Warm the day total with a read that bypasses the throttle. Trackers are
+    // constructed rarely (once per command/cycle) but a runaway caller builds a
+    // FRESH tracker every cycle — without this, several cycles could start
+    // inside one throttle window and each see a stale $0 baseline.
+    if (this.dailyCapUsd !== undefined) {
+      readDailySpendUsd(this.dailyLedgerPaths, { forceFresh: true });
+    }
   }
 
   /** Public read access. */
@@ -363,6 +445,12 @@ export class BudgetTracker {
       });
       return;
     }
+
+    // FRA-22903: the day ceiling is checked BEFORE the per-invocation cap.
+    // A fresh tracker starts at $0 against maxCostUsd, so the per-invocation
+    // gate cannot see — and never denies — a repeating caller's cumulative
+    // damage. Only this check can.
+    this.assertDailyCap(projected, estimate.modelId, estimate.kind, estimate.label);
 
     if (this.opts.maxCostUsd !== undefined) {
       const after = this.cumulativeUsd + projected;
@@ -450,6 +538,8 @@ export class BudgetTracker {
       actual_cost_usd: cost,
       cumulative_cost_usd: this.cumulativeUsd,
       max_cost_usd: this.opts.maxCostUsd ?? null,
+      // FRA-22903: lets the daily reader attribute this row back to us.
+      tracker_id: this.trackerId,
     });
 
     if (this.opts.maxCostUsd !== undefined && this.cumulativeUsd > this.opts.maxCostUsd) {
@@ -460,6 +550,11 @@ export class BudgetTracker {
         { reason: 'cost', spent: this.cumulativeUsd, cap: this.opts.maxCostUsd, modelId: actual.modelId },
       );
     }
+
+    // FRA-22903 (TX1 sibling): the day ceiling is a real ceiling too. The row
+    // just appended above is now on disk, so a forced re-read sees this call's
+    // own cost — the total stays purely ledger-derived, never double-counted.
+    this.assertDailyCap(0, actual.modelId, kind, actual.label);
   }
 
   snapshot(): BudgetSnapshot {
@@ -471,6 +566,66 @@ export class BudgetTracker {
       maxRuntimeMs: this.opts.maxRuntimeMs,
       callsRecorded: this.callsRecorded,
     };
+  }
+
+  /**
+   * FRA-22903: throw BudgetExhausted(reason:'daily_cost') when today's total
+   * gbrain spend — summed from the shared ledger across ALL processes — would
+   * cross the day ceiling.
+   *
+   * `projected` is the cost of the call being reserved (0 when called after a
+   * record, where the cost is already on disk and thus already in the total).
+   *
+   * The ledger read is throttled, but forced once the total is within
+   * NEAR_CAP_FRACTION of the cap, so the boundary itself is always decided on
+   * a current read rather than up-to-REFRESH_MS-stale data.
+   */
+  private assertDailyCap(
+    projected: number,
+    modelId: string,
+    kind: BudgetKind,
+    subLabel: string | undefined,
+  ): void {
+    const cap = this.dailyCapUsd;
+    if (cap === undefined) return;
+
+    // Other processes' spend comes from the ledger (throttled); OUR spend comes
+    // from `cumulativeUsd`, which is exact and immune to the throttle. Summing
+    // the two — rather than re-reading our own rows — is what makes a burst of
+    // calls inside a single tracker enforceable in real time.
+    const others = (fresh: boolean): number =>
+      readDailySpendUsd(this.dailyLedgerPaths, {
+        excludeTrackerId: this.trackerId,
+        forceFresh: fresh,
+      });
+
+    let spentToday = others(false) + this.cumulativeUsd;
+    if (spentToday + projected > cap * NEAR_CAP_FRACTION) {
+      spentToday = others(true) + this.cumulativeUsd;
+    }
+
+    const after = spentToday + projected;
+    if (after <= cap) return;
+
+    appendAuditLine(this.auditPath, {
+      schema_version: 1,
+      ts: new Date().toISOString(),
+      event: 'daily_cap_denied',
+      label: this.opts.label,
+      kind,
+      model: modelId,
+      sub_label: subLabel,
+      projected_cost_usd: projected,
+      daily_spent_usd: spentToday,
+      max_daily_cost_usd: cap,
+    });
+    this.fireExhausted();
+    throw new BudgetExhausted(
+      `${this.opts.label}: gbrain has spent $${spentToday.toFixed(2)} today (UTC) and this call would ` +
+        `reach $${after.toFixed(2)}, crossing the daily ceiling of $${cap.toFixed(2)}. ` +
+        `Raise it deliberately with GBRAIN_MAX_DAILY_COST_USD=<usd> (or 'off') for an authorised program.`,
+      { reason: 'daily_cost', spent: spentToday, cap, modelId },
+    );
   }
 
   /** Internal helper: throw BudgetExhausted(reason:'runtime') when the wall-clock cap fires. */

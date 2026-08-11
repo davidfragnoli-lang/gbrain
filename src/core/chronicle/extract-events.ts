@@ -49,6 +49,7 @@ export interface ChronicleExtractResult {
 const KIND_VOCAB = new Set([
   'meeting', 'call', 'meal', 'solo', 'travel', 'work',
   'commitment', 'decision', 'intro', 'conflict', 'milestone', 'event',
+  'email', // FRA-1316 — mail → timeline event
 ]);
 
 function normalizeKind(k: string): string {
@@ -124,16 +125,47 @@ export async function runChronicleExtract(
     : null;
   const attendees = collectAttendees(fm);
 
-  const judge = opts.judge ?? defaultJudge(engine);
   let result: ChronicleJudgeResult;
-  try {
-    result = await judge({
-      slug: opts.slug, type: page.type, title: page.title,
-      body: page.compiled_truth ?? '', effectiveDate, attendees,
+  const isMail = page.type === 'email' || opts.slug.startsWith('emails/') || opts.slug.startsWith('email/');
+  if (isMail && !opts.judge) {
+    // FRA-1316 — mail → exactly one deterministic event (no LLM). Header-derived:
+    // when=received, who=from/to, what=subject. High-volume + mechanical, so a
+    // judge call per mail would be wasteful and non-deterministic. An injected
+    // judge (tests) still overrides. The shared write path below is unchanged.
+    const { buildMailEventProposal } = await import('./mail-event.ts');
+    const proposal = buildMailEventProposal({
+      slug: opts.slug, title: page.title, frontmatter: fm, effectiveDate,
     });
-  } catch (e) {
-    if ((e as Error)?.name === 'AbortError') throw e;
-    return { slug: opts.slug, status: 'skipped', events_written: 0, reason: 'judge_error' };
+    if (proposal) {
+      // FRA-1426 — resolve raw from/to/cc participants to canonical entity
+      // slugs so the event links to person pages (and last-seen/who-match
+      // works). Unresolved participants are kept verbatim. Falls back to the
+      // raw proposal.who on any resolver hiccup — resolution is a bonus, never
+      // a blocker for the timeline write.
+      try {
+        const { buildEntityIndex, resolveMailWho } = await import('./mail-participants.ts');
+        // Cross-source: mail may live in its own source while person pages live
+        // in `default`.
+        const index = await buildEntityIndex(engine);
+        const { who, entitySlugs } = resolveMailWho(fm, index);
+        if (who.length) proposal.who = who;
+        const tagged = proposal as ChronicleEventProposal & { _entitySlugs?: string[]; _slugSource?: Map<string, string> };
+        tagged._entitySlugs = entitySlugs;
+        tagged._slugSource = index.slugSource;
+      } catch { /* keep raw who */ }
+    }
+    result = { events: proposal ? [proposal] : [] };
+  } else {
+    const judge = opts.judge ?? defaultJudge(engine);
+    try {
+      result = await judge({
+        slug: opts.slug, type: page.type, title: page.title,
+        body: page.compiled_truth ?? '', effectiveDate, attendees,
+      });
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') throw e;
+      return { slug: opts.slug, status: 'skipped', events_written: 0, reason: 'judge_error' };
+    }
   }
 
   // #2606: a truncated or unparseable judge response is a FAILURE, not an
@@ -174,6 +206,16 @@ export async function runChronicleExtract(
     await engine.upsertEventProjection({
       depthSlug: opts.slug, eventSlug, date: day, summary: ev.what, sourceId,
     });
+    // FRA-1426 — fan out a contact row onto each resolved participant entity
+    // page so timeline coverage counts them (metric keys on page_id = entity).
+    const tagged = ev as ChronicleEventProposal & { _entitySlugs?: string[]; _slugSource?: Map<string, string> };
+    if (tagged._entitySlugs && tagged._entitySlugs.length) {
+      const { fanOutContactRows } = await import('./project-participants.ts');
+      await fanOutContactRows(engine, {
+        entitySlugs: tagged._entitySlugs, day, summary: ev.what, eventSlug, sourceId,
+        slugSource: tagged._slugSource,
+      });
+    }
     written++;
   }
   return { slug: opts.slug, status: 'extracted', events_written: written };
