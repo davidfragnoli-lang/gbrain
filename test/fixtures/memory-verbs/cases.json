@@ -35,7 +35,7 @@
     "params": {
       "fact": "conformance {{marker}}: the protocol round-trip fact",
       "provenance": "conformance run {{marker}}",
-      "entity": "people/conformance-{{marker}}",
+      "entity": "test/conformance-{{marker}}",
       "kind": "fact"
     },
     "validateSchema": true,
@@ -68,7 +68,7 @@
     "params": {
       "fact": "conformance {{marker}}: expiring fact",
       "provenance": "conformance run {{marker}}",
-      "entity": "people/conformance-{{marker}}",
+      "entity": "test/conformance-{{marker}}",
       "ttl": "30d"
     },
     "validateSchema": true,
@@ -89,17 +89,18 @@
     "params": {
       "fact": "conformance {{marker}} PRIVATE-SENTINEL commitment",
       "provenance": "conformance run {{marker}}",
-      "entity": "people/conformance-{{marker}}",
+      "entity": "test/conformance-{{marker}}",
       "kind": "commitment",
       "visibility": "private"
     },
-    "validateSchema": true
+    "validateSchema": true,
+    "saveAs": { "key": "fact3", "path": "id" }
   },
   {
     "name": "recall by entity round-trips the remembered fact (superset envelope)",
     "verb": "recall",
     "params": {
-      "entity": "people/conformance-{{marker}}"
+      "entity": "test/conformance-{{marker}}"
     },
     "validateSchema": true,
     "expect": [
@@ -125,7 +126,7 @@
     "name": "recall with budget reports consistent budget meta",
     "verb": "recall",
     "params": {
-      "entity": "people/conformance-{{marker}}",
+      "entity": "test/conformance-{{marker}}",
       "budget_tokens": 10000
     },
     "validateSchema": true,
@@ -152,7 +153,7 @@
     "name": "recall with budget smaller than the first item drops everything",
     "verb": "recall",
     "params": {
-      "entity": "people/conformance-{{marker}}",
+      "entity": "test/conformance-{{marker}}",
       "budget_tokens": 1
     },
     "validateSchema": true,
@@ -186,7 +187,7 @@
     "name": "entity resolves the round-trip entity to a card",
     "verb": "entity",
     "params": {
-      "name": "people/conformance-{{marker}}"
+      "name": "test/conformance-{{marker}}"
     },
     "validateSchema": true,
     "requiresSeededEntity": true,
@@ -231,7 +232,7 @@
     "name": "entity card never leaks private facts to remote callers (fence test)",
     "verb": "entity",
     "params": {
-      "name": "people/conformance-{{marker}}"
+      "name": "test/conformance-{{marker}}"
     },
     "requiresSeededEntity": true,
     "expect": [

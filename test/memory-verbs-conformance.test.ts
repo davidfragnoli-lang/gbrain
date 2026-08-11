@@ -40,6 +40,7 @@ import { CONFORMANCE_CASES } from '../src/core/verbs/conformance-fixtures.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import {
   configureGateway,
+  resetGateway,
   __setChatTransportForTests,
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
@@ -66,6 +67,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  resetGateway();
   __setChatTransportForTests(null);
   __setEmbedTransportForTests(null);
 });
@@ -517,6 +519,7 @@ describe('conformance runner — negative self-test [F3]', () => {
     const failures = honest.results.filter(r => r.status === 'fail');
     expect(failures).toEqual([]);
   });
+
 });
 
 describe('fixture mirror + surface invariants', () => {

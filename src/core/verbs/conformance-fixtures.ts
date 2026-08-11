@@ -79,7 +79,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     params: {
       fact: 'conformance {{marker}}: the protocol round-trip fact',
       provenance: 'conformance run {{marker}}',
-      entity: 'people/conformance-{{marker}}',
+      entity: 'test/conformance-{{marker}}',
       kind: 'fact',
     },
     validateSchema: true,
@@ -96,7 +96,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     params: {
       fact: 'conformance {{marker}}: expiring fact',
       provenance: 'conformance run {{marker}}',
-      entity: 'people/conformance-{{marker}}',
+      entity: 'test/conformance-{{marker}}',
       ttl: '30d',
     },
     validateSchema: true,
@@ -109,18 +109,19 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     params: {
       fact: 'conformance {{marker}} PRIVATE-SENTINEL commitment',
       provenance: 'conformance run {{marker}}',
-      entity: 'people/conformance-{{marker}}',
+      entity: 'test/conformance-{{marker}}',
       kind: 'commitment',
       visibility: 'private',
     },
     validateSchema: true,
+    saveAs: { key: 'fact3', path: 'id' },
   },
 
   // ── recall: round-trip + superset + budget ──────────────────────────────
   {
     name: 'recall by entity round-trips the remembered fact (superset envelope)',
     verb: 'recall',
-    params: { entity: 'people/conformance-{{marker}}' },
+    params: { entity: 'test/conformance-{{marker}}' },
     validateSchema: true,
     expect: [
       { path: 'protocol_version', equals: 1 },
@@ -132,7 +133,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
   {
     name: 'recall with budget reports consistent budget meta',
     verb: 'recall',
-    params: { entity: 'people/conformance-{{marker}}', budget_tokens: 10000 },
+    params: { entity: 'test/conformance-{{marker}}', budget_tokens: 10000 },
     validateSchema: true,
     expect: [
       { path: 'budget_tokens', equals: 10000 },
@@ -144,7 +145,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
   {
     name: 'recall with budget smaller than the first item drops everything',
     verb: 'recall',
-    params: { entity: 'people/conformance-{{marker}}', budget_tokens: 1 },
+    params: { entity: 'test/conformance-{{marker}}', budget_tokens: 1 },
     validateSchema: true,
     expect: [
       { path: 'total', equals: 0 },
@@ -163,7 +164,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
   {
     name: 'entity resolves the round-trip entity to a card',
     verb: 'entity',
-    params: { name: 'people/conformance-{{marker}}' },
+    params: { name: 'test/conformance-{{marker}}' },
     validateSchema: true,
     requiresSeededEntity: true,
     expect: [
@@ -186,7 +187,7 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
   {
     name: 'entity card never leaks private facts to remote callers (fence test)',
     verb: 'entity',
-    params: { name: 'people/conformance-{{marker}}' },
+    params: { name: 'test/conformance-{{marker}}' },
     requiresSeededEntity: true,
     expect: [{ path: 'card.open_threads', absentOrNotContains: 'PRIVATE-SENTINEL' }],
   },
