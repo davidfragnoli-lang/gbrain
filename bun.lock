@@ -26,7 +26,7 @@
         "express-rate-limit": "^7.5.0",
         "gray-matter": "^4.0.3",
         "heic-decode": "^2.1.0",
-        "js-yaml": "^3.15.0",
+        "js-yaml": "^3.15.1",
         "marked": "^18.0.2",
         "openai": "^4.0.0",
         "pgvector": "^0.2.0",
@@ -59,7 +59,7 @@
     "form-data": "^4.0.6",
     "hono": "^4.12.34",
     "ip-address": "^10.3.1",
-    "js-yaml": "^3.15.0",
+    "js-yaml": "^3.15.1",
     "qs": "^6.15.2",
   },
   "packages": {
@@ -461,7 +461,7 @@
 
     "jose": ["jose@6.2.2", "", {}, "sha512-d7kPDd34KO/YnzaDOlikGpOurfF0ByC2sEV4cANCtdqLlTfBlw2p14O/5d/zv40gJPbIQxfES3nSx1/oYNyuZQ=="],
 
-    "js-yaml": ["js-yaml@3.15.0", "", { "dependencies": { "argparse": "^1.0.7", "esprima": "^4.0.0" }, "bin": { "js-yaml": "bin/js-yaml.js" } }, "sha512-ttBQIIQPDeLjpPOohtUdXuXUVoA2uIB6fEH9HyJ7234s5mBJ5wTx20njxplLZQgLaOfpmPQA7X2t5AX6tIPbog=="],
+    "js-yaml": ["js-yaml@3.15.1", "", { "dependencies": { "argparse": "^1.0.7", "esprima": "^4.0.0" }, "bin": { "js-yaml": "bin/js-yaml.js" } }, "sha512-S99WuO3HlhO3XN41EtYUNl9zzXjoJx7QvmipxsJVxtCBT0YHEFy+iOJhjSvrmV12nYhWpZaM8lPHkJm0yUMbag=="],
 
     "json-schema": ["json-schema@0.4.0", "", {}, "sha512-es94M3nTIfsEPisRafak+HDLfHXnKBhV3vU5eqPcS3flIWqcxJWgXHXiey3YrpaNsanY5ei1VoYEbOzijuq9BA=="],
 

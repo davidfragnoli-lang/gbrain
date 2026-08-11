@@ -15,7 +15,13 @@ OPENAI_API_KEY=sk-...              # required (OpenAI Realtime API)
 DEFAULT_PERSONA=venus              # optional (one of: venus, mars)
 BRAIN_ROOT=/path/to/your/brain     # optional (enables live context)
 TIMEZONE=US/Pacific                # optional
+HOST=0.0.0.0                       # optional — binds 127.0.0.1 (loopback) by default; set only to expose beyond localhost
+AGENT_VOICE_CORS_ORIGIN=https://your.app  # optional — CORS is default-deny; list exact origins (comma-separated) only if a browser on another origin needs access
 ```
+
+The two security env vars ship safe by default: the server listens on loopback
+only and refuses cross-origin browser requests. The local `/call` flow below
+needs neither. See the recipe's production checklist before exposing publicly.
 
 Optional for inbound Twilio:
 ```bash
@@ -56,7 +62,7 @@ If any prompt-shape test fails, the privacy guard has caught a name you'd want t
 ```bash
 cd <target-repo>/services/voice-agent
 bun run start    # or `npm start`
-# → listening on http://localhost:8765
+# → listening on http://127.0.0.1:8765 (bind: 127.0.0.1 — set HOST=0.0.0.0 to expose beyond loopback)
 ```
 
 Open `http://localhost:8765/call` in a browser, click Connect, grant mic permission. You should be talking to Venus (or Mars if you set `DEFAULT_PERSONA=mars`).

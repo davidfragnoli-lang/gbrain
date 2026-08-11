@@ -1136,7 +1136,8 @@ async function processPage(
     }
 
     // BrainBench may inject a deterministic extractor for hermetic eval runs.
-    // Production keeps the standard fail-hard extraction path.
+    // Production keeps master's fail-hard-with-reason contract: a per-segment
+    // extraction failure aborts the page rather than silently dropping facts.
     let extracted: ExtractedFact[];
     if (state.extractor) {
       extracted = await state.extractor({

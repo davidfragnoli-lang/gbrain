@@ -1,7 +1,7 @@
 ---
 id: agent-voice
 name: Voice Personas (Mars + Venus)
-version: 0.1.0
+version: 0.1.1
 description: WebRTC-first voice agent reference (Mars + Venus personas, optional Twilio adapter). Skillpack-as-reference paradigm — the install-time agent COPIES code into your host agent repo where it becomes user-owned and mutable, NOT a runtime gbrain dependency.
 category: voice
 install_kind: copy-into-host-repo
@@ -132,7 +132,9 @@ Reference code ships intentionally minimal. Before public deployment:
 
 - **Twilio signature validation** on `/voice` — currently absent; add `X-Twilio-Signature` header validation.
 - **Rate limiting** on `/session` and `/tool` — currently absent.
-- **CORS allowlist** — currently `*`; restrict to your deployed origins.
+- **CORS allowlist** — default-deny out of the box: no `Access-Control-Allow-Origin` header is emitted unless the request's Origin exactly matches `AGENT_VOICE_CORS_ORIGIN` (comma-separated origins, e.g. `AGENT_VOICE_CORS_ORIGIN=https://your.app,https://staging.your.app`). The served `/call` page is same-origin and needs no configuration. `/session` and `/tool` additionally reject cross-origin browser requests (403) unless allowlisted — CORS headers alone can't stop a no-preflight "simple" POST from executing.
+- **Bind address** — the server listens on `127.0.0.1` by default; set `HOST=0.0.0.0` for containers or direct LAN exposure (and prefer a tunnel for anything public).
+- **Host-header allowlist** — not shipped; the origin gate derives self-origin from the `Host` header, so DNS rebinding is not covered. Add a `Host` allowlist before exposing beyond loopback.
 - **Auth on /tool** — voice-side tool calls currently trust the in-process connection; if you expose `/tool` publicly, gate it behind a session token.
 - **HTTPS** — required for browser mic access in production. Use ngrok / Caddy / Cloudflare Tunnel.
 - **Twilio fallback URL** — `/fallback` is a TwiML stub; wire to your operator's cell for crash recovery.

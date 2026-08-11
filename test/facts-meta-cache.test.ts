@@ -154,4 +154,33 @@ describe('meta-hook cache', () => {
     expect(r1?.brain_hot_memory).toBeDefined();
     expect(r2?.brain_hot_memory).toBeDefined();
   });
+
+  test('[] (explicit deny-all) and undefined allow-lists do NOT share a cache entry (#2529)', async () => {
+    // Isolated source so topK saturation from other tests can't mask the
+    // count difference this test keys on.
+    const src = 'deny-key-src';
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [src],
+    );
+    await engine.insertFact(
+      { fact: 'deny-key seed fact', kind: 'fact', entity_slug: 'deny-key', visibility: 'world', source: 'test' },
+      { source_id: src },
+    );
+    // Warm the cache under the UNSET allow-list key.
+    const unset = await getBrainHotMemoryMeta('get_stats', ctx({ sourceId: src }));
+    const unsetCount = (unset?.brain_hot_memory as { facts: unknown[] } | undefined)?.facts.length ?? 0;
+    expect(unsetCount).toBeGreaterThan(0);
+
+    // New fact lands AFTER the warm — a shared cache key would serve the
+    // stale (pre-insert) payload to the [] caller. Pre-fix, hashAllowList
+    // collapsed both to '_' and this returned unsetCount.
+    await engine.insertFact(
+      { fact: 'deny-key post-warm fact', kind: 'fact', entity_slug: 'deny-key', visibility: 'world', source: 'test' },
+      { source_id: src },
+    );
+    const emptyList = await getBrainHotMemoryMeta('get_stats', ctx({ sourceId: src, takesHoldersAllowList: [] }));
+    const emptyCount = (emptyList?.brain_hot_memory as { facts: unknown[] } | undefined)?.facts.length ?? 0;
+    expect(emptyCount).toBeGreaterThan(unsetCount);
+  });
 });

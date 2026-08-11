@@ -169,8 +169,19 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 4000;
 // keeps 4000.
 const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 const THINKING_BY_DEFAULT_MODEL_RE = /^anthropic[:/]claude-[a-z0-9]+-5(?:[.-]|$)/i;
+// OpenAI reasoning models spend output budget on internal reasoning tokens
+// the same way — reasoning tokens are billed as output and count against
+// `max_tokens` — so they get the same headroom. Deliberately scoped to the
+// gpt-5 family and the numbered o-series only; anything else (gpt-4o, the
+// non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other providers'
+// reasoning models routed through their own recipes) keeps the conservative
+// 4000 default.
+const OPENAI_REASONING_MODEL_RE = /^openai[:/](?:gpt-5|o[0-9]+)(?:[.-]|$)/i;
+const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-chat-latest
 export function maxOutputTokensFor(modelStr: string): number {
-  return THINKING_BY_DEFAULT_MODEL_RE.test(modelStr)
+  const openaiReasoning =
+    OPENAI_REASONING_MODEL_RE.test(modelStr) && !OPENAI_CHAT_SNAPSHOT_RE.test(modelStr);
+  return THINKING_BY_DEFAULT_MODEL_RE.test(modelStr) || openaiReasoning
     ? THINKING_DEFAULT_MAX_OUTPUT_TOKENS
     : DEFAULT_MAX_OUTPUT_TOKENS;
 }
