@@ -30,6 +30,7 @@ describe('recipe: perplexity', () => {
     expect(perplexity.implementation).toBe('openai-compatible');
     expect(perplexity.base_url_default).toBe('https://api.perplexity.ai/v1');
     const e = perplexity.touchpoints.embedding!;
+    expect(perplexity.touchpoints.chat?.models).toContain('sonar');
     expect(e.models).toEqual(['pplx-embed-v1-0.6b', 'pplx-embed-v1-4b']);
     expect(e.default_dims).toBe(1024);
     expect(e.max_batch_tokens).toBe(120_000);

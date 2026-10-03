@@ -102,6 +102,9 @@ const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
+  // The Claude CLI uses the operator subscription, not metered API credit.
+  if (splitProviderModelId(modelId).provider === 'claude-cli') return { input: 0, output: 0 };
+
   if (kind === 'embed') {
     const hit = lookupEmbeddingPrice(modelId);
     if (hit.kind === 'known') {

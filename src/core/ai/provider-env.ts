@@ -35,6 +35,7 @@ export function mergedProviderEnv(
   const fromConfig: Record<string, string> = {};
   if (cfg?.openai_api_key) fromConfig.OPENAI_API_KEY = cfg.openai_api_key;
   if (cfg?.anthropic_api_key) fromConfig.ANTHROPIC_API_KEY = cfg.anthropic_api_key;
+  if (cfg?.perplexity_api_key) fromConfig.PERPLEXITY_API_KEY = cfg.perplexity_api_key;
   if (cfg?.openrouter_api_key) fromConfig.OPENROUTER_API_KEY = cfg.openrouter_api_key;
   if (cfg?.voyage_api_key) fromConfig.VOYAGE_API_KEY = cfg.voyage_api_key;
   if (cfg?.dashscope_api_key) fromConfig.DASHSCOPE_API_KEY = cfg.dashscope_api_key;
@@ -60,6 +61,9 @@ export function mergedProviderEnv(
   const merged = { ...fromConfig, ...envReal };
   if (!envReal.GOOGLE_GENERATIVE_AI_API_KEY && envReal.GEMINI_API_KEY) {
     merged.GOOGLE_GENERATIVE_AI_API_KEY = envReal.GEMINI_API_KEY;
+  }
+  if (!merged.PERPLEXITY_API_KEY && envReal.PPLX_API_KEY) {
+    merged.PERPLEXITY_API_KEY = envReal.PPLX_API_KEY;
   }
   return merged;
 }

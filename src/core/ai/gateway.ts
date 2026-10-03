@@ -1434,15 +1434,14 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       // input_type was threaded, so symmetric deployments see zero wire
       // change.
       const fetchWrapper =
-        compat.fetch ??
-        (recipe.id === 'voyage'
-          ? voyageCompatFetch
-
-          : recipe.id === 'nvidia'
-          ? nvidiaCompatFetch
-          : recipe.id === 'perplexity'
+        recipe.id === 'perplexity'
           ? perplexityCompatFetch
-          : openAICompatAsymmetricFetch);
+          : compat.fetch ??
+            (recipe.id === 'voyage'
+              ? voyageCompatFetch
+              : recipe.id === 'nvidia'
+                ? nvidiaCompatFetch
+                : openAICompatAsymmetricFetch);
       const client = createOpenAICompatible({
         name: recipe.id,
         baseURL: compat.baseURL,

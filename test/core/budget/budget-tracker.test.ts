@@ -230,54 +230,16 @@ describe('BudgetTracker.reserve', () => {
     expect(audit.filter((e) => e.event === 'reserve_unpriced').length).toBe(2);
   });
 
-  test('claude-cli:<alias> chat model under a cap prices at the canonical model rate (no no_pricing throw)', () => {
-    // `gbrain enrich --thin` with chat_model = claude-cli:haiku TX2 hard-failed
-    // at reserve() with reason no_pricing at EVERY --max-usd tried: the
-    // gateway reserves with the pre-alias-resolution model string, and
-    // `haiku` is a recipe alias, not a pricing key. lookupPricing resolves
-    // recipe aliases, so the alias prices exactly like the dated id it maps
-    // to — at reserve(), record() and isModelPriceable() alike.
-    expect(isModelPriceable('claude-cli:haiku', 'chat')).toBe(true);
-    const t = new BudgetTracker({ maxCostUsd: 5.0, label: 'test', auditPath });
-    expect(() =>
-      t.reserve({
-        modelId: 'claude-cli:haiku',
-        estimatedInputTokens: 1_000_000,
-        maxOutputTokens: 0,
-        kind: 'chat',
-      }),
-    ).not.toThrow();
-    t.reserve({
-      modelId: 'claude-cli:claude-haiku-4-5-20251001',
-      estimatedInputTokens: 1_000_000,
-      maxOutputTokens: 0,
-      kind: 'chat',
-    });
-    const audit = readAudit();
-    expect(audit.map((e) => e.event)).toEqual(['reserve', 'reserve']);
-    // $1.00/1M input tokens (ANTHROPIC_PRICING['claude-haiku-4-5-20251001']);
-    // the alias and the dated id project the same cost.
-    expect(audit[0].projected_cost_usd).toBeCloseTo(1.0, 6);
-    expect(audit[1].projected_cost_usd).toBe(audit[0].projected_cost_usd);
-  });
-
-  test('claude-cli:<dated-id> resolves Anthropic pricing via the model tail (parity guard for the alias path)', () => {
-    // The DATED id tail ("claude-haiku-4-5-20251001") is itself a bare
-    // ANTHROPIC_PRICING key, so the modelTail fallback prices this call at
-    // the nominal Anthropic per-token rate. The alias path above must land
-    // on exactly this.
-    const t = new BudgetTracker({ maxCostUsd: 5.0, label: 'test', auditPath });
-    expect(() =>
-      t.reserve({
-        modelId: 'claude-cli:claude-haiku-4-5-20251001',
-        estimatedInputTokens: 1_000_000,
-        maxOutputTokens: 0,
-        kind: 'chat',
-      }),
-    ).not.toThrow();
-    const audit = readAudit();
-    expect(audit[0].event).toBe('reserve');
-    expect(audit[0].projected_cost_usd).toBeCloseTo(1.0, 6);
+  test('Claude subscription aliases and dated IDs consume no API credit', () => {
+    const t = new BudgetTracker({ maxCostUsd: 0.01, maxDailyCostUsd: 0.01, label: 'test', auditPath });
+    for (const modelId of ['claude-cli:haiku', 'claude-cli:claude-haiku-4-5-20251001']) {
+      expect(isModelPriceable(modelId, 'chat')).toBe(true);
+      t.reserve({ modelId, estimatedInputTokens: 1_000_000, maxOutputTokens: 1000, kind: 'chat' });
+      t.record({ modelId, inputTokens: 1_000_000, outputTokens: 1000, kind: 'chat' });
+    }
+    expect(t.totalSpent).toBe(0);
+    expect(readAudit().filter(e => e.event === 'reserve').map(e => e.projected_cost_usd)).toEqual([0, 0]);
+    expect(() => t.reserve({ modelId: 'anthropic:claude-haiku-4-5-20251001', estimatedInputTokens: 1_000_000, maxOutputTokens: 0, kind: 'chat' })).toThrow(BudgetExhausted);
   });
 
   test('v0.40.6.1: rerank kind for llama-server-reranker prices at $0 (no TX2 throw under --max-cost)', () => {

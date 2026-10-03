@@ -26,7 +26,7 @@ describe('isolated Bun-linked keyless installation lifecycle', () => {
   }
 
   beforeAll(() => {
-    home = mkdtempSync(join(tmpdir(), 'gbrain-install-lifecycle-'));
+    home = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-install-lifecycle-')));
     const bin = join(home, 'bin');
     mkdirSync(bin);
     for (const service of ['systemctl', 'launchctl', 'crontab', 'service']) {

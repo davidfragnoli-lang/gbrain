@@ -36,6 +36,20 @@ export const perplexity: Recipe = {
     setup_url: 'https://www.perplexity.ai/settings/api',
   },
   touchpoints: {
+    chat: {
+      models: ['sonar', 'sonar-pro', 'sonar-reasoning-pro', 'sonar-deep-research'],
+      supports_tools: false,
+      supports_subagent_loop: false,
+      supports_prompt_cache: false,
+      max_context_tokens: 127000,
+      cost_per_1m_input_usd: 1,
+      cost_per_1m_output_usd: 1,
+      price_last_verified: '2026-09-09',
+    },
+    expansion: {
+      models: ['sonar'],
+      price_last_verified: '2026-09-09',
+    },
     embedding: {
       models: ['pplx-embed-v1-0.6b', 'pplx-embed-v1-4b'],
       default_dims: 1024,
@@ -51,4 +65,19 @@ export const perplexity: Recipe = {
     },
   },
   setup_hint: 'Get an API key at https://www.perplexity.ai/settings/api, then `export PERPLEXITY_API_KEY=...` (re-export PPLX_API_KEY if that is where your key lives).',
+  // Chat Completions are OpenAI-shaped at /chat/completions (no /v1).
+  // Embeddings stay on /v1 via perplexityCompatFetch in gateway.ts.
+  compat: {
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : (input as Request).url;
+      if (typeof raw === 'string' && raw.includes('/v1/chat/completions')) {
+        return fetch(raw.replace('/v1/chat/completions', '/chat/completions'), init);
+      }
+      return fetch(input as any, init);
+    }) as typeof fetch,
+  },
 };

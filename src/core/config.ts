@@ -73,6 +73,8 @@ export interface GBrainConfig {
   database_path?: string;
   openai_api_key?: string;
   anthropic_api_key?: string;
+  /** Perplexity credential for launchd and MCP provider routing. */
+  perplexity_api_key?: string;
   /**
    * OpenRouter API key. File-plane slot so `gbrain config set
    * openrouter_api_key X` (or config.json) reaches the openrouter recipe:
@@ -717,6 +719,7 @@ export function loadConfig(): GBrainConfig | null {
     ...(dbUrl ? { database_path: undefined } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
+    ...((process.env.PERPLEXITY_API_KEY || process.env.PPLX_API_KEY) ? { perplexity_api_key: process.env.PERPLEXITY_API_KEY || process.env.PPLX_API_KEY } : {}),
     ...(process.env.OPENROUTER_API_KEY ? { openrouter_api_key: process.env.OPENROUTER_API_KEY } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
@@ -1199,6 +1202,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'database_path',
   'openai_api_key',
   'anthropic_api_key',
+  'perplexity_api_key',
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',

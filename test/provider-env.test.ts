@@ -16,7 +16,7 @@ const cfg = (partial: Partial<GBrainConfig>): GBrainConfig =>
 describe('mergedProviderEnv', () => {
   test('folds every file-plane key incl. the Azure fields (unification delta)', () => {
     const env = mergedProviderEnv(cfg({
-      openai_api_key: 'sk-o', anthropic_api_key: 'sk-a', voyage_api_key: 'pa-v',
+      openai_api_key: 'sk-o', anthropic_api_key: 'sk-a', voyage_api_key: 'pa-v', perplexity_api_key: 'pplx-test',
       openrouter_api_key: 'or', dashscope_api_key: 'ds',
       deepseek_api_key: 'sk-deepseek',
       google_api_key: 'gg',
@@ -28,6 +28,7 @@ describe('mergedProviderEnv', () => {
     expect(env.OPENAI_API_KEY).toBe('sk-o');
     expect(env.ANTHROPIC_API_KEY).toBe('sk-a');
     expect(env.VOYAGE_API_KEY).toBe('pa-v');
+    expect(env.PERPLEXITY_API_KEY).toBe('pplx-test');
     expect(env.OPENROUTER_API_KEY).toBe('or');
     expect(env.DASHSCOPE_API_KEY).toBe('ds');
     expect(env.DEEPSEEK_API_KEY).toBe('sk-deepseek');
