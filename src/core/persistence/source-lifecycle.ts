@@ -22,6 +22,12 @@ import { claimPhysicalRoot } from './physical-root.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
 
+// A canonical brain with tens of thousands of paths can legitimately exceed
+// 1 MiB while remaining well below the bounded sync-discovery manifest limit.
+// Keep lifecycle administration aligned with that existing 16 MiB bound so
+// archive/restore remains available for large, verified sources.
+const SOURCE_ADMIN_MANIFEST_MAX_BYTES = 16 * 1024 ** 2;
+
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
   sourceId:string; requestId?:string; expectedIncarnation?:string; dryRun?:boolean;
@@ -108,7 +114,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
       if(!existsSync(path)) {if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;throw new OperationError('recovery_required','The canonical checkout is missing; restore its verified manifest first.');}
       const manifest=worktreeManifest(path);
-      if(Buffer.byteLength(JSON.stringify(manifest))>1_048_576) throw new OperationError('request_too_large','The verified source manifest exceeds the 1 MiB administration metadata bound.');
+      if(Buffer.byteLength(JSON.stringify(manifest))>SOURCE_ADMIN_MANIFEST_MAX_BYTES) throw new OperationError('request_too_large','The verified source manifest exceeds the 16 MiB administration metadata bound.');
       manifests.set(path,manifest);
     }
     return topologyTransaction(engine,async tx=>{
@@ -125,6 +131,11 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     if(input.operation==='add'&&source&&(!root||source.local_path!==null)) throw new OperationError('source_id_taken','Source ID is already registered.');
     if(input.operation==='purge'&&!input.expiredOnly&&!source?.archived) throw new OperationError('invalid_params','Only an archived source can be purged.');
     if(['remove','purge'].includes(input.operation)&&!input.confirmDestructive) throw new OperationError('invalid_params','Source removal requires explicit destructive confirmation.');
+    // Cascading a large source can legitimately take longer than the ordinary
+    // five-second topology control window (notably while removing vector rows).
+    // Locks and admission stay bounded above; only the verified destructive
+    // cascade receives the same 120-second ceiling used by bulk migrations.
+    if(['remove','purge'].includes(input.operation)) await tx.executeRaw("SELECT set_config('statement_timeout','120s',true)");
     const worktrees=bindings.map(binding=>binding.worktree_id);
     const currentBinding=bindings.find(binding=>binding.source_id===input.sourceId);
     const sameBinding=!!root&&!!currentBinding?.local_path&&currentBinding.local_path===root.worktree
