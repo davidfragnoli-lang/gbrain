@@ -1,6 +1,6 @@
 import { isConnectorSourceKind } from './connector-identity.ts';
 import type { BrainEngine, NewFact } from '../engine.ts';
-import type { GBrainConfig } from '../config.ts';
+import { loadConfig, type GBrainConfig } from '../config.ts';
 import type { FactsBackstopCtx } from '../facts/backstop.ts';
 import { ENTITY_HINTS_CAP, type ExtractedFact, type FactEmbeddingSignature } from '../facts/extract.ts';
 import { readFactsEmbeddingDim } from '../embedding-dim-check.ts';
@@ -42,6 +42,15 @@ export interface ManagedFactsSession {
   embedding?: FactEmbeddingSignature | null;
 }
 
+export function resolveStoredFactsEmbeddingModel(stored: string | undefined, configured: string | undefined): string | null {
+  if (!stored) return null;
+  if (/^[^\s:]+:[^\s]+$/.test(stored)) return stored;
+  // Older Postgres brains stored only the provider model id while the
+  // file/env plane retained the canonical provider:model identity. Accept the
+  // legacy row only when the configured identity names that exact model.
+  return configured?.endsWith(`:${stored}`) ? configured : null;
+}
+
 function managedFactRequestId(batchKey: string, slug: string): string {
   const hex = digest([batchKey, slug]);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
@@ -73,10 +82,13 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
     throw new OperationError('embedding_configuration', 'Selected brain embedding_disabled must be true or false.');
   }
   if (config.embedding_disabled || values.embedding_disabled === 'true') return null;
-  const model = values.embedding_model;
+  const configuredModel = /^[^\s:]+:[^\s]+$/.test(config.embedding_model ?? '')
+    ? config.embedding_model
+    : loadConfig()?.embedding_model;
+  const model = resolveStoredFactsEmbeddingModel(values.embedding_model, configuredModel);
   if (!model) return null;
   const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
-  if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
+  if (!dimensions || !Number.isSafeInteger(dimensions)) {
     throw new OperationError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.');
   }
   const shape = await readFactsEmbeddingDim(engine);

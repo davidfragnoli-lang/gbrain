@@ -5,6 +5,8 @@ import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { loadConfig, loadConfigWithEngine } from '../../config.ts';
 import type { FactsBackstopResult } from '../../facts/backstop.ts';
+import { OperationError } from '../../ops/contract.ts';
+import { UnrecoverableError } from '../errors.ts';
 
 /** Shared predicate: an inline result reporting execution-time unavailability. */
 export function factsAbsorbUnavailable(result: FactsBackstopResult): boolean {
@@ -28,6 +30,12 @@ export function factsAbsorbShouldRetry(
   classification: 'keyed' | 'keyless',
 ): boolean {
   return classification === 'keyed' && factsAbsorbUnavailable(result);
+}
+
+export function factsAbsorbTerminalError(error: unknown): UnrecoverableError | null {
+  return error instanceof OperationError && error.code === 'embedding_configuration'
+    ? new UnrecoverableError(error.message)
+    : null;
 }
 
 /**
@@ -75,6 +83,11 @@ export function makeFactsAbsorbHandler(engine: BrainEngine): MinionHandler {
     ).catch(async (err: unknown) => {
       const { writeFactsAbsorbFailure } = await import('../../facts/absorb-log.ts');
       await writeFactsAbsorbFailure(engine, slug, err, sourceId);
+      // Embedding provenance/configuration failures are deterministic until an
+      // operator repairs the selected brain. Retrying the same job cannot heal
+      // them and multiplies persistence requests, so dead-letter immediately.
+      const terminal = factsAbsorbTerminalError(err);
+      if (terminal) throw terminal;
       throw err;
     });
     // Execution-time chat_unavailable in a KEYED worker is config drift —
