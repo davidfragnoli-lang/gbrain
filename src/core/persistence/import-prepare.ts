@@ -28,6 +28,33 @@ export interface ManagedImportIntent extends Record<string, unknown> {
   ownerEpoch: string; expected_revision?: string; noEmbed: boolean; activePack?: ImportPack;
 }
 
+export interface ManagedImportCheckpointIntent extends Record<string, unknown> {
+  kind: 'managed_file_import_checkpoint'; ownerEpoch: string; root: string;
+}
+
+export async function prepareManagedImportCheckpoint(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
+  const p = row.intent as ManagedImportCheckpointIntent | null;
+  if (row.authority.remote || row.principal_kind !== 'local_cli' || !p || p.kind !== 'managed_file_import_checkpoint') {
+    throw new OperationError('permission_denied', 'Managed import freshness requires the trusted local CLI writer.');
+  }
+  const validate = async (tx: BrainEngine) => {
+    const binding = await getWorktreeBinding(tx, row.source_id);
+    if (!row.worktree_id || !binding?.local_path || binding.worktree_id !== row.worktree_id ||
+        String(binding.owner_epoch) !== p.ownerEpoch || realpathSync(join(binding.local_path, binding.relative_path)) !== p.root) {
+      throw new OperationError('owner_unavailable', 'The managed import owner changed before its freshness checkpoint.');
+    }
+    const [source] = await tx.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [row.source_id]);
+    if (!source?.local_path || realpathSync(source.local_path) !== p.root) {
+      throw new OperationError('source_changed', 'The managed import root changed before its freshness checkpoint.');
+    }
+  };
+  await validate(engine);
+  return { sourceExclusive: true, observedRevision: null, validate, apply: async tx => {
+    await tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [row.source_id, row.source_incarnation]);
+    return { status: 'synced', source_id: row.source_id, import_checkpoint: true };
+  } };
+}
+
 export function readImportBytes(path: string): Buffer {
   if (realpathSync(path) !== resolve(path) || !lstatSync(path).isFile()) {
     throw new OperationError('source_changed', 'Managed import refuses symlinked files or ancestors. Use the real source path.');

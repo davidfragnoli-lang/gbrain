@@ -121,6 +121,11 @@ function result(cursor: Cursor | CursorHeader, status: SyncResult['status'], rea
     ...(cursor.counts.skippedContextualMode || cursor.counts.skippedCanonicalBytes ? { legacySkips: {
       contextualMode: cursor.counts.skippedContextualMode ?? 0, canonicalBytes: cursor.counts.skippedCanonicalBytes ?? 0 } } : {}) };
 }
+function cursorBindingChanged(cursor: Cursor, context: Awaited<ReturnType<typeof resolveManagedSyncContext>>): boolean {
+  return cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||
+    String(cursor.binding.topology_generation) !== String(context.binding.topology_generation) ||
+    String(cursor.binding.owner_epoch) !== String(context.binding.owner_epoch) || cursor.root !== context.root;
+}
 function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): ManagedSyncWriteDiagnostic {
   const terminal = isTerminalWriteState(row.state);
   const code = terminal ? row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error') : 'write_pending';
@@ -317,6 +322,18 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
         AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [cursor.sourceId]);
       assertActive();
       if (!unfinished.length) {
+        // A deliberate retry is also the recovery seam for a cursor fenced by a
+        // completed writer transfer/reclaim. Ordinary sync remains fail-closed;
+        // only an idle source may discard the old binding snapshot and
+        // rediscover against the current canonical owner.
+        if (cursorBindingChanged(cursor, context)) {
+          phase = 'discovery';
+          discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
+          const discovery = await discoverManagedSync(engine, opts, context);
+          assertActive();
+          cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions,
+            runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
+        }
         const failed = cursor.pending ? await getWriteRequest(engine, cursor.authority.writer.principal, cursor.pending.requestId) : null;
         const recorded = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [key, cursor.runId]);
         assertActive();
@@ -366,9 +383,7 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       cursor = await saveCursor(engine, key, null, fresh, false, assertActive);
     }
     assertActive();
-    if (cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||
-        String(cursor.binding.topology_generation) !== String(context.binding.topology_generation) ||
-        String(cursor.binding.owner_epoch) !== String(context.binding.owner_epoch) || cursor.root !== context.root) {
+    if (cursorBindingChanged(cursor, context)) {
       throw new OperationError('source_changed', 'The unfinished sync cursor belongs to an older source binding.');
     }
     const stored = cursor.processingOptions;

@@ -9,8 +9,10 @@ import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { initializeLocalPersistence, requestPrincipalForContext, submitPageMutation } from './page-mutations.ts';
+import { admitWrite } from './journal.ts';
+import { waitForWrite, writeResponse } from './service.ts';
 import { digest, sha256 } from './digest.ts';
-import { assertImportPaths, managedImportContent, prepareManagedImportMutation, readImportBytes, type ImportPack, type ManagedImportIntent } from './import-prepare.ts';
+import { assertImportPaths, managedImportContent, prepareManagedImportMutation, readImportBytes, type ImportPack, type ManagedImportIntent, type ManagedImportCheckpointIntent } from './import-prepare.ts';
 import { submissionAuthority } from './authority.ts';
 import { inspectUnchanged, screeningRequest } from './noop-kernel.ts';
 import type { WorktreeBinding } from './ownership.ts';
@@ -77,6 +79,25 @@ export async function importManagedFile(engine: BrainEngine, filePath: string, s
     }
     throw error;
   }
+}
+
+/** Publish the source heartbeat only after the caller completed a clean whole-root import. */
+export async function stampManagedImportFreshness(engine: BrainEngine, sourceId: string, root: string): Promise<void> {
+  const ctx = { engine, remote: false, sourceId, config: loadConfig() ?? { engine: engine.kind } } as OperationContext;
+  await initializeLocalPersistence(ctx);
+  const binding = await getWorktreeBinding(engine, sourceId);
+  const canonicalRoot = resolve(root);
+  if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active' ||
+      resolve(join(binding.local_path, binding.relative_path)) !== canonicalRoot) {
+    throw new OperationError('owner_unavailable', 'Managed import freshness must run on the active canonical owner for the selected source.');
+  }
+  const principal = await requestPrincipalForContext(ctx);
+  const intent: ManagedImportCheckpointIntent = { kind: 'managed_file_import_checkpoint', ownerEpoch: String(binding.owner_epoch), root: canonicalRoot };
+  const authority = await submissionAuthority(ctx, 'submit_job', sourceId, binding.source_incarnation, '__managed_import_checkpoint__');
+  const row = await admitWrite(engine, { principal, operation: 'submit_job', sourceId, sourceIncarnation: binding.source_incarnation,
+    slug: '__managed_import_checkpoint__', pageId: null, requestId: randomUUID(), callerIntent: intent, intent, authority,
+    worktreeId: binding.worktree_id, topologyGeneration: binding.topology_generation });
+  writeResponse(await waitForWrite(engine, row, ctx.config, 30_000));
 }
 
 /** Runs the managed-import preparer on an unadmitted request; true only when the no-op kernel finds nothing to publish. */

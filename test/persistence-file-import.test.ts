@@ -103,6 +103,12 @@ test('managed directory import writes through, routes the source, resumes idempo
     writeFileSync(join(f.input, 'note.md'), '# Engineering note\n\nKeep ordinary knowledge available on the first day.\n');
     const result = await runImport(engine, [f.input, '--no-embed', '--fresh'], { sourceId: f.sourceId });
     expect(result).toMatchObject({ imported: 1, errors: 0 });
+    // Importing an external staging directory does not prove the registered
+    // root is complete. A clean whole-root pass does, and publishes its
+    // freshness through the managed writer coordinator.
+    expect((await engine.executeRaw<{ last_sync_at: unknown }>('SELECT last_sync_at FROM sources WHERE id=$1', [f.sourceId]))[0]?.last_sync_at).toBeNull();
+    expect(await runImport(engine, [f.root, '--no-embed', '--fresh'], { sourceId: f.sourceId })).toMatchObject({ errors: 0 });
+    expect((await engine.executeRaw<{ last_sync_at: unknown }>('SELECT last_sync_at FROM sources WHERE id=$1', [f.sourceId]))[0]?.last_sync_at).not.toBeNull();
     expect(readFileSync(join(f.root, 'note.md'), 'utf8')).toContain('ordinary knowledge');
     expect((await engine.getPage('note', { sourceId: f.sourceId }))?.source_path).toBe('note.md');
     expect(await engine.getPage('note', { sourceId: 'default' })).toBeNull();
