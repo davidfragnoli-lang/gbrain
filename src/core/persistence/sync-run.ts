@@ -19,7 +19,7 @@ import { join, resolve } from 'node:path';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
-import { recordManagedSyncFailure, clearManagedSyncFailureAfterSuccess, formatManagedSyncFailure, type ManagedSyncFailure } from './sync-failures.ts';
+import { recordManagedSyncFailure, clearManagedSyncFailureAfterSuccess, reconcileManagedSyncFailuresAfterRetry, formatManagedSyncFailure, type ManagedSyncFailure } from './sync-failures.ts';
 import { writeFailureDiagnostic } from './verb-errors.ts';
 import { extractManagedStaleLinks } from './links-maintenance.ts';
 import { CHECKPOINT_VALIDATION_TIMEOUT, checkpointTimeoutHint } from './checkpoint-validation.ts';
@@ -338,6 +338,7 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
     }
     if (cursor?.done) {
       const completed = cursor;
+      if (opts.retryFailed) await reconcileManagedSyncFailuresAfterRetry(engine, completed.sourceId, completed.runId, key);
       await engine.transaction(async tx => {
         assertActive();
         await tx.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [OP, key, JSON.stringify([header(completed)])]);

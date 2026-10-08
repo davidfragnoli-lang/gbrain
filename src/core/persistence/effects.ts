@@ -126,16 +126,21 @@ async function singleFileGitTarget(engine: BrainEngine, effect: PersistenceEffec
   const sourceRoot = join(binding.local_path, binding.relative_path);
   let path = join(binding.local_path, effect.data.relative_path);
   if (!isWriteTargetContained(path, sourceRoot)) throw new OperationError('source_changed', 'The Git target escaped its registered source.');
+  // A storage-policy change can retire a formerly Git-backed target after the
+  // file (and even its parent directory) has disappeared.  Consult the
+  // source-relative policy before native-path canonicalization: the latter is
+  // intentionally fail-closed for real Git targets, but there is no Git
+  // target left to validate once this slug is explicitly database-only.
+  if (effect.data.slug && isSourceDbOnlySlug(sourceRoot, effect.data.slug, 'not_db_only')) {
+    await completeEffect(engine, effect, { git: 'skipped', reason: 'db_only' });
+    return null;
+  }
   path = nativeFileTarget(binding.local_path, path, 'git_target_unsafe');
   if (persistenceFileHash(path) !== effect.data.expected_hash) { await completeEffect(engine, effect, { git: 'superseded' }); return null; }
   if (!isWriteTargetContained(path, sourceRoot)) throw new OperationError('source_changed', 'The Git target escaped its registered source.');
   // Declared db_only content stays out of Git. Its gitignored local cache file
   // is invisible to `git status`, so publishing it would be refused as unsafe.
   // An invalid gbrain.yml (logged by the loader) publishes as before.
-  if (effect.data.slug && isSourceDbOnlySlug(sourceRoot, effect.data.slug, 'not_db_only')) {
-    await completeEffect(engine, effect, { git: 'skipped', reason: 'db_only' });
-    return null;
-  }
   return relative(binding.local_path, path).split(sep).join('/');
 }
 

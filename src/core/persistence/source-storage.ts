@@ -1,7 +1,7 @@
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
-import { hasUnresolvedDbOnlyDeclaration, isDeclaredDbOnlySlug, loadStorageConfig, type StorageConfig } from '../storage-config.ts';
+import { hasUnresolvedDbOnlyDeclaration, isDbTracked, isDeclaredDbOnlySlug, loadStorageConfig, type StorageConfig } from '../storage-config.ts';
 
 type Loaded = { version: string; config: StorageConfig | null } | { version: string; cause: unknown };
 // One parse per gbrain.yml version per source root: bulk scans and migrations
@@ -53,4 +53,9 @@ export function isSourceDbOnlySlug(root: string, slug: string, onInvalid: 'refus
     if (onInvalid === 'refuse') throw error;
     return false;
   }
+}
+
+/** Explicit db_tracked declarations outrank a legacy .gitignore rule. */
+export function isSourceDbTrackedSlug(root: string, slug: string): boolean {
+  try { const config = load(root); return config ? isDbTracked(slug, config) : false; } catch { return false; }
 }

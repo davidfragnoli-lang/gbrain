@@ -47,6 +47,54 @@ export async function clearManagedSyncFailureAfterSuccess(engine: BrainEngine, k
   if (removed.length) try { clearManagedSyncFailure(key); } catch { }
 }
 
+/**
+ * An explicit retry may legitimately rediscover a repaired file under a new
+ * cursor fingerprint (for example when the retry records newer processing
+ * options).  Once that new run commits the same path, retire only older
+ * terminal cursors whose recorded failure path was covered by this run.
+ * Active receipts and failures for paths outside the successful manifest are
+ * deliberately retained.
+ */
+export async function reconcileManagedSyncFailuresAfterRetry(
+  engine: BrainEngine,
+  sourceId: string,
+  successfulRunId: string,
+  currentKey: string,
+): Promise<string[]> {
+  const removed = await engine.transaction(async tx => {
+    const rows = await tx.executeRaw<{ fingerprint: string }>(`
+      WITH successful_paths AS (
+        SELECT entry->>'path' AS path
+        FROM op_checkpoints m, jsonb_array_elements(m.completed_keys) entry
+        WHERE m.op='managed-sync-manifest' AND m.fingerprint=$2
+      ), candidates AS (
+        SELECT f.fingerprint
+        FROM op_checkpoints f
+        JOIN op_checkpoints c ON c.op='managed-sync' AND c.fingerprint=f.fingerprint
+        LEFT JOIN persistence_requests r ON r.request_id=(c.completed_keys->0->'pending'->>'requestId')::uuid
+          AND r.source_id=$1
+        WHERE f.op='managed-sync-failure' AND f.fingerprint<>$3
+          AND f.completed_keys->0->>'source_id'=$1
+          AND f.completed_keys->0->>'path' IN (SELECT path FROM successful_paths)
+          AND (c.completed_keys->0->>'sourceId')=$1
+          AND COALESCE(c.completed_keys->0->>'done','false')<>'true'
+          AND (c.completed_keys->0->'pending'->>'requestId') IS NOT NULL
+          AND r.state IN ('failed','conflict','cancelled')
+          AND NOT EXISTS (SELECT 1 FROM persistence_requests live WHERE live.source_id=$1
+            AND (live.state IN ('queued','running','recovering') OR live.recovery IS NOT NULL))
+      ), deleted_cursors AS (
+        DELETE FROM op_checkpoints c USING candidates x
+        WHERE c.op='managed-sync' AND c.fingerprint=x.fingerprint RETURNING c.fingerprint
+      )
+      DELETE FROM op_checkpoints f USING deleted_cursors d
+      WHERE f.op='managed-sync-failure' AND f.fingerprint=d.fingerprint
+      RETURNING f.fingerprint`, [sourceId, successfulRunId, currentKey]);
+    return rows.map(row => row.fingerprint);
+  });
+  for (const fingerprint of removed) try { clearManagedSyncFailure(fingerprint); } catch { }
+  return removed;
+}
+
 export async function readManagedSyncFailures(engine: BrainEngine, sourceIds?: string[]): Promise<ManagedSyncFailure[]> {
   const rows = await engine.executeRaw<{ cursor_key: string; value: { sourceId: string; incarnation: string; runId: string; index: number; target: string; pending?: { requestId: string } };
     receipt: Pick<WriteRequest, 'state' | 'request_id' | 'error_code' | 'error_message'> | null; failure: ManagedSyncFailure | null; path: string | null; updated_at: string }>(`

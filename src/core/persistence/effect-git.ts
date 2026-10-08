@@ -4,6 +4,7 @@ import { execFileBounded, isDurabilityHardenedAsync } from '../brain-repo-durabi
 import { OperationError } from '../ops/contract.ts';
 import { persistenceHome } from './identity.ts';
 import { nativeFileTarget } from './native-file-target.ts';
+import { isSourceDbTrackedSlug } from './source-storage.ts';
 
 /** An index lock younger than this is contention; an older one is reported as stale. */
 const INDEX_LOCK_GRACE_MS = 10 * 60 * 1000;
@@ -82,8 +83,20 @@ async function stageTarget(root: string, hooks: string, relativePath: string, si
     return { path: relativePath, state: 'unchanged' };
   }
   if (tracked.code === 0) return { path: relativePath, state: 'unchanged' };
-  if (existsSync(path)) throw new OperationError('git_target_unsafe', 'Git cannot identify the existing canonical file by its native spelling.',
-    'Reconcile the index and worktree spelling before retrying publication.');
+  if (existsSync(path)) {
+    // A reviewed storage declaration is the source's explicit instruction to
+    // retain this page in Git.  It must outrank a stale broad .gitignore rule;
+    // otherwise retry-effects can never repair the retained receipt.
+    const slug = relativePath.endsWith('.md') ? relativePath.slice(0, -3) : relativePath;
+    if (!isSourceDbTrackedSlug(root, slug)) throw new OperationError('git_target_unsafe', 'Git cannot identify the existing canonical file by its native spelling.',
+      'Reconcile the index and worktree spelling before retrying publication.');
+    const add = await git(root, hooks, ['add', '-f', '--', relativePath], signal);
+    if (add.code !== 0) throw new OperationError('git_unavailable', 'Cannot stage the declared database-tracked Git target.');
+    const diff = await git(root, hooks, ['diff', '--cached', '--quiet', '--', relativePath], signal);
+    if (diff.code === 1) return { path: relativePath, state: 'changed' };
+    if (diff.code !== 0) throw new OperationError('git_unavailable', 'Cannot compare the declared database-tracked Git target.');
+    return { path: relativePath, state: 'unchanged' };
+  }
   let parent = dirname(path);
   while (!existsSync(parent)) {
     if (parent === resolvePath(root)) throw new OperationError('git_target_unsafe', 'The canonical Git root disappeared.');
