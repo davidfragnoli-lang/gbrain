@@ -546,7 +546,7 @@ describe('error paths', () => {
   }, T);
 });
 
-describe('managed-worktree refusal is recorded (#5198)', () => {
+describe('managed-worktree push proof (#5198)', () => {
   test('a guard refusal overwrites the last success with ok:false and still throws', async () => {
     writeFileSync(join(work, 'note.md'), 'first\n');
     expect((await push()).status).toBe('pushed');
@@ -562,13 +562,15 @@ describe('managed-worktree refusal is recorded (#5198)', () => {
     expect(existsSync(pushLockDir(work))).toBe(false);
   }, T);
 
-  test('a refusal on a subdirectory target is recorded against the workspace root', async () => {
+  test('a clean managed subdirectory target pushes committed HEAD without staging or pulling', async () => {
     const sub = join(work, 'notes');
     mkdirSync(sub);
     writeFileSync(join(work, '.gbrain-owner.json'), '{}\n');
-    await expect(workspacePush({ dir: sub, branch: 'main', allowUnverifiedRemote: true }))
-      .rejects.toMatchObject({ code: 'writer_coordinator_required' });
-    expect(readPushStatusForRoot(resolveWorkspaceRoot(sub)!)?.ok).toBe(false);
+    writeFileSync(join(work, 'untracked.md'), 'coordinator has not admitted this file\n');
+    const result = await workspacePush({ dir: sub, branch: 'main', allowUnverifiedRemote: true });
+    expect(result).toMatchObject({ ok: true, status: 'pushed', committed: false });
+    expect(readPushStatusForRoot(resolveWorkspaceRoot(sub)!)?.ok).toBe(true);
+    expect(git(work, 'status', '--porcelain')).toContain('?? untracked.md');
   }, T);
 });
 
