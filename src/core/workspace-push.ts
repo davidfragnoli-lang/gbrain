@@ -670,6 +670,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
   const log = (line: string) => opts.logger?.(line);
 
   const root = resolveWorkspaceRoot(opts.dir);
+  let managedPushOnly = false;
   try {
     assertManagedFilesystemWrite(opts.dir);
     if (root) assertManagedFilesystemWrite(root);
@@ -679,10 +680,17 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // status surface calls a push that can never run "stale" instead of failing.
     // No lock winner can be in flight here: the same guard refuses every legacy
     // push of this root.
-    if (root && e instanceof OperationError) {
+    if (root && e instanceof OperationError && e.code === 'writer_coordinator_required') {
+      // Managed writers already own staging/committing canonical bytes. A
+      // clean tracked tree may still prove/push its committed HEAD without
+      // mutating files, index, or pulling remote bytes into the checkout.
+      const trackedDirty = tryGit(root, ['diff', '--quiet']) === null || tryGit(root, ['diff', '--cached', '--quiet']) === null;
+      if (!trackedDirty) managedPushOnly = true;
+      else writePushStatus({ ts: new Date().toISOString(), ok: false, reason: `${e.code}: ${e.message}`, repoRoot: root });
+    } else if (root && e instanceof OperationError) {
       writePushStatus({ ts: new Date().toISOString(), ok: false, code: e.code, reason: `${e.code}: ${e.message}`, repoRoot: root });
     }
-    throw e;
+    if (!managedPushOnly) throw e;
   }
   if (!root) {
     return { ok: false, status: 'error', reason: `not a git repository: ${opts.dir}` };
@@ -733,6 +741,10 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
 
   try {
     if (opts.holdLockMs && opts.holdLockMs > 0) await sleep(opts.holdLockMs);
+    if (managedPushOnly && (tryGit(root, ['diff', '--quiet']) === null || tryGit(root, ['diff', '--cached', '--quiet']) === null)) {
+      return finish({ ok: false, status: 'error', repoRoot: root, branch,
+        reason: 'managed canonical worktree gained tracked changes; coordinator must commit them before push' });
+    }
 
     // 2. deny-glob inputs: tracked + untracked listings. `--others` deliberately WITHOUT
     // --exclude-standard: a gitignored deny match (brain.pglite behind a
@@ -773,8 +785,10 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     const excludedUntracked: string[] = [];
     let stagedForScan: string[];
     try {
-      ensureLocalIdentity(root);
-      git(root, ['add', '-A'], { timeoutMs: 120_000 });
+      if (!managedPushOnly) {
+        ensureLocalIdentity(root);
+        git(root, ['add', '-A'], { timeoutMs: 120_000 });
+      }
       // Un-stage any newly-added deny match (tracked ones already hard-failed
       // above, so anything staged AND deny-matched got here via add -A —
       // untrackedDeny names the expected set; the staged list is the source
@@ -938,7 +952,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // 6. pull AFTER commit [CX2-7] — a dirty tree is impossible here short of
     // a mid-run writer, and divergenceSafePull handles that as skipped_dirty.
     try {
-      const pull = divergenceSafePull(root, branch);
+      const pull = managedPushOnly ? { status: 'up_to_date' as const } : divergenceSafePull(root, branch);
       if (pull.status === 'conflict_aborted') {
         return finish({
           ok: false, status: 'pull_conflict', repoRoot: root, branch, committed,
