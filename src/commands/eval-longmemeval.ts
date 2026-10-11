@@ -584,7 +584,7 @@ function resolvePins(opts: ParsedArgs, runOpts: RunOpts, trajectoryEnabled: bool
     keyword_only: opts.keywordOnly,
     reranker: { enabled: opts.keywordOnly ? false : knobs.reranker_enabled, model: knobs.reranker_model },
     autocut: opts.keywordOnly ? false : knobs.autocut,
-    expansion: opts.keywordOnly ? false : opts.expansion,
+    expansion: opts.expansion,
     expansion_variant_budget: knobs.expansion_variant_budget,
     embedder,
     top_k: opts.topK,
@@ -840,7 +840,7 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
       process.stderr.write(`[longmemeval] FAIL vector arm: ${st.vectorDegradedRows} row(s) scored keyword-only after a silent embed failure (vector_enabled:false / embed_unavailable / embed_timeout) — vector_degraded_rows\n`);
       exitCode = 1;
     }
-    if (!opts.keywordOnly && opts.expansion && st.expansionFailedRows > 0) {
+    if (opts.expansion && st.expansionFailedRows > 0) {
       process.stderr.write(`[longmemeval] FAIL --expansion: ${st.expansionFailedRows} row(s) did not expand as configured (expansion_failed / expansion_partial) — expansion_failed_rows\n`);
       exitCode = 1;
     }
@@ -1366,7 +1366,7 @@ async function runOneQuestion(
   let expansionVariants: string[] | undefined;
   let expansionReplayed = false;
   let expandFn: ((query: string) => Promise<string[]>) | undefined;
-  if (!opts.keywordOnly && opts.expansion) {
+  if (opts.expansion) {
     if (ctx.replay) {
       const recorded = ctx.replay.get(q.question_id);
       if (!recorded) {
@@ -1422,7 +1422,20 @@ async function runOneQuestion(
     }
     if (ctx.synopsis) Object.assign(extra0, { contextual_synopsis: await synopsisTier.applySynopsisTier(engine, adapterPages, ctx.synopsis) });
     if (ctx.factKeys) Object.assign(extra0, { fact_keys: await retrievalArms.applyFactKeyArm(engine, adapterPages, ctx.factKeys.arm, ctx.factKeys.spend) });
-    if (opts.keywordOnly) return engine.searchKeyword(q.question, { limit: opts.topK });
+    if (opts.keywordOnly) {
+      if (!expandFn) return engine.searchKeyword(q.question, { limit: opts.topK });
+      const variants = await expandFn(q.question);
+      const merged = new Map<string, SearchResult>();
+      for (const query of [q.question, ...variants]) {
+        for (const result of await engine.searchKeyword(query, { limit: opts.topK })) {
+          const key = `${result.page_id}:${result.chunk_id}`;
+          const prior = merged.get(key);
+          if (!prior || result.score > prior.score) merged.set(key, result);
+        }
+      }
+      meta = { vector_enabled: false, expansion_applied: variants.length > 0, degraded: [] } as HybridSearchMeta;
+      return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, opts.topK);
+    }
     const searchOpts: HybridSearchOpts = {
       limit: opts.arms.timeScope ? Math.max(opts.topK, opts.arms.timeScopePool) : opts.topK,
       // Per-call wins over the bundle: expansion fires ONLY with --expansion.

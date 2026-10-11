@@ -104,7 +104,7 @@ export function buildLongMemEvalProbeCall(args: LongMemEvalProbeArgs): { argv: s
   // Keep the nightly gate on the keyword arm, but retain subscription-CLI
   // query expansion: strict single-query FTS misses natural-language variants
   // in the compact fixture and previously produced a stable false 3/10.
-  const argv = [args.fixturePath, '--output', args.outputPath, '--mode', 'keyword', '--expansion', '--no-embed-cache', '--reader-mode', 'direct'];
+  const argv = [args.fixturePath, '--output', args.outputPath, '--keyword-only', '--expansion', '--no-embed-cache', '--reader-mode', 'direct'];
   const runOpts: RunOpts = { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false };
   if (args.modelRoutes) {
     argv.push('--model', args.modelRoutes.reader.model);
