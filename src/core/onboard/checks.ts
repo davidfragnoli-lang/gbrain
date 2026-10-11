@@ -736,12 +736,8 @@ export async function checkDanglingAliases(
         message:
           `${n} alias rows point at missing/deleted pages ` +
           `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ` +
-          `Safe GC (source-scoped): ` +
-          `\`DELETE FROM slug_aliases sa WHERE NOT EXISTS (SELECT 1 FROM pages p ` +
-          `WHERE p.slug = sa.canonical_slug AND p.source_id = sa.source_id ` +
-          `AND p.deleted_at IS NULL); DELETE FROM page_aliases pa WHERE NOT EXISTS ` +
-          `(SELECT 1 FROM pages p WHERE p.slug = pa.slug ` +
-          `AND p.source_id = pa.source_id AND p.deleted_at IS NULL);\``,
+          `Preview the supported source-scoped repair with ` +
+          `\`gbrain repair dangling-aliases --source <id> --json\`; apply only the returned plan hash.`,
       },
       remediations: [],  // v0.42: surface-only; auto-GC v0.43+
     };

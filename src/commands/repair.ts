@@ -30,6 +30,7 @@ import { CONTENT_REPAIR_KINDS } from '../core/repair/content-lane.ts';
 
 /** The content-repair lane's command word (#6377): parsed like a kind, dispatched to repair-content.ts, never a RepairKind. */
 export const CONTENT_LANE = 'content';
+export const DANGLING_ALIASES_LANE = 'dangling-aliases';
 const REPAIR_CONTENT_HELP = `       gbrain repair content [--source <id>] [--only <path>]... [--skip <path>]... [--no-llm] [--max-usd <n>] [--diff]
                              [--apply [--expect <hash>[,<hash>]]] [--json]`;
 const REPAIR_CONTENT_SUMMARY = `  content      The content-repair lane (#6377), not a kind: runs ${CONTENT_REPAIR_KINDS.join(', then ')} over the same
@@ -70,6 +71,8 @@ Repair residual damage that \`gbrain doctor\` reports. Dry run unless --apply.
 Kinds:
 ${REPAIR_REGISTRY.map(spec => `  ${spec.kind.length < 13 ? spec.kind.padEnd(12) : `${spec.kind}\n${' '.repeat(14)}`} ${wrap(`${spec.explicit_only
     ? `[explicit-only; preview: ${repairPreviewCommand(spec.kind)}] ` : ''}${spec.summary}`, 15)}`).join('\n')}
+  dangling-aliases
+               Source-scoped preview/apply GC for alias rows whose target page is absent or deleted.
 
 Lanes:
 ${REPAIR_CONTENT_SUMMARY}
@@ -194,7 +197,7 @@ export function parseRepairArgs(args: string[]): RepairArgs {
   }
   if (parsed.noLlm && !llmKind) throw new OperationError('invalid_params', `--no-llm applies only to a kind that may call a paid model (${llmKinds}).`,
     `Preview it by name: gbrain repair ${LLM_REPAIR_REGISTRY[0]?.kind ?? 'fences'}${parsed.source ? ` --source ${parsed.source}` : ''}`);
-  if (parsed.expect !== undefined && parsed.kind !== CONTENT_LANE && !PREVIEW_BOUND_REPAIR_REGISTRY.some(spec => spec.kind === parsed.kind)) {
+  if (parsed.expect !== undefined && parsed.kind !== CONTENT_LANE && parsed.kind !== DANGLING_ALIASES_LANE && !PREVIEW_BOUND_REPAIR_REGISTRY.some(spec => spec.kind === parsed.kind)) {
     throw new OperationError('invalid_params', `--expect applies only to an explicit-only or preview-bound kind named on the command line (${previewBoundKinds}).`,
       `Preview one by name: ${repairPreviewCommand(PREVIEW_BOUND_REPAIR_REGISTRY[0]!.kind)}`);
   }
@@ -248,6 +251,14 @@ export async function runRepairCommand(engine: BrainEngine, args: string[]): Pro
     if (all) throw invalid('Pass either content or --all, not both.', 'Drop --all to run the content lane, or drop content to run every automatic kind.', ['gbrain', 'repair', CONTENT_LANE, ...(source ? ['--source', source] : []), '--json']);
     const { runRepairContentCommand } = await import('./repair-content.ts');
     return runRepairContentCommand(engine, { apply, json, diff, noLlm, noEmbed, source, expect, maxUsd, only, skip, limit });
+  }
+  if (kind === DANGLING_ALIASES_LANE) {
+    if (all || includeAmbiguous || only.length || skip.length || slugs.length || diff || noLlm || noEmbed || maxUsd !== undefined || limit !== undefined) {
+      throw invalid('dangling-aliases accepts only --source, --apply, --expect and --json.',
+        'Preview with gbrain repair dangling-aliases --source <id> --json.');
+    }
+    const { runAliasRepair } = await import('./repair-aliases.ts');
+    return runAliasRepair(engine, { source, apply, expect, json });
   }
   if (kind && !REPAIR_KINDS.includes(kind as RepairKind)) {
     throw new OperationError('invalid_params', `Unknown repair kind '${kind}'.`, `Kinds: ${REPAIR_KINDS.join(', ')}; lanes: ${CONTENT_LANE}.`);
