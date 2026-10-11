@@ -10,7 +10,7 @@ import { inlineCodeEndAt, scanMarkdownCode, type MarkdownCodeMap } from './fence
  * Runs between newlines, backticks and (with onHtmlComment) `<!--` are copied
  * as whole slices, so cost is linear in the text rather than per character.
  */
-export function stripCodeBlocks(content: string, opts: { onHtmlComment?: (start: number, end: number) => void } = {}): string {
+export function stripCodeBlocks(content: string, opts: { onHtmlComment?: (start: number, end: number) => void; preserveInline?: boolean } = {}): string {
   const fenceMarker = / {0,3}(`{3,}|~{3,})([^\n]*)/y;
   const special = opts.onHtmlComment ? /\n|`|<!--/g : /\n|`/g;
   let fence: string | undefined;
@@ -55,6 +55,11 @@ export function stripCodeBlocks(content: string, opts: { onHtmlComment?: (start:
       const afterFence = end === -1 ? content.length : end + 3;
       out += content.slice(i, afterFence).replace(/[^\r\n]/g, ' ');
       i = afterFence;
+      continue;
+    }
+    if (opts.preserveInline) {
+      out += '`';
+      i++;
       continue;
     }
     inline ??= scanMarkdownCode(content.replace(/\r(?!\n)/g, ' '));

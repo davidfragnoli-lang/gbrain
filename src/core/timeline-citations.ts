@@ -1,4 +1,5 @@
 import { stripCodeBlocks } from './markdown-code.ts';
+import { inlineCodeEndAt, scanMarkdownCode } from './fence-scan.ts';
 
 const CITATION_TIMELINE_RE = /\[Source:\s*([^\]]+?,\s*\d{4}-\d{2}-\d{2})\s*\]/g;
 /**
@@ -98,7 +99,10 @@ function citationParagraphs(
     lines = [];
   };
 
-  for (const line of stripCodeBlocks(content).split(/\r?\n/)) {
+  // Source labels often use inline code for literal file paths. Keep those
+  // spans while forming paragraphs; readCitations filters citation-shaped
+  // text that is itself code and strips remaining code from the summary.
+  for (const line of stripCodeBlocks(content, { preserveInline: true }).split(/\r?\n/)) {
     if (line.trim().length === 0 || isCommentOnlyLine(line)) {
       flush();
       continue;
@@ -125,10 +129,12 @@ function readCitations(content: string, opts: CitationOpts, legacy: boolean): In
   const result: InlineCitationTimelineCandidate[] = [];
   if (!content.includes('[Source:')) return result;
   for (const paragraph of citationParagraphs(content, opts)) {
-    const matches = [...paragraph.text.matchAll(CITATION_TIMELINE_RE)];
+    const code = scanMarkdownCode(paragraph.text);
+    const matches = [...paragraph.text.matchAll(CITATION_TIMELINE_RE)]
+      .filter((match) => inlineCodeEndAt(code, match.index ?? -1) === -1);
     if (matches.length === 0) continue;
-    const text = stripHtmlComments(paragraph.text)
-      .replace(/\[Source:[^\]]*\](?:\((?:[^()]|\([^()]*\))*\))?/g, '');
+    const text = stripCodeBlocks(stripHtmlComments(paragraph.text)
+      .replace(/\[Source:[^\]]*\](?:\((?:[^()]|\([^()]*\))*\))?/g, ''));
     const summary = (legacy ? text : unwrapEmphasis(text))
       .replace(/^[-*>#\s]+/, '')
       .replace(/\s+/g, ' ')

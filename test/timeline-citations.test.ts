@@ -85,6 +85,9 @@ describe('#6226 multi-source citations and emphasis', () => {
       { date: '2026-01-02', source: 'call', summary: 'Set max_retry_count and a*b*c; 2 * 3 * 4' }]],
     ['a single-source citation is unchanged', 'Shipped the beta. [Source: Slack import, 2026-10-05]', [
       { date: '2026-10-05', source: 'Slack import', summary: 'Shipped the beta.' }]],
+    ['inline-code source paths remain provenance, not code-block losses', 'Observed pipeline: intake to release. [Source: `work-knowledge/review.md`, 2026-09-23; `work-knowledge/release.json`, 2026-09-23]', [
+      { date: '2026-09-23', source: '`work-knowledge/review.md`', summary: 'Observed pipeline: intake to release.' },
+      { date: '2026-09-23', source: '`work-knowledge/release.json`', summary: 'Observed pipeline: intake to release.' }]],
   ];
   for (const [name, text, expected] of cases) {
     test(name, () => {
@@ -93,6 +96,10 @@ describe('#6226 multi-source citations and emphasis', () => {
       expect(extractTimelineFromContent(text, 'notes/x').map(e => ({ date: e.date, source: e.source, summary: e.summary }))).toEqual(expected);
     });
   }
+
+  test('citation-shaped text inside inline code is still ignored', () => {
+    expect(parseInlineCitationTimelineEntries('Example: `[Source: fake.md, 2026-09-23]`')).toEqual([]);
+  });
 
   test('emphasis unwrapping stays linear on adversarial input', () => {
     const inputs = ['**a'.repeat(50_000), '*x '.repeat(50_000), '__a_'.repeat(50_000), '_'.repeat(150_000)];
