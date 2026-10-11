@@ -221,10 +221,9 @@ describe('E2E synthesize — no API key skip path', () => {
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
-      // A 1ms budget + 25 uncached files: the budget check runs after each
-      // per-file cache lookup, and 25 PGLite roundtrips take well over 1ms,
-      // so at least the tail of the corpus is guaranteed to defer (exact
-      // count depends on wall-clock — assert >= 1, not equality).
+      // Advance the triage clock past the 1ms budget on the first cache miss.
+      // Cache lookup speed varies with machine load, so real elapsed time
+      // cannot guarantee that any file is deferred.
       await rig.engine.setConfig('dream.triage.max_ms', '1');
       for (let i = 0; i < 25; i++) {
         writeFileSync(
@@ -233,14 +232,19 @@ describe('E2E synthesize — no API key skip path', () => {
         );
       }
       await withoutAnthropicKey(async () => {
+        let triageClock = 0;
         const result = await runPhaseSynthesize(rig.engine, {
           brainDir: rig.brainDir,
           dryRun: true,
+          triageNow: () => (triageClock += 2),
         });
         expect(result.status).toBe('ok');
+        // The phase must have read the injected clock; otherwise the counts
+        // below would again depend on real elapsed time.
+        expect(triageClock).toBeGreaterThan(0);
         const triage = (result.details as { triage: { deferred: number; degraded: number } }).triage;
-        expect(triage.deferred).toBeGreaterThanOrEqual(1);
-        expect(triage.deferred + triage.degraded).toBe(25);
+        expect(triage.deferred).toBe(25);
+        expect(triage.degraded).toBe(0);
         expect(result.summary).toContain('not yet triaged');
         expect(result.summary).toContain('dream retriage');
       });
@@ -722,12 +726,21 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
     }
   }
 
+  // #6069: a degenerate verdict leaves only a backoff marker (score NULL), never a cached verdict.
+  function expectBackoffMarkerOnly(verdictRow: unknown, kind: string): void {
+    const row = verdictRow as { score: number | null; content_type: string | null; reasons: string[] } | null;
+    expect(row).not.toBeNull();
+    expect(row!.score).toBeNull();
+    expect(row!.content_type).toBe('triage_unreliable');
+    expect(row!.reasons).toEqual([`unreliable:${kind}`, 'attempt:1']);
+  }
+
   test('truncated judge response (stop_reason=length) → no dream_verdicts row + warning', async () => {
     const { verdictRow, stderr } = await runWithStubbedJudge({
       text: '{"scor', // reasoning ate the budget; partial JSON
       stopReason: 'length',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'truncated');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was truncated/);
     expect(stderr).toMatch(/not caching in dream_verdicts/);
   }, 30_000);
@@ -737,7 +750,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
       text: 'not json at all',
       stopReason: 'end',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'unparseable');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was unparseable/);
     expect(stderr).toMatch(/not caching in dream_verdicts/);
   }, 30_000);
@@ -749,7 +762,7 @@ describe('E2E synthesize — degenerate verdicts are NOT cached in dream_verdict
       text: '{"worth_processing": false, "reasons": ["routine ops"]}',
       stopReason: 'end',
     });
-    expect(verdictRow).toBeNull();
+    expectBackoffMarkerOnly(verdictRow, 'unparseable');
     expect(stderr).toMatch(/\[dream\] triage for 2026-05-01-session was unparseable/);
   }, 30_000);
 

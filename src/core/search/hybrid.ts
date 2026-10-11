@@ -28,7 +28,8 @@ import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { applyAliasHop, isExcludedIdentity, type IdentityTierOpts } from './alias-hop.ts';
 export { applyAliasHop, isExcludedIdentity, type IdentityTierOpts };
 import { dedupResults } from './dedup.ts';
-import { accumulateRrf } from './rrf-page-fusion.ts';
+import { accumulateRrf, type RrfEntry } from './rrf-page-fusion.ts';
+import type { RrfAttribution } from '../types.ts';
 import {
   isAmbiguousModalityQuery,
 } from './query-intent.ts';
@@ -47,6 +48,7 @@ import { resolveHybridRequest } from './hybrid/request.ts';
 import { prepareSemanticCache, resolveCacheSearchMode, semanticCacheSkipped, serveSemanticCacheHit } from './hybrid/cache-stages.ts';
 import { buildPostFusionOpts, buildRelationalList, resolveModalityAndQueries, runLexicalArms, runVectorArms } from './hybrid/arms.ts';
 import { searchVectorFallback, searchWithoutEmbeddings } from './hybrid/keyword-only.ts';
+import { factEmbeddingDisabled } from '../embedding-disabled.ts';
 import { expandStructuralNeighbors, finalizeHybridResults, fuseArms, rerankAndPin, sizeReturnPool } from './hybrid/rank.ts';
 
 export const RRF_K = 60;
@@ -286,6 +288,7 @@ export function applyBacklinkBoost(
       // --explain output. Stays undefined when count == 0 so the
       // formatter can render "no boosts applied" honestly.
       r.backlink_boost = factor;
+      r.backlink_count = count;
     }
   }
 }
@@ -900,6 +903,14 @@ export interface HybridSearchOpts extends SearchOpts {
    * resolver (knobs hash `mbg=`); eval A/B runs drive it here.
    */
   metadataBoostGate?: MetadataBoostGate;
+  /**
+   * explain_target (explain-target.ts): when set, each pipeline stage records
+   * whether the target page was present and at what rank. Observation only —
+   * never changes ranking.
+   */
+  explainTarget?: import('./explain-target.ts').TargetTrace;
+  /** Stamp fusion attribution (`rrf`, `blend_norm_rrf`) for score_details; off keeps rows byte-identical. */
+  explain?: boolean;
   /** Override default RRF K constant (default: 60). Lower values boost top-ranked results more. */
   rrfK?: number;
   /** Override dedup pipeline parameters. */
@@ -933,16 +944,19 @@ export interface HybridSearchOpts extends SearchOpts {
    * v0.42.20.0 (Fix 3, #1775) INTERNAL — shared query-embed deadline threaded
    * from `hybridSearchCached` into the inner `hybridSearch` so the cache-lookup
    * embed and the inner embed share ONE wall-clock budget (worst case ~one
-   * timeout, not two). Direct `hybridSearch` callers leave it undefined and get
-   * a fresh per-call deadline. Not part of the public contract.
+   * timeout, not two). A getter: the deadline starts at the first embed
+   * request. Direct `hybridSearch` callers leave it undefined and get a fresh
+   * per-call deadline. Not part of the public contract.
    */
-  _queryEmbedDeadline?: QueryEmbedDeadline;
+  _queryEmbedDeadline?: () => QueryEmbedDeadline;
   /**
    * #5691 INTERNAL — the brain's `embedding_query_prefix`, read once per
    * request (by `hybridSearchCached`, or by `hybridSearch` when undefined) and
    * prepended to the text vector arm's query embeddings only.
    */
   _queryPrefix?: string;
+  /** INTERNAL — the brain opted out of embedding (factEmbeddingDisabled), read once per request: keyword-only, no query embed. */
+  _embeddingOptedOut?: boolean;
 
   /**
    * Hermetic eval canaries/CI — non-semantic embeddings. When set, the query
@@ -995,8 +1009,8 @@ const QUERY_EMBED_TIMEOUT_MS = (() => {
 
 /**
  * Floor for the remaining shared-deadline budget at each embed call (codex).
- * The shared deadline is absolute from `hybridSearchCached` entry, so slow
- * expansion/keyword (or a 6s cache-lookup stall) before the inner embed could
+ * The shared deadline is absolute from the first embed request, so a 6s
+ * cache-lookup stall (or slow work between two embeds) before the inner embed could
  * leave ~0 budget and starve a HEALTHY embed into a false keyword-only result.
  * Flooring guarantees every embed gets at least this long, so a fast healthy
  * embed (~0.5s) always succeeds. Worst case under a stalled provider on the
@@ -1014,6 +1028,17 @@ export interface QueryEmbedDeadline {
 
 export function makeQueryEmbedDeadline(ms = QUERY_EMBED_TIMEOUT_MS): QueryEmbedDeadline {
   return { signal: AbortSignal.timeout(ms), deadlineAt: Date.now() + ms };
+}
+
+/**
+ * #6400 (a): a shared query-embed deadline that starts at the FIRST embed
+ * request, not when the search starts. Every call returns the same deadline,
+ * so the cache-lookup embed and the vector-arm embeds still share one budget,
+ * but lexical work and expansion before the first embed no longer spend it.
+ */
+export function lazyQueryEmbedDeadline(ms = QUERY_EMBED_TIMEOUT_MS): () => QueryEmbedDeadline {
+  let dl: QueryEmbedDeadline | undefined;
+  return () => (dl ??= makeQueryEmbedDeadline(ms));
 }
 
 /**
@@ -1065,6 +1090,7 @@ export async function hybridSearch(
     opts = { ...opts, ...filters };
   }
   if (opts?._queryPrefix === undefined) opts = { ...opts, _queryPrefix: await loadEmbeddingQueryPrefix(engine) };
+  if (opts._embeddingOptedOut === undefined) opts = { ...opts, _embeddingOptedOut: await factEmbeddingDisabled(engine) };
   // Named stages (src/core/search/hybrid/): request -> lexical arms ->
   // relational arm -> [keyword-only return] -> modality + expansion ->
   // vector arms -> [keyword fallback return] -> fusion + post-fusion boosts
@@ -1085,9 +1111,8 @@ export async function hybridSearch(
   // explicitly and only short-circuit when neither the text provider nor (for
   // multimodal-routed queries) the multimodal provider is reachable. Without
   // this guard a multimodal-only install would fall to keyword-only here and
-  // never run the image/unified vector path.
-  const multimodalProviderProbe =
-    cfgForColumn?.embedding_multimodal_model ?? 'voyage:voyage-multimodal-3';
+  // never run the image/unified vector path. Null when no configured model can embed images.
+  const multimodalProviderProbe = (await import('../ai/multimodal-model.ts')).multimodalEmbeddingModel();
   // The LLM intent tie-break (below) can escalate a regex-'text' query to
   // 'image'/'both'; account for that possibility so an ambiguous query on a
   // multimodal-only install still reaches the multimodal branch.
@@ -1100,17 +1125,19 @@ export async function hybridSearch(
       earlyModality === 'image' ||
       earlyModality === 'both' ||
       mayEscalateToMultimodal) &&
+    !opts?._embeddingOptedOut &&
+    multimodalProviderProbe !== null &&
     isAvailable('embedding', multimodalProviderProbe);
   // Hermetic eval canaries/CI: a caller-supplied queryEmbedFn produces the
   // vector-arm query embedding without the gateway, so provider
   // availability is irrelevant — skip the keyword-only short-circuit.
-  if (opts?.decide?.keywordOnly || (!opts?.queryEmbedFn && !isAvailable('embedding', providerProbe) && !willTryMultimodal)) {
+  if (opts?.decide?.keywordOnly || (!opts?.queryEmbedFn && (opts?._embeddingOptedOut || !isAvailable('embedding', providerProbe)) && !willTryMultimodal)) {
     return searchWithoutEmbeddings(req, lexical, relationalList, postFusionOpts, providerProbe);
   }
 
   const { effectiveModality, unifiedRouting, queries } = await resolveModalityAndQueries(req);
   const { vectorArms, queryEmbedding, imageQueryEmbedding, unifiedDone } =
-    await runVectorArms(req, { effectiveModality, unifiedRouting, queries, multimodalProviderProbe });
+    await runVectorArms(req, { effectiveModality, unifiedRouting, queries, multimodalProviderProbe: multimodalProviderProbe ?? cfgForColumn?.embedding_multimodal_model ?? 'voyage:voyage-multimodal-3' });
   if (vectorArms.length === 0) {
     return searchVectorFallback(req, lexical, relationalList, postFusionOpts);
   }
@@ -1128,6 +1155,7 @@ export async function hybridSearch(
 
   // Dedup
   const deduped = dedupResults(fused, dedupOpts);
+  opts?.explainTarget?.observe('deduped', deduped);
 
   // Auto-escalate: if detail=low returned 0, retry with high. The inner
   // call's onMeta fires with the escalated detail_resolved; do NOT also
@@ -1137,9 +1165,11 @@ export async function hybridSearch(
   }
 
   const { rerankPinned, relationalRerankPin } = await rerankAndPin(req, deduped, relationalList, effectiveModality);
+  opts?.explainTarget?.observe('reranked', rerankPinned);
   const { returnPool, adaptiveDecision, autocutDecision, relationalSlotDecision } = await sizeReturnPool(req, {
     rerankPinned, deduped, exactLookupOpts: lexical.exactLookupOpts, relationalList, effectiveModality,
   });
+  opts?.explainTarget?.observe('return_pool', returnPool);
   return finalizeHybridResults(req, returnPool, {
     relaxedDropped, adaptiveDecision, autocutDecision, relationalSlotDecision,
     relationalRerankPin, keywordArmConfidence, metadataBoostGate,
@@ -1176,6 +1206,7 @@ export async function hybridSearchCached(
   if (opts?.types?.length === 0) return [];
   const { modeInputForCache, resolvedForCache, knobsHash } = await resolveCacheSearchMode(engine, opts);
   const queryPrefix = opts?._queryPrefix ?? await loadEmbeddingQueryPrefix(engine);
+  const embeddingOptedOut = opts?._embeddingOptedOut ?? await factEmbeddingDisabled(engine);
   // Result caching is off (semanticResultCacheAvailable() === false): skip the
   // key/config setup entirely so the wrapper costs no round-trips of its own.
   const semanticCache = semanticResultCacheAvailable()
@@ -1196,8 +1227,10 @@ export async function hybridSearchCached(
   // opts._queryEmbedDeadline). On a stalled provider the cache-lookup embed
   // times out (→ cacheStatus 'disabled', fall through), then the inner embed
   // sees the already-elapsed budget and fails fast → keyword fallback. Worst
-  // case ~one timeout (~6s), comfortably under the CLI 10s force-exit.
-  const queryEmbedDl = makeQueryEmbedDeadline();
+  // case ~one timeout (~6s), comfortably under the CLI 10s force-exit. The
+  // budget starts at the first embed request (#6400), so lexical work and
+  // expansion before the vector arm don't spend it.
+  const queryEmbedDl = lazyQueryEmbedDeadline();
   if (semanticCache && !skipCache) {
     try {
       const { isAvailable } = await import('../ai/gateway.ts');
@@ -1206,12 +1239,12 @@ export async function hybridSearchCached(
       // 'embedding' column (skipCache short-circuits non-default above),
       // so this is the default embeddingModel — but threading it keeps
       // the provider probe consistent with the bare hybridSearch path.
-      if (isAvailable('embedding', semanticCache.providerProbe)) {
+      if (!embeddingOptedOut && isAvailable('embedding', semanticCache.providerProbe)) {
         // v0.35.0.0+: query-side embedding (cache lookup path).
         // v0.42.20.0 (Fix 3) — bounded by the shared deadline; on timeout this
         // throws → caught below → cacheStatus 'disabled' → falls through to the
         // inner hybridSearch (which reuses the same elapsed deadline).
-        queryEmbedding = await embedQueryBounded(query, queryPrefix ? { queryPrefix } : undefined, queryEmbedDl);
+        queryEmbedding = await embedQueryBounded(query, queryPrefix ? { queryPrefix } : undefined, queryEmbedDl());
       } else {
         cacheStatus = 'disabled';
       }
@@ -1238,6 +1271,7 @@ export async function hybridSearchCached(
     // doesn't start a fresh 6s budget after the cache-lookup already spent it.
     _queryEmbedDeadline: queryEmbedDl,
     _queryPrefix: queryPrefix,
+    _embeddingOptedOut: embeddingOptedOut,
     // #2952 — classify this search's telemetry record (emitted by the inner
     // function) with the cache-consult outcome. 'hit' already returned above,
     // so only miss/disabled reach this call.
@@ -1420,29 +1454,39 @@ export function filterResultsByCallerScope(
 export function rrfFusionWeighted(
   lists: FusionListEntry[],
   applyBoost: boolean | number = true,
+  attribute = false,
 ): SearchResult[] {
   const entries = accumulateRrf(lists);
   if (entries.length === 0) return [];
 
+  // Explain attribution (score_details): the raw summed vote, the normalized
+  // score and the compiled-truth factor, stamped once per fused row.
+  const attribution = new Map<RrfEntry, RrfAttribution>();
   const maxScore = Math.max(...entries.map(e => e.score));
   if (maxScore > 0) {
     for (const e of entries) {
+      const raw = e.score;
       e.score = e.score / maxScore;
       // issue #160 + #3695: unverified stubs and synthetic chunkless title
       // rows never get the compiled-truth authority boost. Numeric = factor.
       const boost = typeof applyBoost === 'number'
         ? compiledTruthBoost(e.result, true, applyBoost)
         : compiledTruthBoost(e.result, applyBoost);
+      attribution.set(e, { raw, normalized: e.score, compiled_truth_boost: boost, arms: e.arms });
       e.score *= boost;
     }
   }
 
   return entries
     .sort((a, b) => b.score - a.score || b.own - a.own)
-    .map(({ result, score, keywordHit }) =>
-      keywordHit && result.keyword_hit !== true
-        ? { ...result, score, keyword_hit: true }
-        : { ...result, score });
+    .map((e) => {
+      const { result, score, keywordHit } = e;
+      // Stamped only for explain callers, so ordinary rows stay byte-identical.
+      const rrf = attribute ? { rrf: attribution.get(e) ?? { raw: e.score, normalized: e.score, compiled_truth_boost: 1, arms: e.arms } } : {};
+      return keywordHit && result.keyword_hit !== true
+        ? { ...result, score, keyword_hit: true, ...rrf }
+        : { ...result, score, ...rrf };
+    });
 }
 
 /**
@@ -1508,6 +1552,7 @@ export async function cosineReScore(
   queryEmbedding: Float32Array,
   column: string = 'embedding',
   imageSpace?: { queryEmbedding: Float32Array; column: string },
+  attribute = false,
 ): Promise<SearchResult[]> {
   // 'both' mode: image-arm rows live in the image space (image column,
   // multimodal query vector); everything else in the text space.
@@ -1565,7 +1610,7 @@ export async function cosineReScore(
 
     // v0.46.15: stamp the raw cosine — evidence + --explain read it (the
     // hydration map is already paid for; zero extra probes).
-    return { ...r, score: blended, cosine };
+    return { ...r, score: blended, cosine, ...(attribute ? { blend_norm_rrf: normRrf } : {}) };
   }).sort((a, b) => b.score - a.score);
 }
 

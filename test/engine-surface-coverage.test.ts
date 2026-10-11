@@ -37,7 +37,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { configureGateway } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 const DIM = 1536;
 
@@ -50,7 +50,7 @@ const INTERFACE_METHODS: readonly string[] = [
   // Lifecycle
   'connect', 'disconnect', 'reconnect', 'initSchema', 'transaction', 'transactionDirect', 'registerBeforeDisconnect', 'withReservedConnection',
   // Pages CRUD
-  'getPage', 'readPageSnapshot', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
+  'getPage', 'readPageSnapshot', 'readPageSnapshotsBatch', 'lockPageKeys', 'putPage', 'findDuplicatePage', 'findDuplicatePages', 'deletePage', 'deletePages', 'resolveSlugsByPaths',
   'softDeletePage', 'softDeletePages', 'restorePage', 'purgeDeletedPages', 'listPages', 'resolveSlugs', 'getAllSlugs',
   'listAllPageRefs', 'listAllSources', 'updateSourceConfig', 'listPrefixSampledPages', 'listCorpusSample',
   // Search
@@ -62,8 +62,8 @@ const INTERFACE_METHODS: readonly string[] = [
   // Extraction watermark
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
   // Links + graph
-  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
-  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
+  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'replaceDerivedLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
+  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'relationalChainHop', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
   // Tags
@@ -87,7 +87,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'getContradictionCacheEntry', 'putContradictionCacheEntry', 'sweepContradictionCache',
   // Facts (hot memory)
   'insertFact', 'insertFacts', 'deleteFactsForPage', 'expireFact', 'listFactsByEntity',
-  'listFactsSince', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
+  'listFactsSince', 'listFactsKeyset', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
   'findCandidateDuplicates', 'consolidateFact', 'findTrajectory', 'getFactsHealth',
   // Versions
   'createVersion', 'getVersions', 'revertToVersion',
@@ -131,6 +131,9 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'codeEdgesDeps',
   // refactor wave 1 C9: per-call engine-sql executor getter (EO1).
   'engineSql',
+  // Engine graduation: PGLite close/open that keeps the kernel lock across the custody window.
+  'closeRetainingLock',
+  'connectWithHeldLock',
 ];
 
 /**
@@ -353,6 +356,7 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
 
   afterAll(async () => {
     await engine.disconnect();
+    resetGateway(); // R5: restore the preload baseline for later files in this shard
   });
 
   test('kind discriminator (readonly instance property, not on the prototype)', () => {

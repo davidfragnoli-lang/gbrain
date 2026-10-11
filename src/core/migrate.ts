@@ -1,6 +1,7 @@
 import type { BrainEngine } from './engine.ts';
 import type { Migration } from './schema-migrations/types.ts';
 import { MIGRATIONS } from './schema-migrations/registry.generated.ts';
+import { hasPendingMigrations } from './migrate-pending.ts';
 import { setQuietMigrationNotices } from './schema-migrations/helpers.ts';
 // runMigrations executes while an initialized engine is live. Keep its helper
 // modules in the static graph rather than importing them from async handlers.
@@ -9,6 +10,7 @@ import {
   isRetryableConnError,
 } from './retry-matcher.ts';
 import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
+import { resumePageRevisionBackfill } from './page-state/revision-backfill-schema.ts';
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
 import { repairLinkSourceCheck, LINK_SOURCE_GATE_MIGRATION_VERSION } from './link-source-check-repair.ts';
 
@@ -240,35 +242,11 @@ async function runMigrationSQL(
         // Falling through means the DDL runs with the server default.
       }
       await conn.executeRaw(sql);
-    });
+    }, { selfContained: true });
   }
 }
 
-/**
- * Cheap probe: does this engine have schema migrations pending?
- *
- * Reads the `version` config row in a single round-trip (no schema replay,
- * no migration apply). Used by `connectEngine` to gate `initSchema()` so
- * short-lived CLI invocations on already-migrated brains don't pay the
- * full bootstrap-probe + SCHEMA_SQL replay + ledger-check cost on every
- * `gbrain stats` / `gbrain query` / `gbrain doctor`.
- *
- * Defensive: treats a getConfig failure (config table missing, query error)
- * as "yes pending" so the caller falls through to the full initSchema path.
- * Worst case on a wedged brain is one extra schema replay — same as before.
- *
- * Closes #651 in cooperation with the post-upgrade auto-apply hook (X1)
- * without the perf cost #652 would have introduced on every CLI call.
- */
-export async function hasPendingMigrations(engine: BrainEngine): Promise<boolean> {
-  try {
-    const currentStr = await engine.getConfig('version');
-    const current = parseInt(currentStr || '1', 10);
-    return current < LATEST_VERSION;
-  } catch {
-    return true;
-  }
-}
+export { hasPendingMigrations };
 
 /**
  * v0.41.6.0 D4 — race-tolerant CLI-side migration runner.
@@ -464,7 +442,9 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     }
   }
 
+  const backfill = () => resumePageRevisionBackfill(engine).catch(e => console.error(`[migrate] page revision backfill paused (#5216): ${e instanceof Error ? e.message : String(e)}`));
   if (pending.length === 0) {
+    await backfill();
     return { applied: 0, current };
   }
 
@@ -519,7 +499,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     // covers every exit path from here on (incl. the pre-flight probe).
     setQuietMigrationNotices(false);
   }
-
+  await backfill();
   return { applied, current: LATEST_VERSION };
 }
 

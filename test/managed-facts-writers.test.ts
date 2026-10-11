@@ -39,6 +39,7 @@ import { runLoopsExtract } from '../src/core/google/loops-extract.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { testBackends } from './helpers/test-backends.ts';
 
 const backends = testBackends();
@@ -297,6 +298,29 @@ test('managed bulk conversation extraction writes its facts and terminal audit r
   });
 }, 120_000);
 
+test('managed conversation extraction honors facts.default_visibility=world on extracted rows; both audit rows stay private', async () => {
+  const single = `---\ntitle: Single message\ntype: conversation\n---\n**Alice Example** (2024-03-15 9:00 AM): Only one message here.\n`;
+  await managed(async ({ put }) => {
+    await put('conversations/synthetic-chat', CONVERSATION);
+    await put('conversations/single-message', single);
+  }, async ({ engine, sourceId }) => {
+    await engine.setConfig('facts.default_visibility', 'world');
+    try {
+      const result = await runExtractConversationFactsCore(engine, { sourceId, overrideDisabled: true, extractor, types: ['conversation'] });
+      expect(result).toMatchObject({ facts_inserted: 1, pages_marked_non_extractable: 1, pages_failed: 0 });
+      const rows = await engine.executeRaw<{ slug: string; source: string; visibility: string }>(
+        'SELECT source_markdown_slug AS slug, source, visibility FROM facts WHERE source_id=$1 ORDER BY source_markdown_slug, row_num', [sourceId]);
+      expect(rows).toEqual([
+        { slug: 'conversations/single-message', source: 'cli:extract-conversation-facts:non-extractable:v2', visibility: 'private' },
+        { slug: 'conversations/synthetic-chat', source: 'cli:extract-conversation-facts', visibility: 'world' },
+        { slug: 'conversations/synthetic-chat', source: 'cli:extract-conversation-facts:terminal:v2', visibility: 'private' },
+      ]);
+    } finally {
+      await engine.unsetConfig('facts.default_visibility');
+    }
+  });
+}, 120_000);
+
 test('managed conversation extraction preserves the prior batch when a replacement extraction fails', async () => {
   const slug = 'conversations/synthetic-chat';
   await managed(async ({ engine, sourceId, put }) => {
@@ -477,7 +501,7 @@ test('managed deleted-page expiry waits for a concurrent restore of that page (P
     await put('people/bob-demo', PERSON('Bob Demo', FENCE('| 1 | Plays chess | fact | 1.0 | world | low | 2019-01-01 |  | chat |  |')));
   }, async ({ engine, sourceId }) => {
     if (engine.kind !== 'postgres') return;
-    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage('people/bob-demo', { sourceId })));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage('people/bob-demo', { sourceId }), TEST_WRITE_ATTRIBUTION));
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     let locked!: () => void;
@@ -487,7 +511,7 @@ test('managed deleted-page expiry waits for a concurrent restore of that page (P
       await tx.executeRaw('UPDATE pages SET deleted_at=NULL WHERE source_id=$1 AND slug=$2', [sourceId, 'people/bob-demo']);
       locked();
       await gate;
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     await holding;
     const run = runExtractFacts(engine, { sourceId, slugs: [] });
     await new Promise(resolve => setTimeout(resolve, 500));

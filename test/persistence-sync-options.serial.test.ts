@@ -593,6 +593,8 @@ function matchesSyncBarrier(boundary: SyncBarrier, sql: string, params: unknown[
   if (boundary === 'freeze') return sql.startsWith('SELECT id,slug,source_path FROM pages WHERE source_id=') && !transactional;
   if (boundary === 'request-lookup') return sql.startsWith('SELECT') && sql.includes('FROM persistence_requests') && sql.includes('request_id=') && !transactional;
   if (boundary === 'admission-commit') return sql.includes('UPDATE persistence_counters SET outstanding_count=outstanding_count+1');
+  // A won cursor swap is the saved cursor (#5984 feeder, no read-back): the freeze transaction's last statement is its manifest touch.
+  if (boundary === 'freeze-commit') return transactional && sql === 'UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2' && params?.[0] === 'managed-sync-manifest';
   return transactional && sql === 'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2' && params?.[0] === 'managed-sync';
 }
 
@@ -684,7 +686,10 @@ for (const boundary of ['retry-discovery', 'retry-commit', 'missing-manifest', '
   if (boundary !== 'completed-cleanup') {
     writeFileSync(join(f.root, 'records/example-0.md'), '---\ntitle: [broken\n---\nSynthetic invalid document.\n');
     f.git.commitAll('Add synthetic failed import');
-    expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' });
+    // #5988: sync holds unreadable YAML by default; sync.holds=fail keeps the failed receipt this retry path needs.
+    await engine.setConfig('sync.holds', 'fail');
+    try { expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' }); }
+    finally { await engine.unsetConfig('sync.holds'); }
     writeFileSync(join(f.root, 'records/example-0.md'), body);
     f.git.commitAll('Repair synthetic failed import');
   } else expect(await performSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 1 });

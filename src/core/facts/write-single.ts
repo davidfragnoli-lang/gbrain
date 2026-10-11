@@ -24,6 +24,10 @@
  */
 
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { recordTaintEdges } from '../trust/taint.ts';
+import type { TaintInput, WriteTrust } from '../trust/tier.ts';
+import { recordFlaggedRow, type GatedRowDecision } from '../write-gate-store.ts';
 
 const DEDUP_THRESHOLD = 0.95;
 const DEDUP_CANDIDATE_LIMIT = 5;
@@ -60,6 +64,10 @@ export interface SingleFactInput {
   validUntil?: Date | null;
   sessionId?: string | null;
   confidence?: number;
+  /** #5575 I2: a deriver's taint (e.g. loops extraction from an email page); the new row gets its tier and input edges. */
+  derivation?: { trust: WriteTrust; inputs: readonly TaintInput[] };
+  /** #5575 B3: the caller's write-gate decision (an `insert`); a flag records its receipt on the new row. */
+  gate?: GatedRowDecision;
 }
 
 export interface SingleFactResult {
@@ -114,7 +122,8 @@ export async function writeSingleFact(
   let embedding: Float32Array | null = null;
   let embeddingModel: string | null = null;
   let degradedDedup = false;
-  if (isAvailable('embedding')) {
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  if (!await factEmbeddingDisabled(engine) && isAvailable('embedding')) {
     try {
       embeddingModel = getEmbeddingModel();
       embedding = await embedOne(factText, { embeddingModel, inputType: 'document' });
@@ -127,11 +136,13 @@ export async function writeSingleFact(
 
   if (managed) {
     // The coordinator's fact intent owns dedup, supersession, the fence row and
-    // the file on a managed brain; the legacy direct writes stay unmanaged.
+    // the file on a managed brain; the legacy direct writes stay unmanaged. An
+    // entity with no page keeps its resolver slug database-only, as the
+    // unmanaged path stores it, so dedup is per entity.
     const { publishManagedEntityFacts } = await import('./managed-fact-write.ts');
     const written = await publishManagedEntityFacts(engine, sourceId, resolvedSlug, [{ fact: factText, kind, notability: 'medium',
       source: input.provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
-      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true });
+      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true, attributeFallback: true, derivation: input.derivation });
     const [stored] = await engine.executeRaw<{ entity_slug: string | null }>('SELECT entity_slug FROM facts WHERE id=$1', [written.ids[0]]);
     return { id: written.ids[0], status: written.superseded ? 'superseded' : written.inserted ? 'inserted' : 'duplicate', entity_slug: stored?.entity_slug ?? null,
       valid_until: validUntil, degraded_dedup: degradedDedup };
@@ -209,11 +220,14 @@ export async function writeSingleFact(
           embedding,
           embedding_model: embedding ? embeddingModel : null,
           sessionId: input.sessionId ?? null,
+          ...(input.gate ? { gate: input.gate } : {}),
         },
       ],
+      input.derivation,
     );
 
     if (result.fenceWriteFailed) {
+      if (result.fenceRefusal) throw result.fenceRefusal;
       // Parse-validate rejected the .tmp (quarantined). Hard failure — do NOT
       // fall through to a DB row whose fence is broken (pipeline policy).
       throw new Error(
@@ -245,10 +259,15 @@ export async function writeSingleFact(
     // tree unusable) → DB-only path below.
   }
 
-  const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
-    source_id: sourceId,
-    ...(supersedeId !== null ? { supersedeId } : {}),
-  });
+  const inserted = await maintenanceTransaction(engine, async tx => {
+    const row = await tx.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
+      source_id: sourceId,
+      ...(supersedeId !== null ? { supersedeId } : {}),
+    });
+    if (row.status !== 'duplicate' && input.derivation) await recordTaintEdges(tx, { table: 'facts', id: row.id, sourceId }, input.derivation.inputs);
+    if (row.status !== 'duplicate' && input.gate) await recordFlaggedRow(tx, input.gate, { table: 'facts', id: row.id, sourceId });
+    return row;
+  }, input.derivation?.trust);
 
   return {
     id: inserted.id,
@@ -283,7 +302,7 @@ async function expireSuperseded(engine: BrainEngine, oldId: number, newId: numbe
     report('fence strike', err);
   }
   try {
-    await engine.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]);
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]));
   } catch (err) {
     report('superseded_by link', err);
   }

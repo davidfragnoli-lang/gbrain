@@ -3,7 +3,7 @@
  *
  * gbrain's CLI_ONLY commands read flags ad hoc (`args.includes('--force')`,
  * per-command parseFlags helpers), so there is no parser to make strict. The
- * pre-dispatch validator in src/cli.ts needs to know each command's legal
+ * pre-dispatch validator in src/cli/main.ts needs to know each command's legal
  * flags; this script derives them from the source instead of a hand-typed
  * list that would rot.
  *
@@ -11,7 +11,7 @@
  * its dispatch text: the record's module under src/cli/commands/ (the former
  * `case 'X':` / plain `if (command === 'X')` body, moved verbatim in refactor
  * wave 1) plus every block of the explicit handleCliOnly pipeline in
- * src/cli.ts (handleCliOnly and its @cliPipelineStage functions, see
+ * src/cli/main.ts (handleCliOnly and its @cliPipelineStage functions, see
  * scripts/lib/cli-pipeline.ts) segmented on its dispatch markers — every
  * `if (command === 'X' …)` head, plain or compound, and `case 'X':` labels (see
  * segmentDispatchBlocks). Collect every `import('…/commands/Y.ts')` in that
@@ -52,8 +52,24 @@ const EXTRA_FLAGS: Record<string, string[]> = {
   embed: ['--pace', '--pace-max-concurrency'],
   // sync shares the same pace surface via env/config plus CLI passthrough.
   sync: ['--pace', '--pace-max-concurrency'],
-  // Deferred persistence routing reaches runForget in recall.ts two levels deep.
-  forget: ['--reason', '--request-id'],
+  // Deferred persistence routing reaches runForget in recall.ts two levels deep;
+  // `forget --purge` hands off from there to src/commands/forget-purge.ts.
+  forget: ['--reason', '--request-id', '--purge', '--dry-run', '--yes', '--match', '--status', '--vacuum', '--all-subjects'],
+};
+
+/**
+ * Command modules a command hands its argv to through a nested handler import,
+ * scanned at module depth so their safety-flag reads count as consumption
+ * evidence. Their own imports are not walked. Keep commented.
+ */
+const DELEGATED_MODULES: Record<string, string[]> = {
+  // `auth local-writer list|register|revoke` passes its argv to
+  // runPersistenceAdminCli (#5595), and `auth rescope-client|rescope-token` to
+  // parseRescopeGrantArgs; both parse --dry-run themselves.
+  auth: ['src/commands/persistence-admin.ts', 'src/core/grants/cli.ts'],
+  // `forget --purge` (and forget --help) hand the argv to runForgetPurge, which
+  // parses --dry-run itself; a plain forget refuses --dry-run (recall.ts).
+  forget: ['src/commands/forget-purge.ts'],
 };
 
 /**
@@ -65,9 +81,12 @@ const EXTRA_FLAGS: Record<string, string[]> = {
  * builds the INTERNAL `jobs run-child` argv (`--job-id`, `--allow-shell-jobs`):
  * those literals are what a worker passes to its child, not flags an importer
  * parses — autopilot imports it only to resolve the child CLI, and `jobs`
- * declares both flags in its own source.
+ * declares both flags in its own source. strict-args.ts is the strict-argument
+ * table for several commands' destructive subcommands (#6114): its literals
+ * belong to pages, cache, schema, integrity and search, each of which reads
+ * its own flags in its own source.
  */
-const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts'];
+const EXCLUDED_MODULES = ['thin-client-routing.ts', 'persistence-delegate.ts', 'job-isolation.ts', 'strict-args.ts'];
 
 function isExcludedModule(p: string): boolean {
   // Basename comparison is path-separator agnostic: on Windows p ends in
@@ -331,6 +350,26 @@ export function segmentDispatchBlocks(fnSrc: string): Map<string, string> {
 
 /** @param root repository root; a fixture tree in tests (test/cli-synthetic-command.test.ts). */
 export function buildFlagRegistry(root: string = ROOT): Record<string, string[]> {
+  return buildFlagArtifacts(root).registry;
+}
+
+/**
+ * A1 render-time routing pin (src/core/fix-routing.ts): the routing flags a
+ * fix naming each CLI-only command carries. Acceptance alone is not evidence
+ * (every command accepts `--brain`/`--source` through UNIVERSAL_FLAGS), so:
+ * - `--brain` when the command opens its brain through the connect terminator
+ *   (phase other than `pre-connect`), or its own code reads the global brain
+ *   option;
+ * - `--source` when the record declares `routes_source` (its source resolves
+ *   through the ambient chain). The declaration needs consumption evidence (the
+ *   tight-quoted `'--source'` literal in the command's own code, the
+ *   SAFETY_FLAGS rule); a declaration without it fails the generator.
+ */
+export function buildRoutingFlags(root: string = ROOT): Record<string, string[]> {
+  return buildFlagArtifacts(root).routing;
+}
+
+function buildFlagArtifacts(root: string): { registry: Record<string, string[]>; routing: Record<string, string[]> } {
   // CLI_ONLY membership: one record per command in the command table
   // (src/cli/command-table.ts), read by AST so the generator never executes
   // the table.
@@ -338,7 +377,7 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
   const commands = records.map(r => r.name);
 
   // Dispatch text per command, from two sources (refactor wave 1, W4 cli):
-  //  1. the explicit handleCliOnly pipeline in src/cli.ts: handleCliOnly and
+  //  1. the explicit handleCliOnly pipeline in src/cli/main.ts: handleCliOnly and
   //     every @cliPipelineStage function it calls, each segmented on its own
   //     (bounded at the function, so no function's tail bleeds into the next;
   //     unbounded, the LAST block once absorbed every --flag literal in the
@@ -348,10 +387,10 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
   // Import specifiers resolve relative to the file the text came from.
   const blocks = new Map<string, Array<{ text: string; dir: string }>>();
   const addBlock = (label: string, text: string, dir: string) => blocks.set(label, [...(blocks.get(label) ?? []), { text, dir }]);
-  const pipeline = flattenCliPipeline(parseSource(root, 'src/cli.ts'));
+  const pipeline = flattenCliPipeline(parseSource(root, 'src/cli/main.ts'));
   for (const fn of [pipeline.entry, ...pipeline.stages]) {
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator over this repository's own source tree; every joined segment is a constant module name or a path the generator itself discovered under ROOT
-    for (const [label, text] of segmentDispatchBlocks(fn.getText())) addBlock(label, text, join(root, 'src'));
+    for (const [label, text] of segmentDispatchBlocks(fn.getText())) addBlock(label, text, join(root, 'src', 'cli'));
   }
   for (const record of records) {
     const mod = record.loadSpecifier ? readCommandModule(root, record.loadSpecifier) : null;
@@ -381,6 +420,7 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);
 
   const registry: Record<string, string[]> = {};
+  const routing: Record<string, string[]> = {};
   for (const command of commands) {
     const parts = blocks.get(command) ?? [];
     const flags = new Set<string>(UNIVERSAL_FLAGS);
@@ -428,6 +468,14 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
       }
     }
 
+    for (const rel of DELEGATED_MODULES[command] ?? []) {
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator over this repository's own source tree; every joined segment is a constant module path from DELEGATED_MODULES
+      const path = join(root, rel);
+      if (!existsSync(path)) continue;
+      const code = stripComments(readSrc(path));
+      depthZeroText += code;
+      for (const f of flagsInText(code)) { flags.add(f); depthZero.add(f); }
+    }
     for (const f of EXTRA_FLAGS[command] ?? []) { flags.add(f); depthZero.add(f); }
     for (const f of SAFETY_FLAGS) {
       if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
@@ -436,15 +484,25 @@ export function buildFlagRegistry(root: string = ROOT): Record<string, string[]>
       if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
     }
     registry[command] = [...flags].sort();
+    const record = records.find(r => r.name === command);
+    if (record?.routesSource && !consumes(depthZeroText, '--source')) {
+      throw new Error(`generate-flag-registry: ${command} declares routes_source but its code never reads '--source'`);
+    }
+    const routed = [
+      ...(record?.phase !== 'pre-connect' || /getCliOptions\(\)\.brain|cliOpts\.brain/.test(depthZeroText) ? ['--brain'] : []),
+      ...(record?.routesSource ? ['--source'] : []),
+    ];
+    if (routed.length) routing[command] = routed;
   }
-  return registry;
+  return { registry, routing };
 }
 
-export function renderRegistryModule(registry: Record<string, string[]>): string {
-  const entries = Object.keys(registry)
+export function renderRegistryModule(registry: Record<string, string[]>, routing: Record<string, string[]> = {}): string {
+  const render = (map: Record<string, string[]>) => Object.keys(map)
     .sort()
-    .map(cmd => `  '${cmd}': [${registry[cmd].map(f => `'${f}'`).join(', ')}],`)
+    .map(cmd => `  '${cmd}': [${map[cmd].map(f => `'${f}'`).join(', ')}],`)
     .join('\n');
+  const entries = render(registry);
   return `// AUTO-GENERATED by scripts/generate-flag-registry.ts — do not edit by hand.
 // Regenerate: bun run build:flag-registry
 // Freshness + drift pinned by test/cli-flag-validation.test.ts (#2185).
@@ -463,13 +521,21 @@ export function renderRegistryModule(registry: Record<string, string[]>): string
 export const CLI_FLAG_REGISTRY: Record<string, readonly string[]> = {
 ${entries}
 };
+
+// Routing flags a fix naming each CLI-only command carries (A1 render-time pin,
+// src/core/fix-routing.ts): '--brain' when the command opens its brain (not a
+// pre-connect command, or its code reads the global brain option); '--source'
+// when the command-table record declares routes_source (consumption-checked).
+export const CLI_ROUTING_FLAGS: Record<string, readonly string[]> = {
+${render(routing)}
+};
 `;
 }
 
 if (import.meta.main) {
-  const registry = buildFlagRegistry();
+  const { registry, routing } = buildFlagArtifacts(ROOT);
   const outPath = join(ROOT, 'src/core/cli-flag-registry.generated.ts');
-  writeFileSync(outPath, renderRegistryModule(registry));
+  writeFileSync(outPath, renderRegistryModule(registry, routing));
   const n = Object.keys(registry).length;
   const total = Object.values(registry).reduce((a, v) => a + v.length, 0);
   console.log(`wrote ${outPath} (${n} commands, ${total} flag entries)`);

@@ -23,6 +23,12 @@ export interface DoctorEntry {
   name: string;
   /** Every check name `run` can push, categorized in src/core/doctor-categories.ts. */
   emits: readonly string[];
+  /**
+   * Names a pre-gate entry only emits with a connected engine (#6303). `--only`
+   * of one of them connects the engine; test/doctor-only-engine-checks.test.ts
+   * fails when an engine-only name is not declared.
+   */
+  engineChecks?: readonly string[];
   run(ctx: DoctorContext): Promise<Check[] | typeof STOP_DOCTOR>;
 }
 
@@ -47,6 +53,8 @@ export interface DoctorContext {
   schemaVersion: number;
   /** Written by the connection entry when `getStats` fails; the next entry stops the run. */
   connectionFailed: boolean;
+  /** `--only <check>[,…]`: run only the entries that emit these checks (plus the connection lane). */
+  only?: ReadonlySet<string> | null;
 }
 
 /**

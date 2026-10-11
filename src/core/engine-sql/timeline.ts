@@ -22,6 +22,7 @@ import { privatePagesFilterFragment, privateTimelineEventFilterFragment } from '
 import { PageMissingError } from '../engine-errors.ts';
 import type { SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
+import { projectionEligibleSql } from '../eligibility/sql.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
 
 export async function addTimelineEntry(
@@ -106,12 +107,21 @@ export async function getTimeline(exec: LegacyUnscopedRead, slug: string, opts?:
           : sqlFragment``;
     const afterCond = opts?.after ? sqlFragment`AND te.date >= ${opts.after}::date` : sqlFragment``;
     const beforeCond = opts?.before ? sqlFragment`AND te.date <= ${opts.before}::date` : sqlFragment``;
+    // Cat7-1: no index leads with slug, so an unscoped `p.slug = $1` scans all
+    // of pages_source_slug_key whenever statistics steer the planner to drive
+    // from pages. The unscoped arm probes (source_id, slug) once per source
+    // instead, in a LATERAL fenced with OFFSET 0 so no plan can reorder it.
+    const pagesJoin = opts?.sourceIds?.length || opts?.sourceId
+      ? sqlFragment`timeline_entries te JOIN pages p ON p.id = te.page_id`
+      : sqlFragment`sources s
+      CROSS JOIN LATERAL (SELECT * FROM pages WHERE source_id = s.id AND slug = ${slug} OFFSET 0) p
+      JOIN timeline_entries te ON te.page_id = p.id`;
     const rows = (await exec.run(sqlFragment`
-      SELECT te.* FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+      SELECT te.* FROM ${pagesJoin}
       WHERE p.slug = ${slug} ${sourceCond} ${afterCond} ${beforeCond}
         ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}
-          AND ${privateTimelineEventFilterFragment('te')}`) : sqlFragment``}
-      ORDER BY te.date DESC LIMIT ${limit}`)).rows;
+          AND ${privateTimelineEventFilterFragment('te')}`) : sqlFragment``}${opts?.eligibility ? sqlFragment` AND ${trustedSql(projectionEligibleSql('timeline_entries', 'te', opts.eligibility))}` : sqlFragment``}
+      ORDER BY te.date DESC, te.id DESC LIMIT ${limit}`)).rows;
     return rows as unknown as TimelineEntry[];
   }
 

@@ -233,7 +233,9 @@ describe('doctor command', () => {
         } as any);
         expect(check.status).toBe('warn');
         expect(check.message).toContain('budget/pricing');
-        expect(check.message).toContain('embedding-pricing.ts');
+        // E1: the fix registers the rate with `gbrain pricing set`, never an edit to gbrain's source.
+        expect(check.message).not.toContain('embedding-pricing.ts');
+        expect(check.fix).toMatchObject({ argv: expect.arrayContaining(['gbrain', 'pricing', 'set']) });
         expect(check.message).toContain('--max-cost');
       });
     } finally {
@@ -822,8 +824,8 @@ describe('v0.31.8 — wedge migration force-retry hint (D19)', () => {
 describe('v0.32.4 — sync_freshness check', () => {
   // Stub engine: only checkSyncFreshness's executeRaw matters. Per-case rows
   // shape is `{id, name, local_path, last_sync_at}`.
-  function makeStubEngine(rows: any[]): any {
-    return { executeRaw: async () => rows };
+  function makeStubEngine(rows: any[], managed = false): any {
+    return { executeRaw: async (sql: string) => (sql.includes('FROM persistence_brain') ? [{ enabled: managed }] : rows) };
   }
 
   function agoMs(ms: number): Date {
@@ -847,6 +849,16 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toContain('never been synced');
     expect(result.message).toContain(`'wiki'`); // source.id embedded
     expect(result.message).toContain('gbrain sync --source <id>');
+  });
+
+  test('#5477: a managed brain is told to sync with --no-pull; unmanaged wording is unchanged', async () => {
+    const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
+    const rows = [{ id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: null }];
+    const unmanaged = await checkSyncFreshness(makeStubEngine(rows));
+    expect(unmanaged.message).toBe("Source 'wiki' has never been synced. Run `gbrain sync --source <id>` for each stale source");
+    const managed = await checkSyncFreshness(makeStubEngine(rows, true));
+    expect(managed.status).toBe('fail');
+    expect(managed.message).toBe("Source 'wiki' has never been synced. Run `gbrain sync --source <id> --no-pull` for each stale source");
   });
 
   test('last_sync_at > 72h ago → fail with day-rounded "Nd ago"', async () => {
@@ -996,8 +1008,8 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });
@@ -1248,8 +1260,8 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });
@@ -1919,8 +1931,8 @@ describe('sync_freshness — clone-unavailable content-lag fallback', () => {
   beforeEach(async () => {
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
-    const { CHUNKER_VERSION } = await import('../src/core/chunkers/code.ts');
-    currentChunkerVersion = String(CHUNKER_VERSION);
+    const { chunkerStamp } = await import('../src/core/chunkers/code.ts');
+    currentChunkerVersion = chunkerStamp();
     _setGitHeadProbeForTests(null);
     _setGitCleanProbeForTests(null);
   });

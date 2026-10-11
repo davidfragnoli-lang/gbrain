@@ -19,6 +19,8 @@ import { execFileSync } from 'child_process';
 import { lstatSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { isInternalUrl } from './url-safety.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
+import { gitChildEnv } from './git-env.ts';
 
 /**
  * Git CLI accepts two flag positions:
@@ -249,7 +251,7 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts.timeoutMs ?? 600_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: gitChildEnv({ ...GIT_ENV }),
     });
   } catch (e) {
     throw new GitOperationError(
@@ -266,23 +268,41 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
  * GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1 escape hatch reaches sync's pull —
  * self-hosted local-filesystem remotes could clone but never pull. Default
  * stays `never`; the origin was already validated at clone time.
+ *
+ * Runs asynchronously so the caller's event loop stays live while git waits
+ * on the remote: --timeout timers, signal handlers and job-lease renewals keep
+ * firing. The child is stopped when `opts.signal` aborts or after
+ * `opts.timeoutMs` (default 5 min); `isStoppedGitPull` recognizes the error
+ * that produces, so callers can tell "we stopped it" from "git failed".
  */
-export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): void {
+export async function pullRepo(repoPath: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<void> {
   assertManagedFilesystemWrite(repoPath);
-  const args: string[] = ['-C', repoPath, ...durableSsrfFlags(), 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
-  try {
-    execFileSync('git', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: opts.timeoutMs ?? 300_000,
-      env: { ...process.env, ...GIT_ENV },
-    });
-  } catch (e) {
-    throw new GitOperationError(
-      'pull',
-      `git pull failed in ${repoPath}: ${gitErrorDetail(e)}`,
-      e,
-    );
-  }
+  const argv = ['-C', repoPath, ...durableSsrfFlags(), 'pull', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--ff-only'];
+  const run = await execFileBounded('git', argv, {
+    timeout: opts.timeoutMs ?? 300_000,
+    env: gitChildEnv({ ...GIT_ENV }),
+    signal: opts.signal,
+  });
+  if (!run.error) return;
+  // execFile hands stderr back beside the error rather than on it, so lead
+  // with it here to keep the #1315 stderr-first message.
+  const reason = run.stderr.trim() || run.error.message;
+  throw new GitOperationError('pull', `git pull failed in ${repoPath}: ${reason}`, run.error);
+}
+
+/**
+ * Whether a `pullRepo` rejection means the pull was stopped (its deadline
+ * passed, its signal aborted, or something outside sent git SIGTERM) rather
+ * than git reporting a failure. GitOperationError keeps the subprocess error
+ * as `cause`, so the stop markers are read there: `code` ETIMEDOUT/ABORT_ERR
+ * or `signal` SIGTERM.
+ */
+export function isStoppedGitPull(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause === null || typeof cause !== 'object') return false;
+  const { code, signal } = cause as { code?: unknown; signal?: unknown };
+  return code === 'ETIMEDOUT' || code === 'ABORT_ERR' || signal === 'SIGTERM';
 }
 
 /**
@@ -301,7 +321,7 @@ export function fetchRemote(repoPath: string, branch: string, opts: { timeoutMs?
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts.timeoutMs ?? 30_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: gitChildEnv({ ...GIT_ENV }),
     });
   } catch (e) {
     throw new GitOperationError(
@@ -345,7 +365,7 @@ export function validateRepoState(
     const out = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: gitChildEnv({ ...GIT_ENV }),
     });
     remoteUrl = out.toString().trim();
   } catch {
@@ -360,7 +380,7 @@ export function validateRepoState(
         execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-dir'], {
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 10_000,
-          env: { ...process.env, ...GIT_ENV },
+          env: gitChildEnv({ ...GIT_ENV }),
         });
         return 'healthy';
       } catch {
@@ -390,7 +410,7 @@ export function isInsideGitRepo(path: string): boolean {
     execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: gitChildEnv({ ...GIT_ENV }),
     });
     return true;
   } catch {
@@ -415,7 +435,7 @@ function emptyTreeOid(path: string): string {
     input: '',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 10_000,
-    env: { ...process.env, ...GIT_ENV },
+    env: gitChildEnv({ ...GIT_ENV }),
   }).toString().trim();
 }
 
@@ -445,7 +465,7 @@ export function hasTrackedContent(path: string): boolean {
     const out = execFileSync('git', ['-C', path, 'rev-parse', '--verify', 'HEAD:./'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: gitChildEnv({ ...GIT_ENV }),
     });
     return out.toString().trim() !== emptyTreeOid(path);
   } catch {
@@ -491,7 +511,7 @@ function runGit(
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: opts.timeoutMs ?? 120_000,
-        env: { ...process.env, ...(opts.env ?? GIT_ENV) },
+        env: gitChildEnv({ ...(opts.env ?? GIT_ENV) }),
       },
     );
     return out.toString().trim();
@@ -513,14 +533,14 @@ export function isWorkingTreeDirty(repoPath: string): boolean {
 export function detectDefaultBranch(repoPath: string): string {
   try {
     const sym = execFileSync('git', ['-C', repoPath, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     if (sym.startsWith('origin/')) return sym.slice('origin/'.length);
     if (sym) return sym;
   } catch { /* origin/HEAD not set — fall through */ }
   try {
     const cur = execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     if (cur && cur !== 'HEAD') return cur;
   } catch { /* detached or no commits */ }
@@ -532,7 +552,7 @@ function rebaseInProgress(repoPath: string): boolean {
   for (const name of ['rebase-merge', 'rebase-apply']) {
     try {
       const p = execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-path', name], {
-        stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+        stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
       }).toString().trim();
       const abs = p.startsWith('/') ? p : join(repoPath, p);
       if (existsSync(abs)) return true;
@@ -584,14 +604,14 @@ export function divergenceSafePull(
     // Abort any half-applied rebase so the tree is never left mid-rebase.
     try {
       execFileSync('git', ['-C', repoPath, 'rebase', '--abort'], {
-        stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+        stdio: 'ignore', timeout: 30_000, env: gitChildEnv({ ...GIT_ENV }),
       });
     } catch { /* best-effort */ }
     // If state STILL remains, try once more, then report regardless.
     if (rebaseInProgress(repoPath)) {
       try {
         execFileSync('git', ['-C', repoPath, 'rebase', '--abort'], {
-          stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+          stdio: 'ignore', timeout: 30_000, env: gitChildEnv({ ...GIT_ENV }),
         });
       } catch { /* best-effort */ }
     }
@@ -627,7 +647,7 @@ export function pushProbe(
     execFileSync(
       'git',
       ['-C', repoPath, ...durableSsrfFlags(), 'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--dry-run', 'origin', `HEAD:${branch}`],
-      { stdio: ['ignore', 'pipe', 'pipe'], timeout: opts.timeoutMs ?? 60_000, env: { ...process.env, ...GIT_ENV_AUTH } },
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: opts.timeoutMs ?? 60_000, env: gitChildEnv({ ...GIT_ENV_AUTH }) },
     );
     return { ok: true };
   } catch (e) {

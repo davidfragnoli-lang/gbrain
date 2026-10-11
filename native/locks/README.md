@@ -42,7 +42,7 @@ All eight addons are checked in, so source installs work with
 `bun install --frozen-lockfile --ignore-scripts`. They support x64 and arm64
 on Linux glibc (2.17 ABI baseline), Linux musl, macOS (13.0 deployment
 target), and Windows. The required CI matrix covers the repository's minimum
-Bun 1.3.11, Bun 1.3.13, and the release compiler, Bun 1.4.2. OS compatibility
+Bun 1.4.0 and the release compiler, Bun 1.4.2. OS compatibility
 also requires the selected Bun version's own platform minimums.
 
 Node-API headers and their upstream license are vendored from Node
@@ -169,3 +169,41 @@ revision conflicts with typed receipts, exact replay, resident stdio/CLI IPC,
 and shutdown/reopen. Release CI runs it for both published Linux x64 and macOS
 arm64 artifacts. Child homes and credentials are isolated; the script never
 loads repository TypeScript or adjacent native files to satisfy the executable.
+
+## Tests and CI
+
+`bun test test/native-lock.test.ts test/scripts/native-lock-prebuilds.test.ts`
+checks real process exclusion, crash handoff, retained files, cancellation,
+missing-addon failure and source/binary manifest integrity. Tests use isolated
+temporary paths and never open an operator datastore. The required
+`native-locks.yml` lane rebuilds and executes all eight OS/architecture/libc
+targets on Bun 1.4.0 and 1.4.2, including native musl Docker userspace.
+Every pair also runs `bun scripts/native/compiled-smoke.ts` to prove compiled
+process locking. Release CI verifies the shipped CLI embeds the matching
+addon and runs the compiled smoke on its two release platforms. Rebuild
+instructions and the precise packaging/runtime distinction are above.
+Release compilation uses Bun 1.4.2; strict Darwin codesign verification must
+pass before publication. The native macOS 26.2 smoke is not macOS 27
+certification, and Linux fault injection is not a full native Windows backup
+create/restore test.
+
+The OpenClaw 2026.9.4 / Node 24.18.0 native-host fixture proves plugin startup,
+restarted-turn saved-page pointer retrieval and same-slug source isolation with
+a deterministic loopback provider:
+
+```bash
+GBRAIN_TEST_OPENCLAW_BIN=<absolute-installed-cli> \
+GBRAIN_TEST_OPENCLAW_DATABASE_URL=<isolated-postgres-test-db> \
+bun test test/openclaw-context-engine-native.serial.test.ts
+```
+
+The database user needs `CREATEDB`; fixtures create/drop unique databases
+rather than truncating shared rows. Real-provider recall and macOS 27 behavior
+remain unverified.
+
+`package.json` in this directory is a private package boundary, not a
+package: plugin hosts that derive a native-addon namespace from the nearest
+`package.json` above a `.node` file otherwise treat the whole checkout as one
+package and load slowly (#6026). It declares no entry points, is not a
+prebuild input, and must never move into `prebuilds/`, which holds exactly the
+eight addons.

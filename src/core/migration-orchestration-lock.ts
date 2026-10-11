@@ -28,8 +28,7 @@ import { getPgliteMigrationLockPath } from './pglite-lock.ts';
 import { tryAcquireNativeLock } from './persistence/native-lock.ts';
 
 export const MIGRATION_ORCHESTRATION_LOCK_ID = 'gbrain-apply-migrations';
-/** Exit status of a runner refused because another runner holds the lock (EX_TEMPFAIL). */
-export const MIGRATIONS_RUNNING_EXIT_CODE = 75;
+export { MIGRATIONS_RUNNING_EXIT_CODE } from './exit-codes.ts';
 // Long enough to outlast a synchronous orchestrator phase (subprocess timeouts
 // reach 30 minutes) that starves the refresh timer; ownership is rechecked
 // before every orchestrator.
@@ -49,8 +48,36 @@ export class MigrationsRunningError extends Error {
   }
 }
 
+/** Which part of this runner's own lease row no longer matches its fence; values only, never the token itself. */
+export interface MigrationLeaseLostDetails {
+  holder_pid: number;
+  holder_host: string;
+  token_match: boolean;
+  fence_match: boolean;
+  expected_fence: string;
+  observed_acquired_at: string;
+}
+
+/**
+ * #6028 diagnostic: the fenced refresh of this runner's lease matched no row,
+ * yet the row still names this process. No other runner holds it, so this is
+ * not `migrations_running`. The refresh goes through the direct pool and the
+ * holder read through the main pool; a mismatch can mean the two reach
+ * different databases, or the row was rewritten. Root cause pending (#6028).
+ */
+export class MigrationLeaseLostError extends Error {
+  readonly code = 'migration_lease_lost';
+  constructor(readonly details: MigrationLeaseLostDetails) {
+    super(`this apply-migrations run's own migration lease (pid ${details.holder_pid}, host ${details.holder_host}) no longer matches its fence `
+      + `(acquisition token ${details.token_match ? 'matches' : 'differs'}, acquisition time ${details.fence_match ? 'matches' : 'differs'}); stopped before the next migration.`);
+    this.name = 'MigrationLeaseLostError';
+  }
+}
+
 export interface MigrationOrchestrationLock {
-  /** Throws MigrationsRunningError when the lease was lost to another runner. */
+  /** Postgres lease acquisition token; quiescence checks exclude this runner's own row by it. */
+  leaseToken?: string;
+  /** Throws MigrationsRunningError when the lease was lost to another runner, MigrationLeaseLostError when the row still names this one. */
   assertHeld(): Promise<void>;
   release(): Promise<void>;
 }
@@ -125,9 +152,20 @@ async function acquirePostgres(config: GBrainConfig): Promise<MigrationOrchestra
   }, LEASE_REFRESH_MS);
   timer.unref?.();
   return {
+    leaseToken: handle.acquisitionToken,
     assertHeld: async () => {
       if (await handle.refresh()) return;
       const snapshot = await inspectLock(engine, MIGRATION_ORCHESTRATION_LOCK_ID).catch(() => null);
+      if (snapshot?.holder_pid === process.pid && snapshot.holder_host === hostname()) {
+        throw new MigrationLeaseLostError({
+          holder_pid: snapshot.holder_pid,
+          holder_host: snapshot.holder_host,
+          token_match: snapshot.acquisition_token === handle.acquisitionToken,
+          fence_match: Math.abs(Number(handle.acquiredAt) * 1000 - new Date(snapshot.acquired_at).getTime()) < 1,
+          expected_fence: handle.acquiredAt,
+          observed_acquired_at: new Date(snapshot.acquired_at).toISOString(),
+        });
+      }
       throw new MigrationsRunningError({ host: snapshot?.holder_host ?? null, pid: snapshot?.holder_pid ?? null });
     },
     release: async () => {

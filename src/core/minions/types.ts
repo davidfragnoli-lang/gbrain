@@ -1,4 +1,5 @@
 import { parseSubmissionAuthority, type SubmissionAuthority } from './submission-authority.ts';
+import { parseSpendAuthorization, type JobSpendContext, type SpendAuthorization } from './spend-record.ts';
 /**
  * Minions — BullMQ-inspired Postgres-native job queue for GBrain.
  *
@@ -42,6 +43,10 @@ export interface MinionJob {
   data: Record<string, unknown>;
   /** Internal authority column; never accepted from job data or remote options. */
   submission_authority?: SubmissionAuthority | null;
+  /** Submit-time spend authorization (spend-authorization.ts); never read from job data. */
+  spend_authorization?: SpendAuthorization | null;
+  /** The column holds a value the strict parser rejects; the worker refuses to run the job. */
+  spend_authorization_invalid?: true;
 
   // Retry
   max_attempts: number;
@@ -269,6 +274,8 @@ export interface MinionJobContext {
   data: Record<string, unknown>;
   /** Internal authority column; never accepted from job data or remote options. */
   submission_authority?: SubmissionAuthority | null;
+  /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
+  spend?: JobSpendContext;
   attempts_made: number;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
@@ -431,9 +438,14 @@ export const ABORT_REASON_TIMEOUT = 'timeout';
 
 // --- Errors ---
 
-export { UnrecoverableError } from './errors.ts';
+export { JobDeferredError, UnrecoverableError } from './errors.ts';
 
 // --- Row Mapping ---
+
+function spendAuthorizationFields(raw: unknown): Pick<MinionJob, 'spend_authorization' | 'spend_authorization_invalid'> {
+  try { return { spend_authorization: parseSpendAuthorization(raw) }; }
+  catch { return { spend_authorization: null, spend_authorization_invalid: true }; }
+}
 
 export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
   return {
@@ -443,6 +455,7 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     status: row.status as MinionJobStatus,
     priority: row.priority as number,
     submission_authority: parseSubmissionAuthority(row.submission_authority),
+    ...spendAuthorizationFields(row.spend_authorization),
     data: (typeof row.data === 'string' ? JSON.parse(row.data) : row.data ?? {}) as Record<string, unknown>,
     max_attempts: row.max_attempts as number,
     attempts_made: row.attempts_made as number,
@@ -592,6 +605,14 @@ export interface SubagentHandlerData {
    * discipline. Set by the dream fan-out alongside `mode`.
    */
   oneshot_slug_suffix?: string;
+  /**
+   * #6160 — the namespaces a oneshot synthesis child may write (the cycle's
+   * resolved reflections and originals prefixes). Oneshot validation uses
+   * them as its task shapes instead of guessing from the allow-list's
+   * spelling, so root-level and custom namespaces validate. Absent on jobs
+   * queued by older builds, which keep the allow-list derivation.
+   */
+  oneshot_task_prefixes?: string[];
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior

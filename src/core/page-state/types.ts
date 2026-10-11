@@ -9,9 +9,24 @@ export interface PageMutationPrecondition {
 export interface PageWriteOptions extends PageMutationPrecondition {
   sourceId?: string;
   allowEmptyOverwrite?: boolean;
+  /**
+   * #5984: inside a page transaction, write in that transaction instead of a
+   * savepoint (one round trip less); a failure then aborts the transaction.
+   */
+  inline?: boolean;
+  /**
+   * #5984: stamps the page's contextual retrieval state in the same statement,
+   * as `updatePageContextualRetrievalState` would right after it. Not for the
+   * `none` tier, whose stamp also clears tier vectors.
+   */
+  contextualRetrieval?: { mode: string; corpusGeneration: string | null };
 }
 
-export interface PageKey { sourceId: string; slug: string }
+export interface PageKey {
+  sourceId: string; slug: string;
+  /** #5984: the source incarnation the caller already verified; lets a page lock send its source read with the guard statements. */
+  incarnation?: string;
+}
 export interface PageSnapshotOptions extends GetPageOpts {
   /** Exact slug wins; only follow a source-scoped alias when explicitly requested. */
   resolveAlias?: boolean;
@@ -29,6 +44,22 @@ export interface PageWithdrawal {
   visibility: 'private' | 'world';
   fact_hash: string;
   withdrawn_at: string;
+  /** A purge tombstone (fact_purges): the overlay drops the row instead of striking it. */
+  purged?: boolean;
+}
+/**
+ * The source's subject-'*' fact purge tombstones under the read's visibility
+ * filter, as a marker instead of a list: they apply to every page, so each
+ * overlay resolves them against the fence rows of the text it overlays
+ * (page-state/snapshot.ts `resolveGlobalPurges`). Count and latest purged_at
+ * change when a '*' tombstone is added or removed, so a digest that carries
+ * the marker goes stale on either.
+ */
+export interface GlobalPurgeMarker {
+  count: number;
+  latest: string | null;
+  /** The read kept world rows only (excludePrivate); the lookup applies the same filter. */
+  world_only: boolean;
 }
 export interface PageSnapshot {
   page: Page;
@@ -36,15 +67,31 @@ export interface PageSnapshot {
   revision: string;
   sourceIncarnation: string;
   withdrawals: PageWithdrawal[];
+  /** Subject-'*' purges, listed in `withdrawals` only when the stored text names them. Absent when the source has none under the read's filter. */
+  globalPurges?: GlobalPurgeMarker;
 }
 
 export class PageRevisionConflictError extends Error {
-  readonly code = 'revision_conflict';
+  readonly code: 'revision_conflict' | 'revision_backfill_pending' = 'revision_conflict';
   constructor(readonly expectedRevision: string | null, readonly currentRevision: string | null) {
     super(currentRevision === null ? 'The page no longer exists at the expected revision.'
       : expectedRevision === null ? 'The page already exists; an expected revision is required.'
       : 'The page changed after it was read. Read its current revision before retrying.');
     this.name = 'PageRevisionConflictError';
+  }
+}
+
+/** #5216: the snapshot revision of a row written before the column existed and not yet backfilled. Never a UUID. */
+export const REVISION_BACKFILL_PENDING = 'backfill_pending';
+
+/** A revision-bound write to a row whose revision is still being backfilled. A conflict to every retry loop. */
+export class RevisionBackfillPendingError extends PageRevisionConflictError {
+  override readonly code = 'revision_backfill_pending' as const;
+  constructor(expectedRevision: string | null) {
+    super(expectedRevision, REVISION_BACKFILL_PENDING);
+    this.message = 'This page has no revision yet: the revision backfill for pages written before the upgrade has not reached it. '
+      + 'Resume it with: gbrain apply-migrations --yes (see docs/guides/write-refusals.md#other-error-codes).';
+    this.name = 'RevisionBackfillPendingError';
   }
 }
 
@@ -57,6 +104,7 @@ export function assertPageRevision(snapshot: Pick<PageSnapshot, 'revision'> | nu
   }
   if (force && expectedRevision !== undefined) throw new TypeError('force and expectedRevision are mutually exclusive');
   if (force) return;
+  if (snapshot?.revision === REVISION_BACKFILL_PENDING) throw new RevisionBackfillPendingError(expectedRevision ?? null);
   const current = snapshot?.revision ?? null;
   if (current !== (expectedRevision?.toLowerCase() ?? null)) throw new PageRevisionConflictError(expectedRevision ?? null, current);
 }

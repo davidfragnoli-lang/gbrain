@@ -12,7 +12,9 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { REPAIR_KINDS } from '../src/core/repair/core.ts';
 import { REPAIR_HELP, runRepairCommand } from '../src/commands/repair.ts';
+import { AUTO_REPAIR_REGISTRY } from '../src/core/repair/registry.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let engine: PGLiteEngine;
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-flags-'));
@@ -68,6 +70,20 @@ describe('gbrain repair flags', () => {
     expect(error.message).toContain('extra');
   });
 
+  test('usage refusals name the exact usage and offer the read-only preview', async () => {
+    expectFunnelSuggestions('src/commands/repair.ts', 'invalid', 7);
+    const both = envelopeFor(await refusal(['timeline', '--all']));
+    expect(both).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'repair', 'timeline', '--json'], next: 'run' } });
+    expect(both.suggestion).toContain('Drop --all to repair only timeline');
+    const yes = envelopeFor(await refusal(['timeline', '--yes']));
+    expect(yes).toMatchObject({ fix: { argv: ['gbrain', 'repair', 'timeline', '--json'] } });
+    expect(yes.suggestion).toContain('--apply instead of --yes');
+    const limit = envelopeFor(await refusal(['timeline', '--limit', '0']));
+    expect(limit.suggestion).toContain('--limit 50');
+    const applyAll = envelopeFor(await refusal(['--apply']));
+    expect(applyAll).toMatchObject({ fix: { argv: ['gbrain', 'repair', '--json'], next: 'run' } });
+  });
+
   test('help names every registered kind', () => {
     for (const kind of REPAIR_KINDS) expect(REPAIR_HELP).toContain(`  ${kind}`);
   });
@@ -76,7 +92,7 @@ describe('gbrain repair flags', () => {
     const out = await captured(['--all', '--json']);
     const parsed = JSON.parse(out) as { mode: string; results: Array<{ kind: string; cost: Record<string, unknown>; paid: boolean }>; paid_kinds: string[] };
     expect(parsed.mode).toBe('dry_run');
-    expect(parsed.results.map(r => r.kind)).toEqual([...REPAIR_KINDS]);
+    expect(parsed.results.map(r => r.kind)).toEqual(AUTO_REPAIR_REGISTRY.map(spec => spec.kind));
     for (const result of parsed.results) {
       expect(result.cost).toHaveProperty('lifetime_ids');
       expect(result.cost).toHaveProperty('embedding_usd');
@@ -86,6 +102,6 @@ describe('gbrain repair flags', () => {
     const human = await captured(['--all']);
     expect(human).toContain("may queue paid embeddings: timeline, visibility, safe-chunks");
     const free = JSON.parse(await captured(["--all", "--json", "--no-embed"])) as { paid_kinds: string[] };
-    expect(free.paid_kinds).toEqual(["timeline", "visibility", "connector-fences", "embedding-effects"]);
+    expect(free.paid_kinds).toEqual(["timeline", "visibility", "connector-fences", "take-supersession", "embedding-effects", "fences", "slug-conflicts"]);
   });
 });

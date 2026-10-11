@@ -14,8 +14,10 @@
  * Normalizer `doctor-json-v1`: ordered checks (name, status, message,
  * details, issues) plus the report envelope, with volatile tokens replaced:
  * temp home / repo / os tmpdir paths, UUIDs, ISO timestamps, the running
- * package version, the machine hostname, and `*_ms` / elapsed / pid-style
- * detail keys. Check order is emitted order (deterministic; no Map/Set
+ * package and Bun versions, the machine hostname, and `*_ms` / elapsed / pid-style
+ * detail keys, and the latest schema migration number in the `schema_version`
+ * message (`<latest>`, so a migration renumber does not churn the goldens;
+ * `expectSchemaLatestMatchesRegistry` keeps the hidden number honest). Check order is emitted order (deterministic; no Map/Set
  * iteration is re-sorted). stderr lines are kept (normalized) because the
  * early-stop paths announce themselves there.
  */
@@ -24,21 +26,28 @@ import { hostname, tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { defineNormalizer, mapStrings, scrubKeys, scrubPaths, scrubTimestamps } from './golden.ts';
 import { PROVIDER_ENV_KEYS } from './provider-env.ts';
+import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..');
 const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const PRELOAD = join(import.meta.dir, 'no-network-preload.ts');
+const CLOCK_PRELOAD = join(import.meta.dir, 'fixed-clock-preload.ts');
 const PACKAGE_VERSION = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as { version: string }).version;
+const REGISTRY_LATEST = Math.max(...MIGRATIONS.map((m) => m.version));
+const SCHEMA_LATEST = /\b(Version |latest: |latest is |latest known version \()(\d+)\b/g;
 
 export interface DoctorHome {
   home: string;
   work: string;
   skillsDir: string;
   netLog: string;
+  /** Milliseconds every CLI process of this home adds to the real clock (fixed-clock-preload.ts); unset runs on the real clock. */
+  clockOffsetMs?: number;
   cleanup: () => void;
 }
 
-export function makeDoctorHome(prefix: string): DoctorHome {
+/** `opts.clock`: an ISO instant; the home's CLI processes share one clock that reads it now and moves forward from it. */
+export function makeDoctorHome(prefix: string, opts: { clock?: string } = {}): DoctorHome {
   const home = mkdtempSync(join(tmpdir(), `gbrain-${prefix}-`));
   const work = join(home, 'work');
   const skillsDir = join(home, 'skills');
@@ -60,6 +69,7 @@ export function makeDoctorHome(prefix: string): DoctorHome {
     work,
     skillsDir,
     netLog: join(home, 'net.log'),
+    ...(opts.clock ? { clockOffsetMs: Date.parse(opts.clock) - Date.now() } : {}),
     cleanup: () => rmSync(home, { recursive: true, force: true }),
   };
 }
@@ -81,6 +91,8 @@ export async function runGbrain(h: DoctorHome, args: string[], env: Record<strin
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) childEnv[k] = v;
   for (const k of PROVIDER_ENV_KEYS) delete childEnv[k];
   for (const k of ['DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_REMOTE_CLIENT_SECRET', 'GBRAIN_PGLITE_SNAPSHOT', 'GBRAIN_SKILLS_DIR', 'OPENCLAW_WORKSPACE']) delete childEnv[k];
+  // harness_wiring reads agent markers and harness config homes: keep the golden independent of the host's harness.
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_CI', 'CODEX_HOME', 'OPENCODE', 'OPENCODE_PID', 'XDG_CONFIG_HOME']) delete childEnv[k];
   Object.assign(childEnv, {
     HOME: h.home,
     GBRAIN_HOME: h.home,
@@ -91,11 +103,13 @@ export async function runGbrain(h: DoctorHome, args: string[], env: Record<strin
     NO_COLOR: '1',
     PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
   });
+  delete childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS;
+  if (h.clockOffsetMs !== undefined) childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS = String(h.clockOffsetMs);
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) delete childEnv[k];
     else childEnv[k] = v;
   }
-  const proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', PRELOAD, CLI, ...args], {
+  const proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', PRELOAD, '--preload', CLOCK_PRELOAD, CLI, ...args], {
     cwd: h.work,
     env: childEnv,
     stdin: 'ignore',
@@ -138,9 +152,31 @@ export function normalizeDoctorText(text: string, roots: Record<string, string>,
   out = scrubTimestamps(out).replace(UUID, '<uuid>');
   out = out.replace(/\(most recent caller: at [^()]*\([^()]*\)\)/g, '(most recent caller: <frame>)');
   out = out.split(PACKAGE_VERSION).join('<version>');
+  out = out.replace(SCHEMA_LATEST, (match, prefix: string, n: string) => (Number(n) === REGISTRY_LATEST ? `${prefix}<latest>` : match));
+  out = out.split(`Bun ${Bun.version}`).join('Bun <bun-version>');
   const host = hostname();
   if (host) out = out.split(host).join('<hostname>');
   return out;
+}
+
+/**
+ * Golden guard for the `<latest>` placeholder: the raw (un-normalized) doctor
+ * report must name the migration registry maximum as both the brain's schema
+ * version and the latest version, so normalizing it away hides nothing.
+ */
+export function expectSchemaLatestMatchesRegistry(run: GbrainRun): void {
+  const checks = (run.json as { checks?: Array<{ name: string; message: string }> } | null)?.checks ?? [];
+  const message = checks.find((c) => c.name === 'schema_version')?.message ?? '<no schema_version check>';
+  const expected = `Version ${REGISTRY_LATEST} (latest: ${REGISTRY_LATEST})`;
+  if (message !== expected) {
+    throw new Error([
+      `FAIL: doctor schema_version says "${message}", expected "${expected}" (migration registry maximum ${REGISTRY_LATEST}).`,
+      'Why:  the doctor goldens replace the latest migration number with <latest>; this guard keeps the doctor\'s reported',
+      '      latest version equal to src/core/schema-migrations/registry.generated.ts, so the placeholder cannot hide a stale schema.',
+      'Fix:  bun run build:schema-migrations (stale registry), then rerun this test; a fresh brain must migrate to the registry maximum.',
+      'See:  docs/TESTING.md#refactor-wave-1-goldens',
+    ].join('\n'));
+  }
 }
 
 /** `doctor-json-v1` with optional extra literal/regex replacements (e.g. a Postgres URL). */

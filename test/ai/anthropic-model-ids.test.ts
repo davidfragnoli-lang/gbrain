@@ -46,20 +46,28 @@ describe('compareAnthropicVersions', () => {
 
 describe('newerAnthropicModel', () => {
   test('returns the newest priced same-family recipe id when the model is older', () => {
-    expect(newerAnthropicModel('anthropic:claude-sonnet-4-6')?.id).toBe('claude-sonnet-5');
-    expect(newerAnthropicModel('anthropic:claude-opus-4-7')?.id).toBe('claude-opus-5');
+    expect(newerAnthropicModel('anthropic:claude-sonnet-4-6')?.id).toBe('claude-sonnet-5-5');
+    expect(newerAnthropicModel('anthropic:claude-sonnet-5')?.id).toBe('claude-sonnet-5-5');
+    expect(newerAnthropicModel('anthropic:claude-opus-4-7')?.id).toBe('claude-opus-5-5');
+    expect(newerAnthropicModel('anthropic:claude-opus-5')?.id).toBe('claude-opus-5-5');
   });
 
   test('dated and undated forms of the current version get no hint', () => {
-    expect(newerAnthropicModel('claude-haiku-4-5')).toBeNull();
-    expect(newerAnthropicModel('anthropic:claude-haiku-4-5-20251001')).toBeNull();
+    expect(newerAnthropicModel('claude-haiku-5-5')).toBeNull();
+    expect(newerAnthropicModel('anthropic:claude-haiku-5-5')).toBeNull();
+  });
+
+  test('dated and undated forms of an older version get the same hint (#6335 lists claude-haiku-5-5)', () => {
+    expect(newerAnthropicModel('claude-haiku-4-5')?.id).toBe('claude-haiku-5-5');
+    expect(newerAnthropicModel('anthropic:claude-haiku-4-5-20251001')?.id).toBe('claude-haiku-5-5');
   });
 
   test('current, newer-than-recipe, fable, non-Anthropic and unparseable ids get none', () => {
     for (const id of [
-      'anthropic:claude-sonnet-5',
+      'anthropic:claude-sonnet-5-5',
       'anthropic:claude-sonnet-6',
-      'anthropic:claude-opus-5-2',
+      'anthropic:claude-opus-5-5',
+      'anthropic:claude-opus-5-6',
       'anthropic:claude-fable-5',
       'openai:gpt-5.6',
       'not-a-model',

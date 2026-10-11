@@ -23,39 +23,50 @@
  * fence-owned and are left alone. Active fence-owned rows of soft-deleted
  * pages are expired at the start of each run.
  *
- * Empty-fence guard (Codex R2-#7; #2484; #2646): the phase refuses to do
- * its destructive reconciliation pass when genuinely-backfillable legacy
- * rows still exist — in THIS run's source only (`source_id = sourceId`;
- * a pending row in source A must not jam extraction for source B — the
- * source-isolation invariant) — `row_num IS NULL` (never fenced) AND
- * `entity_slug` resolves to a live page in this source (so the v0_32_2
- * migration's Phase B could fence them) AND the row is not soft-expired
- * (`expired_at IS NULL`). Status returns `warn` with a hint to re-run
- * the v0.32.2 fence backfill (`apply-migrations --force-retry 0.32.2`
- * then `--yes` — a bare `--yes` is a no-op once the ledger says
- * complete). Without the guard, an interrupted upgrade where v0_32_2
- * hasn't run could leave the cycle silently misreporting "0 facts on
- * people/alice" while legacy rows linger.
+ * Unfenced rows (#5299): each run first fences the source's active
+ * `row_num IS NULL` rows onto their live entity pages through the shared
+ * core pass (`facts/unfenced-facts.ts`, also the v0.32.2 migration's Phase
+ * B) and reconciles those pages in the same run. The inline writer's
+ * DB-only fallback keeps producing such rows, so no manual migration retry
+ * is needed.
  *
- * The live-page requirement (#2484) is load-bearing: the inline facts
- * writer keeps producing `row_num IS NULL, entity_slug IS NOT NULL`
- * rows AFTER the migration completes, whenever a resolved slug has no
- * fenceable page (slugify-floor / stub-guard-blocked unprefixed slugs).
- * Those are structurally unfenceable — no page to fence onto, and the
- * ledger-complete migration won't re-run — so they must NOT gate, or
- * the phase jams forever (~16/day observed). Requiring a backing page
- * keeps genuine pre-v0.32.2 rows (whose entity page exists) gating
- * while excluding the inline-writer's permanent-unfenceable rows.
- *
- * Soft-expired rows don't count either (#2646): they're what
- * `forget_fact` produces, so excluding them lets operators drain the
- * backlog through the sanctioned removal path instead of raw SQL.
+ * Empty-fence guard (Codex R2-#7; #2484; #2646; per page since #6278): rows
+ * the fence step could not fence this run (a page whose file is not on this
+ * host, a malformed fence, a held page lock, a claim the fence codec cannot
+ * render) keep THEIR page out of the destructive reconciliation pass, while
+ * every other page of the run's source reconciles. Reconciliation lists a
+ * page's active `row_num IS NULL` rows and would classify them as stale, so
+ * a source-wide count that merely tolerated them would expire the very rows
+ * the fence step promised to keep. The guard is still source-scoped
+ * (`source_id = sourceId`, the source-isolation invariant): a row counts when
+ * `row_num IS NULL`, its `entity_slug` resolves to a live page in this
+ * source, it is not soft-expired (`expired_at IS NULL`; `forget_fact` drains
+ * rows that way) and the source has a `local_path`. `legacyRowsPending`,
+ * `guardTriggered` and the halt rollup still report the run; status returns
+ * `warn` naming each failed page. Rows with no backing page or checkout
+ * (slugify-floor / stub-guard-blocked slugs from the inline writer) are
+ * structurally unfenceable and never gate.
  */
 
+import { isQuarantined } from '../quarantine.ts';
 import { existsSync, readFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
-import { managedDerivedFactsPreflight, withDerivedFactsWrite } from '../persistence/derived-facts.ts';
+import type { GBrainConfig } from '../config.ts';
+import type { PreparedMutation } from '../persistence/coordinator.ts';
+import { isTerminal, type WriteRequest } from '../persistence/model.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { withWriteTrust } from '../persistence/context.ts';
+import { deriveTrust, recordTaintEdges } from '../trust/taint.ts';
+import { applyGateDecision, derivedGateConfig, derivedGateInput, emptyGateTally, mergeGateTally, type GateTally } from '../trust/derived-gate.ts';
+import { decideFactWrite, recordFlaggedRow } from '../write-gate-store.ts';
+import { authorizeWrite } from '../persistence/authority.ts';
+import { digest } from '../persistence/digest.ts';
+import { getWriteRequest } from '../persistence/journal.ts';
+import { maintenanceCallerPreflight, maintenancePreflight, submitDatabaseMaintenanceIntent, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { resolveManagedFactsEmbedding } from '../persistence/facts-maintenance.ts';
+import { REVISION_BACKFILL_PENDING } from '../page-state/types.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import {
   resolveSupersededByRow,
   supersessionChainOf,
@@ -63,9 +74,11 @@ import {
   type SupersessionChain,
 } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
+import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import {
+  duplicateActiveFenceRows,
   extractFactsFromFenceText,
   type FenceExtractedFact,
 } from '../facts/extract-from-fence.ts';
@@ -79,6 +92,14 @@ import { isAborted } from '../abort-check.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { acquirePageLock } from '../page-lock.ts';
+import {
+  lockReconcileRevision,
+  selectFactsReconcileDrain,
+  settleFactsReconcile,
+  FACTS_DRAIN_BUDGET_MS,
+  type FactsReconcileDrainOpts,
+  type FactsReconcileOutcome,
+} from '../facts/reconcile-watermark.ts';
 
 interface ExistingPageFact {
   id: number | string;
@@ -245,6 +266,31 @@ async function refuseDestructiveReconcileOnStaleCache(
 }
 
 /**
+ * #5575 I2/B3: new fence rows restate the page (no model), so they take its
+ * tier capped at operator_curated (the caller's write scope) and pass the
+ * write gate at it (an owner page never runs it). Held rows go to
+ * write_gate_holds, rejected rows are skipped; inserted rows get input edges
+ * and flag receipts.
+ */
+type ReconcileRow = Parameters<BrainEngine['insertFacts']>[0][number];
+async function insertReconciledFacts<F extends ReconcileRow>(
+  tx: BrainEngine, sourceId: string, slug: string, inserts: F[], derivation: Awaited<ReturnType<typeof deriveTrust>>, tally: GateTally,
+): Promise<{ inserted: { inserted: number; ids: number[] }; allowed: F[] }> {
+  const cfg = inserts.length ? await derivedGateConfig(tx) : null;
+  const decisions = inserts.map(f => decideFactWrite(f, { sourceId, slug, payload: { ...(f as ReconcileRow), embedding: null }, input: derivedGateInput(derivation.trust), cfg: cfg! }));
+  for (const d of decisions) if (d.action !== 'insert') await applyGateDecision(tx, d, { table: 'facts', sourceId }, async () => null, tally);
+  const allowed = inserts.filter((_, i) => decisions[i].action === 'insert');
+  const flags = decisions.filter(d => d.action === 'insert');
+  const inserted = allowed.length === 0 ? { inserted: 0, ids: [] as number[] }
+    : await tx.insertFacts(allowed.map(f => ({ ...f, superseded_by_row: undefined })), { source_id: sourceId }); // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+  for (const [i, id] of inserted.ids.entries()) {
+    await recordTaintEdges(tx, { table: 'facts', id, sourceId }, derivation.inputs);
+    if (inserted.ids.length === allowed.length && await recordFlaggedRow(tx, flags[i], { table: 'facts', id, sourceId }) !== null) tally.flagged++;
+  }
+  return { inserted, allowed };
+}
+
+/**
  * Run one page's destructive reconcile under its page lock (5s, matching the
  * fence writers in fence-write.ts / forget.ts). A lock still held past the
  * deadline degrades to a FACTS_PAGE_LOCK_TIMEOUT warning for THAT page and a
@@ -309,6 +355,255 @@ async function listExistingFactsForPage(
   );
 }
 
+interface FenceReconcilePlan {
+  /** Rows the parsed fence carries (duplicates included), for the pages-with-facts count. */
+  fenceRows: number;
+  extracted: FenceExtractedFact[];
+  matched: Map<number, ExistingPageFact>;
+  stale: ExistingPageFact[];
+  updates: FenceExtractedFact[];
+  toInsert: FenceExtractedFact[];
+  chain: SupersessionChain;
+  /** Nothing to write: every row matches and every supersession pointer is in place. */
+  inSync: boolean;
+}
+
+/**
+ * One page's reconcile plan against its stored rows. Null when the fence is
+ * not authoritative (warnings are appended): a warning-bearing parse or a
+ * fence below the timeline sentinel preserves the page's existing index.
+ */
+async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: string | null; timeline: string | null; effective_date?: Date | string | null },
+  slug: string, sourceId: string, warnings: string[]): Promise<FenceReconcilePlan | null> {
+  const parsed = parseFactsFence(page.compiled_truth ?? '');
+  if (parsed.warnings.length > 0) {
+    // The parser deliberately skips malformed rows and returns any rows it
+    // could still recover. That partial result is not authoritative: using
+    // it for reconciliation would interpret skipped rows as deletions.
+    warnings.push(...parsed.warnings.map(w => `${slug}: ${w}`));
+    return null;
+  }
+  // #3625: a fence below the timeline sentinel lands in page.timeline, where
+  // parseFactsFence cannot see it; reading compiled_truth alone would treat
+  // its rows as deleted. timelineHasGenuineFactsFenceMarker explains the scan.
+  if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+    warnings.push(
+      `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
+      `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +
+      `Move the fence above the sentinel and re-save — leaving it in place ` +
+      `preserves the existing indexed facts but they will not update.`,
+    );
+    return null;
+  }
+  // v0.35.4 (D-ENG-1): page.effective_date is the fallback valid_from, so
+  // trajectory queries see claim dates rather than import dates.
+  const pageEffectiveDate = page.effective_date ? new Date(page.effective_date) : null;
+  // #1781: duplicate ACTIVE rows (same claim and source) index once.
+  const duplicates = duplicateActiveFenceRows(parsed.facts);
+  const extracted = extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate })
+    .filter(f => !duplicates.has(f.row_num));
+  // Reconcile by row number, the fence's own unique identity. A DB row whose
+  // (row_num, claim) is still in the fence keeps its id and has its other
+  // cells updated in place; a row whose number disappeared or whose claim
+  // was rewritten is expired and detached (row_num NULL), never deleted.
+  const existing = await listExistingFactsForPage(db, slug, sourceId);
+  const desiredByRow = new Map(extracted.map(f => [f.row_num, f]));
+  const matched = new Map<number, ExistingPageFact>();
+  const stale: ExistingPageFact[] = [];
+  for (const fact of existing) {
+    const desired = fact.row_num == null ? undefined : desiredByRow.get(Number(fact.row_num));
+    if (desired && desired.fact === fact.fact) matched.set(desired.row_num, fact);
+    else stale.push(fact);
+  }
+  const updates = extracted.filter(f => {
+    const fact = matched.get(f.row_num);
+    return fact !== undefined && factCellsDiffer(fact, f);
+  });
+  const toInsert = extracted.filter(f => !matched.has(f.row_num));
+  const chain = supersessionChainOf(extracted, slug);
+  let inSync = false;
+  if (stale.length === 0 && updates.length === 0 && toInsert.length === 0) {
+    const byRow = new Map([...matched].map(([row, fact]) => [row, { id: Number(fact.id), struck: fact.expired_at != null }]));
+    inSync = extracted.every(f => {
+      const stored = matched.get(f.row_num)!.superseded_by;
+      return resolveSupersession(f, byRow, chain, slug).superseded_by === (stored == null ? null : Number(stored));
+    });
+  }
+  return { fenceRows: parsed.facts.length, extracted, matched, stale, updates, toInsert, chain, inSync };
+}
+
+/**
+ * The destructive half of a plan. A vector-bearing row is never replaced by
+ * a row that could not be embedded: until embedding succeeds, rows keep
+ * their positions (stale rows whose claim is still active in the fence stay,
+ * others are expired in place, new rows wait). In-place updates still apply.
+ */
+function reconcileWrites(plan: FenceReconcilePlan) {
+  const deferInserts = plan.toInsert.some(f => !f.embedding) && plan.stale.some(f => f.has_embedding);
+  const activeClaims = new Set(plan.extracted.filter(f => f.expired_at == null).map(f => `${f.fact}\u0000${f.source}`));
+  return {
+    deferInserts,
+    detach: deferInserts ? [] : plan.stale,
+    expireInPlace: deferInserts ? plan.stale.filter(f => f.expired_at == null && !activeClaims.has(`${f.fact}\u0000${f.source}`)) : [],
+    inserts: deferInserts ? [] : plan.toInsert,
+  };
+}
+
+/** One page's reconcile writes, inside a transaction that holds the page key. */
+async function writeFenceReconcile(tx: BrainEngine, sourceId: string, slug: string, plan: FenceReconcilePlan,
+  writes: ReturnType<typeof reconcileWrites>, signal?: AbortSignal): Promise<{ inserted: number; updated: number; warnings: string[]; write_gate?: GateTally }> {
+  const tally = emptyGateTally();
+  // #5575 I2: the fence rows restate the page (no model), so every write here is at the page's tier, capped at operator_curated.
+  const derivation = await deriveTrust(tx, [{ table: 'pages', sourceId, slug }], { channel: 'derive:facts_fence', projection: true });
+  return withWriteTrust(tx, derivation.trust, async () => {
+  for (const fact of writes.expireInPlace) {
+    await tx.executeRaw('UPDATE facts SET expired_at = COALESCE(expired_at, now()) WHERE id = $1 AND source_id = $2', [fact.id, sourceId]);
+  }
+  for (const fact of writes.detach) {
+    await tx.executeRaw(
+      `UPDATE facts SET expired_at = COALESCE(expired_at, now()), row_num = NULL
+        WHERE id = $1 AND source_id = $2`,
+      [fact.id, sourceId],
+    );
+  }
+  for (const f of plan.updates) {
+    await tx.executeRaw(
+      `UPDATE facts SET kind = $3, visibility = $4, notability = $5, context = $6,
+          valid_from = COALESCE($7::timestamptz, valid_from),
+          valid_until = CASE WHEN $8::boolean THEN $9::timestamptz ELSE valid_until END,
+          expired_at = CASE WHEN $10::timestamptz IS NULL THEN NULL ELSE COALESCE(expired_at, $10::timestamptz) END,
+          source = $11, confidence = $12,
+          claim_metric = $13, claim_value = $14, claim_unit = $15, claim_period = $16
+        WHERE id = $1 AND source_id = $2`,
+      [plan.matched.get(f.row_num)!.id, sourceId, f.kind ?? 'fact', f.visibility ?? 'private', f.notability ?? 'medium',
+        f.context ?? null, f.valid_from?.toISOString() ?? null, f.expired_at == null,
+        f.valid_until?.toISOString() ?? null, f.expired_at?.toISOString() ?? null, f.source, f.confidence ?? 1.0,
+        f.claim_metric ?? null, f.claim_value ?? null, f.claim_unit ?? null, f.claim_period ?? null],
+    );
+  }
+  const { inserted, allowed } = await insertReconciledFacts(tx, sourceId, slug, writes.inserts, derivation, tally);
+  const insertedRows = new Set(allowed.map(f => f.row_num));
+  const linked = await syncSupersession(tx, sourceId, slug, plan.extracted, plan.chain, insertedRows);
+  signal?.throwIfAborted();
+  const updated = new Set([...plan.updates.map(f => f.row_num), ...linked.changed.filter(row => !insertedRows.has(row))]);
+  return { inserted: inserted.inserted, updated: updated.size, warnings: linked.warnings, ...(mergeGateTally(tally, undefined) ? { write_gate: tally } : {}) };
+  });
+}
+
+export const FENCE_FACTS_INTENT = 'managed_maintenance_fence_facts';
+export const DELETED_PAGE_FACTS_INTENT = 'managed_maintenance_deleted_page_facts_expire';
+
+function maintenanceRequestIdFor(parts: unknown[]): string {
+  const h = digest(parts);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * Managed brains: one page's reconcile as a database-only request bound to
+ * the page revision. The vectors embedded for new rows ride along; the
+ * preparer replans under the page lock and uses a vector only for the same
+ * (row, claim) under the brain's current embedding model. Null when the page
+ * changed or the request is still pending (the next run retries).
+ */
+async function publishFenceReconcile(engine: BrainEngine, authority: MaintenanceAuthority, page: { id: number; knowledge_revision?: string | null },
+  slug: string, toInsert: FenceExtractedFact[]): Promise<{ inserted: number; updated: number; deleted: number; deferred: boolean; warnings: string[]; write_gate?: GateTally } | null> {
+  const sourceId = authority.writer.sourceId;
+  const revision = page.knowledge_revision ?? REVISION_BACKFILL_PENDING;
+  const embeddings = toInsert.filter(f => f.embedding).map(f => ({ row_num: f.row_num, fact: f.fact, model: f.embedding_model ?? null, vector: Array.from(f.embedding!) }));
+  for (let attempt = 0; ; attempt++) {
+    const requestId = maintenanceRequestIdFor(['extract-facts-fence-v1', authority.writer.sourceIncarnation, sourceId, slug, revision, digest(embeddings), attempt]);
+    const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
+    if (prior && isTerminal(prior) && prior.state !== 'committed') continue;
+    try {
+      const receipt = await submitDatabaseMaintenanceIntent(engine, authority, slug,
+        { kind: FENCE_FACTS_INTENT, expected_revision: revision, page_id: page.id, embeddings }, requestId);
+      return { inserted: Number(receipt.inserted ?? 0), updated: Number(receipt.updated ?? 0), deleted: Number(receipt.deleted ?? 0),
+        deferred: receipt.deferred === true, warnings: Array.isArray(receipt.warnings) ? receipt.warnings.map(String) : [],
+        ...(receipt.write_gate ? { write_gate: receipt.write_gate as GateTally } : {}) };
+    } catch (error) {
+      if (error instanceof OperationError && ['revision_conflict', 'page_not_found', 'page_identity_changed', 'write_pending'].includes(error.code)) return null;
+      throw error;
+    }
+  }
+}
+
+/** Preparer for `managed_maintenance_fence_facts`: replans the page's reconcile under its key and applies it. */
+export async function prepareFenceFactsReconcile(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
+  const intent = row.intent as { page_id?: unknown; expected_revision?: unknown; embeddings?: Array<{ row_num: number; fact: string; model: string | null; vector: number[] }> } | null;
+  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
+  if (!snapshot || snapshot.page.id !== Number(row.page_id) || Number(intent?.page_id) !== snapshot.page.id) {
+    throw opError('page_identity_changed', 'The page was deleted or replaced before its facts fence was reconciled.',
+      `Page ${row.slug} in source ${row.source_id} changed before request ${row.request_id} ran, so its fact index was left as it was. The next extract_facts run reconciles the current page.`);
+  }
+  await authorizeWrite(engine, row.authority, 'submit_job', row.slug);
+  return { observedRevision: snapshot.revision, noop: true,
+    validate: async tx => { await authorizeWrite(tx, row.authority, 'submit_job', row.slug); },
+    apply: async tx => {
+      const current = await tx.getPage(row.slug, { sourceId: row.source_id });
+      const warnings: string[] = [];
+      const plan = current ? await planFenceReconcile(tx, current, row.slug, row.source_id, warnings) : null;
+      if (!plan || plan.inSync) return { status: 'completed', inserted: 0, updated: 0, deleted: 0, deferred: false, warnings };
+      const signature = await resolveManagedFactsEmbedding(tx, config, true);
+      const vectors = new Map((intent?.embeddings ?? [])
+        .filter(e => signature && e.model === signature.model && e.vector.length === signature.dimensions && e.vector.every(Number.isFinite))
+        .map(e => [`${e.row_num}\u0000${e.fact}`, e]));
+      for (const fact of plan.toInsert) {
+        const vector = vectors.get(`${fact.row_num}\u0000${fact.fact}`);
+        if (vector) { fact.embedding = new Float32Array(vector.vector); fact.embedding_model = vector.model; }
+      }
+      const writes = reconcileWrites(plan);
+      const written = await writeFenceReconcile(tx, row.source_id, row.slug, plan, writes);
+      return { status: 'completed', ...written, deleted: writes.detach.length + writes.expireInPlace.length, deferred: writes.deferInserts,
+        warnings: [...warnings, ...written.warnings] };
+    } };
+}
+
+/**
+ * Managed brains: expire the active fence-owned rows of one soft-deleted
+ * page as a database-only request. It admits only a page that is still
+ * soft-deleted, never restores it, and the apply rechecks the deletion under
+ * the page key, so a concurrent restore wins. Returns the expired ids.
+ */
+async function expireDeletedPageFactsManaged(engine: BrainEngine, authority: MaintenanceAuthority, slug: string): Promise<number[]> {
+  const sourceId = authority.writer.sourceId;
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  if (!snapshot?.page.deleted_at) return [];
+  for (let attempt = 0; ; attempt++) {
+    const requestId = maintenanceRequestIdFor(['extract-facts-deleted-page-v1', authority.writer.sourceIncarnation, sourceId, slug, snapshot.revision, attempt]);
+    const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
+    if (prior && isTerminal(prior) && prior.state !== 'committed') continue;
+    try {
+      const receipt = await submitDatabaseMaintenanceIntent(engine, authority, slug,
+        { kind: DELETED_PAGE_FACTS_INTENT, expected_revision: snapshot.revision, page_id: snapshot.page.id, deleted_page: true }, requestId);
+      return Array.isArray(receipt.expired) ? receipt.expired.map(Number) : [];
+    } catch (error) {
+      if (error instanceof OperationError && ['revision_conflict', 'page_not_found', 'page_identity_changed', 'write_pending'].includes(error.code)) return [];
+      throw error;
+    }
+  }
+}
+
+/** Preparer for `managed_maintenance_deleted_page_facts_expire`. */
+export async function prepareDeletedPageFactsExpiry(engine: BrainEngine, row: WriteRequest): Promise<PreparedMutation> {
+  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+  if (!snapshot || snapshot.page.id !== Number(row.page_id) || !snapshot.page.deleted_at) {
+    throw opError('page_identity_changed', 'The deleted page was restored, purged or replaced before its facts were expired.',
+      `Page ${row.slug} in source ${row.source_id} is no longer the soft-deleted page request ${row.request_id} was admitted for, so its facts were left as they are. No action is needed; extract_facts reconciles a restored page from its fence.`);
+  }
+  await authorizeWrite(engine, row.authority, 'submit_job', row.slug);
+  return { observedRevision: snapshot.revision, noop: true,
+    validate: async tx => { await authorizeWrite(tx, row.authority, 'submit_job', row.slug); },
+    apply: async tx => {
+      const expired = await tx.executeRaw<{ id: number }>(
+        `UPDATE facts f SET expired_at = now()
+          WHERE f.source_id = $1 AND f.source_markdown_slug = $2 AND f.row_num IS NOT NULL AND f.expired_at IS NULL
+            AND EXISTS (SELECT 1 FROM pages p WHERE p.source_id = $1 AND p.slug = $2 AND p.id = $3 AND p.deleted_at IS NOT NULL)
+          RETURNING f.id`,
+        [row.source_id, row.slug, Number(row.page_id)]);
+      return { status: 'completed', expired: expired.map(e => Number(e.id)) };
+    } };
+}
+
 export interface ExtractFactsOpts {
   /** Subset of slugs to reconcile. undefined = walk every page in the brain. */
   slugs?: string[];
@@ -334,6 +629,12 @@ export interface ExtractFactsOpts {
   signal?: AbortSignal;
   /** Override the shared page-lock directory for deterministic tests. */
   pageLockRoot?: string;
+  /**
+   * #5151: with an explicit slug list on an unmanaged brain, also reconcile
+   * a bounded batch of pages whose facts watermark is behind the page
+   * (src/core/facts/reconcile-watermark.ts). The dream cycle sets it.
+   */
+  drain?: FactsReconcileDrainOpts;
 }
 
 export interface ExtractFactsResult {
@@ -344,13 +645,20 @@ export interface ExtractFactsResult {
   factsUpdated: number;
   /** Fence-owned rows expired and detached because their row left the fence. */
   factsDeleted: number;
+  /** Unfenced rows (`row_num IS NULL`, live entity page) still pending after this run's fence step. */
   legacyRowsPending: number;
+  /** Pages (sorted slugs) that still hold those rows; they skip reconciliation while the other pages reconcile (#6278). */
+  legacyPages: string[];
+  /** Unfenced rows this run appended to their page's fence and stamped with a row number (#5299). */
+  unfencedRowsFenced: number;
   /** Active fence-owned rows expired because their page was soft-deleted. */
   factsExpiredForDeletedPages: number;
   guardTriggered: boolean;
   /** Pages whose reconcile threw and rolled back; later pages still ran. */
   pagesFailed: number;
   warnings: string[];
+  /** #5575 B3: new fence rows the write gate flagged, held or rejected; present only when it did any. */
+  writeGate?: GateTally;
   /** v0.35.5: phantom-redirect pre-pass counts. */
   phantomsScanned: number;
   phantomsRedirected: number;
@@ -430,86 +738,24 @@ function timelineHasGenuineFactsFenceMarker(timeline: string): boolean {
 }
 
 /**
- * Run the extract_facts phase against the current brain state. Returns
- * an ExtractFactsResult envelope; status mapping (ok / warn / fail)
- * happens in the cycle.ts caller.
+ * Empty-fence guard (Codex R2-#7; #2484; #2646; per page, #6278): the active
+ * unfenced rows the fence step left on live pages of this source, per page.
+ * A row counts only when `row_num IS NULL`, its `entity_slug` resolves to a
+ * LIVE page in THIS run's source (#3526 source isolation), it is not
+ * soft-expired (#2646: `forget_fact` drains rows by soft-expiring them), the
+ * source has a `local_path` (#2763), and it is not an ontology observation
+ * (`dimension IS NULL`, #6264: those are never fenced, so they must not gate
+ * either). Rows without a page or checkout (#2484: the inline writer's
+ * slugify-floor / stub-guard-blocked slugs) are structurally unfenceable and
+ * never gate.
  */
-export async function runExtractFacts(
-  engine: BrainEngine,
-  opts: ExtractFactsOpts = {},
-): Promise<ExtractFactsResult> {
-  const sourceId = opts.sourceId ?? 'default';
-  // Managed brains reconcile the same way, but each database write commits
-  // inside the coordinator's source capability under the page key.
-  const managed = await managedDerivedFactsPreflight(engine, sourceId);
-  const transact = <T>(slugs: string[], fn: (tx: BrainEngine) => Promise<T>): Promise<T> =>
-    managed ? withDerivedFactsWrite(engine, sourceId, slugs, fn) : engine.transaction(fn);
-  const result: ExtractFactsResult = {
-    pagesScanned: 0,
-    pagesWithFacts: 0,
-    factsInserted: 0,
-    factsUpdated: 0,
-    factsDeleted: 0,
-    legacyRowsPending: 0,
-    factsExpiredForDeletedPages: 0,
-    pagesFailed: 0,
-    guardTriggered: false,
-    warnings: [],
-    phantomsScanned: 0,
-    phantomsRedirected: 0,
-    phantomsAmbiguous: 0,
-    phantomsSkippedDrift: 0,
-    phantomsLockBusy: false,
-    phantomsMorePending: false,
-  };
-
-  // ── Empty-fence guard (Codex R2-#7; #2484; #2646) ──────────────
-  // Pre-check: if any genuinely-backfillable legacy fact rows exist,
-  // refuse to run the destructive reconciliation pass — the v0_32_2
-  // orchestrator must fence them first.
-  //
-  // A row is a real backfill candidate only when `row_num IS NULL`
-  // (never fenced) AND its `entity_slug` resolves to a LIVE page in
-  // this source (the migration's Phase B only fences rows whose
-  // entity_slug maps to a writable page) AND it is not soft-expired.
-  // #2484: the original predicate was just `row_num IS NULL AND
-  // entity_slug IS NOT NULL`, which ALSO matched
-  // structurally-unfenceable hot-memory rows the inline writer keeps
-  // producing post-migration: the legacy DB-only fallback
-  // (backstop.ts) writes `entity_slug` (a resolved slug, e.g. a
-  // slugify-floor or stub-guard-blocked unprefixed slug like
-  // `people-jane-doe`) with `row_num` NULL whenever the slug has no
-  // fenceable page. Those rows can never satisfy the migration's exit
-  // condition (no page to fence onto, and `apply-migrations` is a
-  // ledger-complete no-op for them), so they jammed the phase forever
-  // — ~16/day, mislabeled "v0.31 pending backfill." We now require a
-  // live backing page, which both genuine pre-v0.32.2 rows (their
-  // entity page exists) satisfy and inline-writer unfenceable rows do
-  // not. #2646: soft-expired rows (`expired_at IS NOT NULL`) are also
-  // excluded — `forget_fact`, the officially sanctioned removal path,
-  // soft-expires legacy rows rather than deleting them, so counting
-  // expired rows would leave the guard permanently stuck with no
-  // supported way to drain the backlog.
-  //
-  // Source isolation (#3526): the count is scoped to THIS run's
-  // sourceId. The pre-fix query counted brain-wide, so a single pending
-  // legacy row in any mounted source jammed extract_facts for every
-  // source — a cross-source leak of one source's migration state into
-  // another's cycle (CLAUDE.md source-isolation invariant).
-  //
-  // #2763: the count also requires the source to have a `local_path` —
-  // mirroring the v0_32_2 Phase B fenceability rule (its backfill SKIPS
-  // rows whose source has no local_path, `skipped_no_local_path`, yet
-  // still returns complete). On a thin-client / DB-only source the
-  // backstop writer keeps producing row_num-NULL rows whose entity_slug
-  // maps to a LIVE page; without the local_path check those rows
-  // tripped the guard forever with drain advice (`apply-migrations
-  // --force-retry 0.32.2`) that is a structural no-op for them.
-  const legacy = await engine.executeRaw<{ n: string }>(
-    `SELECT COUNT(*) AS n
+async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise<{ count: number; slugs: Set<string> }> {
+  const legacy = await engine.executeRaw<{ entity_slug: string; n: string }>(
+    `SELECT f.entity_slug, COUNT(*) AS n
        FROM facts f
       WHERE f.source_id = $1
         AND f.row_num IS NULL
+        AND f.dimension IS NULL
         AND f.entity_slug IS NOT NULL
         AND f.expired_at IS NULL
         AND EXISTS (
@@ -522,33 +768,91 @@ export async function runExtractFacts(
           SELECT 1 FROM sources s
            WHERE s.id = f.source_id
              AND s.local_path IS NOT NULL
-        )`,
+        )
+      GROUP BY f.entity_slug`,
     [sourceId],
   );
-  const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
+  return { count: legacy.reduce((sum, row) => sum + parseInt(row.n ?? '0', 10), 0), slugs: new Set(legacy.map(row => row.entity_slug)) };
+}
+
+/**
+ * Run the extract_facts phase against the current brain state. Returns
+ * an ExtractFactsResult envelope; status mapping (ok / warn / fail)
+ * happens in the cycle.ts caller.
+ */
+export async function runExtractFacts(
+  engine: BrainEngine,
+  opts: ExtractFactsOpts = {},
+): Promise<ExtractFactsResult> {
+  const sourceId = opts.sourceId ?? 'default';
+  // Managed brains reconcile the same way, but each page's writes publish as
+  // a receipted database-only maintenance request. The authority is
+  // preflighted on the first page that needs a write, so a run with nothing
+  // to change never needs one; an unacceptable caller still refuses first.
+  const managed = await maintenanceCallerPreflight(engine, sourceId);
+  let authority: Promise<MaintenanceAuthority | null> | undefined;
+  const managedAuthority = () => managed ? authority ??= maintenancePreflight(engine, sourceId) : Promise.resolve(null);
+  const result: ExtractFactsResult = {
+    pagesScanned: 0,
+    pagesWithFacts: 0,
+    factsInserted: 0,
+    factsUpdated: 0,
+    factsDeleted: 0,
+    legacyRowsPending: 0,
+    legacyPages: [],
+    unfencedRowsFenced: 0,
+    factsExpiredForDeletedPages: 0,
+    pagesFailed: 0,
+    guardTriggered: false,
+    warnings: [],
+    phantomsScanned: 0,
+    phantomsRedirected: 0,
+    phantomsAmbiguous: 0,
+    phantomsSkippedDrift: 0,
+    phantomsLockBusy: false,
+    phantomsMorePending: false,
+  };
+
+  // ── Fence unfenced rows (#5299) ─────────────────────────────────
+  // The inline writer's DB-only fallback keeps producing `row_num IS NULL`
+  // rows on live entity pages (a write from a host without the checkout,
+  // `sync.write_through=off`). Each run fences them itself through the
+  // shared core pass (the v0.32.2 migration's Phase B): the coordinator on a
+  // managed brain, the page file + maintenance transaction otherwise. The
+  // fenced pages join this run's reconcile below.
+  let fencedSlugs: string[] = [];
+  if (!opts.dryRun) {
+    try {
+      const fence = await fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId }), { pageLockRoot: opts.pageLockRoot });
+      result.unfencedRowsFenced = fence.fenced;
+      fencedSlugs = fence.fenced_slugs;
+      for (const page of [...fence.failed_pages, ...fence.missing_files]) result.warnings.push(`FACTS_FENCE_FAILED: ${page}`);
+    } catch (e) {
+      result.warnings.push(`FACTS_FENCE_FAILED: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
+    }
+  }
+
+  // ── Empty-fence guard (per page, #6278) ─────────────────────────
+  // Rows the fence step could not fence this run keep their own page out of
+  // the destructive reconciliation pass; the other pages reconcile.
+  const { count: legacyCount, slugs: legacySlugs } = await pendingLegacyRows(engine, sourceId);
   result.legacyRowsPending = legacyCount;
+  result.legacyPages = [...legacySlugs].sort();
   if (legacyCount > 0) {
     result.guardTriggered = true;
-    // Drain advice must actually work: a bare `apply-migrations --yes`
-    // is a no-op once the v0.32.2 ledger entry says complete (the
-    // runner classifies it as already-applied), so the sanctioned
-    // re-run path is the explicit retry marker first. Phase B is
-    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
-    // against the existing fence — so the re-run is safe. Individual
-    // rows can instead be drained through `forget_fact` (soft-expired
-    // rows stop counting).
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
-      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
-      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
-      `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
+      `extract_facts: ${legacyCount} unfenced fact row(s) on ${legacySlugs.size} page(s) in source "${sourceId}" (entity page present, row_num NULL) ` +
+      (opts.dryRun
+        ? 'would be fenced by this phase; a dry run writes nothing, so those pages skip reconciliation.'
+        : 'could not be fenced this run, so those pages keep their fact index and skip reconciliation while the other pages reconcile. ' +
+          'The FACTS_FENCE_FAILED warnings name each page and why; ' +
+          'a page whose canonical file does not exist on this host is fenced by the cycle on the host that holds the file; ' +
+          'a row the fence codec cannot render stays active and searchable (doctor fence_integrity lists it); the phantom-redirect pass waits until the source has no unfenced rows. ' +
+          'Individual rows can instead be drained via `forget_fact`.'),
     );
-    // #3683: book the halt BEFORE the early return. The end-of-run rollup
-    // write below is unreachable from this path, so pre-fix a guard-triggered
-    // run recorded NOTHING in extract_rollup_7d — halt_count was structurally
-    // 0 and doctor extract_health's `halt_rate > 10%` warning could never
-    // fire for facts.fence no matter how long the phase stayed jammed.
-    // upsertExtractRollup is best-effort internally (never throws).
+    // #3683: a guard-triggered run books its halt here for doctor
+    // extract_health's halt_rate (the completion rollup below is skipped for
+    // it). upsertExtractRollup is best-effort internally (never throws).
     if (!opts.dryRun) {
       await upsertExtractRollup(engine, {
         kind: 'facts.fence',
@@ -558,7 +862,6 @@ export async function runExtractFacts(
         halt_delta: 1,
       });
     }
-    return result;
   }
 
   // ── v0.35.5: phantom-redirect pre-pass ──────────────────────────
@@ -570,8 +873,11 @@ export async function runExtractFacts(
   // Idempotency-by-construction: phantom predicate filters out `deleted_at
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
+  // #6278: the pass moves rows by their fence position and would strand a
+  // legacy row (no position) on a deleted phantom, so it still waits for the
+  // whole source to be fenced; the reconcile walk below is per page.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir) {
+  if (opts.brainDir && legacyCount === 0) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,
@@ -614,9 +920,10 @@ export async function runExtractFacts(
         RETURNING f.id`,
       [sourceId],
     );
-    // Managed: one page at a time under its key, so a concurrent restore is
-    // either seen as restored or waited for, never expired underneath it.
-    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, transact) : await expireDeleted(engine);
+    // Managed: one receipted request per page, rechecked under its key, so a
+    // concurrent restore is either seen as restored or waited for, never
+    // expired underneath it.
+    const expired = managed ? await expireDeletedPagesManaged(engine, sourceId, managedAuthority) : await maintenanceTransaction(engine, expireDeleted);
     result.factsExpiredForDeletedPages = expired.length;
   }
 
@@ -643,122 +950,43 @@ export async function runExtractFacts(
   // Without this, an incremental-mode cycle with phantom-but-not-canonical
   // in opts.slugs would leave canonical's DB facts stale until next full
   // walk (codex A1 — the round-14 risk specialized to scenario B).
-  if (phantomResult.touched_canonicals.length > 0) {
-    const slugSet = new Set(slugs);
-    for (const c of phantomResult.touched_canonicals) slugSet.add(c);
-    slugs = Array.from(slugSet);
+  if (phantomResult.touched_canonicals.length > 0 || fencedSlugs.length > 0) {
+    slugs = Array.from(new Set([...slugs, ...phantomResult.touched_canonicals, ...fencedSlugs]));
   }
+  const watermark = !managed && !opts.dryRun;
+  const explicit = new Set(slugs);
+  if (watermark && opts.drain && opts.slugs !== undefined) {
+    slugs = Array.from(new Set([...slugs, ...await selectFactsReconcileDrain(engine, sourceId, opts.drain)]));
+  }
+  const drainDeadline = Date.now() + (opts.drain?.budgetMs ?? FACTS_DRAIN_BUDGET_MS);
+  // #6278 (Decision 57): a page still holding unadopted legacy rows keeps its
+  // index as it is; reconciling it would classify those rows as stale.
+  slugs = slugs.filter(slug => !legacySlugs.has(slug));
 
   // ── Reconcile each page ───────────────────────────────────────
   // Each page reconciles independently: 'stop' ends the walk (cancellation),
-  // 'next' moves on. A thrown error is isolated to its page below.
-  const reconcilePage = async (slug: string): Promise<'next' | 'stop'> => {
+  // every other outcome moves on. A thrown error is isolated to its page
+  // below. For the watermark, 'unchanged' is a complete no-op still to be
+  // stamped and 'complete' was stamped inside the write transaction.
+  type PageOutcome = FactsReconcileOutcome | 'unchanged' | 'skipped' | 'stop';
+  let revision: string | null | undefined;
+  const reconcilePage = async (slug: string): Promise<PageOutcome> => {
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {
       // Slug listed but not in DB — skip silently. The next cycle
       // will pick it up if it exists.
-      return 'next';
+      return 'skipped';
     }
+    revision = page.knowledge_revision ?? null;
+    // #6259: a quarantined page projects no fence facts; its existing index is left as it is.
+    if (isQuarantined(page.frontmatter as Record<string, unknown> | null)) return 'skipped';
 
-    const body = page.compiled_truth ?? '';
-    const parsed = parseFactsFence(body);
-    if (parsed.warnings.length > 0) {
-      result.warnings.push(
-        ...parsed.warnings.map(w => `${slug}: ${w}`),
-      );
-      // The parser deliberately skips malformed rows and returns any rows it
-      // could still recover. That partial result is not authoritative: using
-      // it for reconciliation would interpret skipped rows as deletions.
-      // Preserve this page's existing index and continue with other pages.
-      return 'next';
-    }
-
-    // #3625: splitBody() puts everything below the timeline sentinel into
-    // page.timeline, not compiled_truth — a `## Facts` fence written there
-    // (agent-composed bodies commonly append it at the bottom) is invisible
-    // to the parseFactsFence(body) call above. Without this check,
-    // parsed.facts.length === 0 reads as "the user deleted the fence" and
-    // the block below prunes every previously-indexed row for the page —
-    // when the fence is actually just misplaced, not absent. Distinguish
-    // the two by checking whether a fence marker ALSO landed in
-    // page.timeline: if so, the page is non-authoritative — malformed
-    // placement (loud warning, preserve the existing index), never treated
-    // as absence (destructive delete). Checked unconditionally on
-    // parsed.facts.length (not just when it's 0): a page can have a valid
-    // fence above the sentinel AND a stray/duplicate one below it (e.g. a
-    // partial hand-edit), in which case parsed.facts.length > 0 but
-    // reconciling from compiled_truth alone would still misread the
-    // below-sentinel rows as deleted. Uses timelineHasGenuineFactsFenceMarker
-    // rather than a raw .includes() (adversarial review finding: the naive
-    // substring check false-positives on the marker text merely being
-    // mentioned in a doc code-block or quoted prose, wrongly blocking a
-    // genuine deletion and leaving stale facts indexed indefinitely).
-    if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
-      result.warnings.push(
-        `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
-        `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +
-        `Move the fence above the sentinel and re-save — leaving it in place ` +
-        `preserves the existing indexed facts but they will not update.`,
-      );
-      return 'next';
-    }
-
-    if (parsed.facts.length > 0) result.pagesWithFacts += 1;
-
-    // v0.35.4 (D-ENG-1) — thread page.effective_date as the fallback
-    // valid_from. Without this, fence rows without explicit `validFrom:`
-    // land with `valid_from = now()` (import timestamp) and every
-    // trajectory query against the page returns import dates instead of
-    // claim dates.
-    const pageEffectiveDate = page.effective_date ? new Date(page.effective_date) : null;
-    // #1781: duplicate ACTIVE rows (same claim and source) index once. A
-    // struck history row never collapses with an active row that carries the
-    // same text, so a claim that reverts to an earlier value stays active.
-    const activeKeys = new Set<string>();
-    const extracted = extractFactsFromFenceText(parsed.facts, slug, sourceId, { pageEffectiveDate }).filter(f => {
-      if (f.expired_at != null) return true;
-      const key = `${f.fact}\u0000${f.source}`;
-      if (activeKeys.has(key)) return false;
-      activeKeys.add(key);
-      return true;
-    });
-
-    if (opts.dryRun) return 'next';
-
-    // Reconcile by row number, the fence's own unique identity (the parser
-    // refuses duplicate row numbers). A DB row whose (row_num, claim) is still
-    // in the fence keeps its id and has its other cells updated in place, so
-    // ids handed out by recall keep working for forget and consolidation,
-    // source_session, created_at and embeddings survive an edit. A row whose
-    // number disappeared or whose claim was rewritten is expired and detached
-    // (row_num NULL), never deleted: the same rule the managed projection
-    // applies. Keying on row number also keeps a claim that reverts to an
-    // earlier value (NYC -> SF -> NYC) active instead of folding it onto the
-    // struck history row with the same text.
-    const existing = await listExistingFactsForPage(engine, slug, sourceId);
-    const desiredByRow = new Map(extracted.map(f => [f.row_num, f]));
-    const matched = new Map<number, ExistingPageFact>();
-    const stale: ExistingPageFact[] = [];
-    for (const fact of existing) {
-      const desired = fact.row_num == null ? undefined : desiredByRow.get(Number(fact.row_num));
-      if (desired && desired.fact === fact.fact) matched.set(desired.row_num, fact);
-      else stale.push(fact);
-    }
-    const updates = extracted.filter(f => {
-      const fact = matched.get(f.row_num);
-      return fact !== undefined && factCellsDiffer(fact, f);
-    });
-    const toInsert = extracted.filter(f => !matched.has(f.row_num));
-    const chain = supersessionChainOf(extracted, slug);
-
-    if (stale.length === 0 && updates.length === 0 && toInsert.length === 0) {
-      const byRow = new Map([...matched].map(([row, fact]) => [row, { id: Number(fact.id), struck: fact.expired_at != null }]));
-      const inSync = extracted.every(f => {
-        const stored = matched.get(f.row_num)!.superseded_by;
-        return resolveSupersession(f, byRow, chain, slug).superseded_by === (stored == null ? null : Number(stored));
-      });
-      if (inSync) return 'next';
-    }
+    const plan = await planFenceReconcile(engine, page, slug, sourceId, result.warnings);
+    if (!plan) return 'invalid';
+    if (plan.fenceRows > 0) result.pagesWithFacts += 1;
+    if (opts.dryRun) return 'skipped';
+    if (plan.inSync) return 'unchanged';
+    const { toInsert } = plan;
 
     // v0.35.4 (D-CDX-3) — batch-embed new rows before insert so
     // consolidate's cosine clustering and find_trajectory's drift_score see
@@ -801,64 +1029,25 @@ export async function runExtractFacts(
       return 'stop';
     }
 
-    // A vector-bearing row is never replaced by a row that could not be
-    // embedded. Until embedding succeeds, rows keep their positions: stale
-    // rows whose claim is still active in the fence stay as they are, others
-    // are expired in place, and new rows wait. In-place updates (privacy,
-    // notability, strikes) still apply.
-    const deferInserts = toInsert.some(f => !f.embedding) && stale.some(f => f.has_embedding);
-    const activeClaims = new Set(extracted.filter(f => f.expired_at == null).map(f => `${f.fact}\u0000${f.source}`));
-    const detach = deferInserts ? [] : stale;
-    const expireInPlace = deferInserts
-      ? stale.filter(f => f.expired_at == null && !activeClaims.has(`${f.fact}\u0000${f.source}`))
-      : [];
-    const inserts = deferInserts ? [] : toInsert;
+    const writes = reconcileWrites(plan);
+    const { detach, expireInPlace, deferInserts } = writes;
     if (deferInserts) {
       result.warnings.push(`${slug}: destructive fact reconciliation deferred; existing vectors preserved until embedding succeeds`);
     }
 
-    const apply = async () => {
+    type Written = { inserted: number; updated: number; warnings: string[]; deleted?: number; deferred?: boolean; write_gate?: GateTally };
+    const apply = async (): Promise<Written | null> => {
+      const authority = await managedAuthority();
+      if (authority) return publishFenceReconcile(engine, authority, page, slug, toInsert);
       try {
-        return await transact([slug], async tx => {
+        return await maintenanceTransaction(engine, async tx => {
           opts.signal?.throwIfAborted();
+          if (watermark && !await lockReconcileRevision(tx, sourceId, slug, page.knowledge_revision ?? null)) return null;
           const current = await tx.getPage(slug, { sourceId });
           if (!current || current.compiled_truth !== page.compiled_truth || current.timeline !== page.timeline) return null;
-          for (const fact of expireInPlace) {
-            await tx.executeRaw('UPDATE facts SET expired_at = COALESCE(expired_at, now()) WHERE id = $1 AND source_id = $2', [fact.id, sourceId]);
-          }
-          for (const fact of detach) {
-            await tx.executeRaw(
-              `UPDATE facts SET expired_at = COALESCE(expired_at, now()), row_num = NULL
-                WHERE id = $1 AND source_id = $2`,
-              [fact.id, sourceId],
-            );
-          }
-          for (const f of updates) {
-            await tx.executeRaw(
-              `UPDATE facts SET kind = $3, visibility = $4, notability = $5, context = $6,
-                  valid_from = COALESCE($7::timestamptz, valid_from),
-                  valid_until = CASE WHEN $8::boolean THEN $9::timestamptz ELSE valid_until END,
-                  expired_at = CASE WHEN $10::timestamptz IS NULL THEN NULL ELSE COALESCE(expired_at, $10::timestamptz) END,
-                  source = $11, confidence = $12,
-                  claim_metric = $13, claim_value = $14, claim_unit = $15, claim_period = $16
-                WHERE id = $1 AND source_id = $2`,
-              [matched.get(f.row_num)!.id, sourceId, f.kind ?? 'fact', f.visibility ?? 'private', f.notability ?? 'medium',
-                f.context ?? null, f.valid_from?.toISOString() ?? null, f.expired_at == null,
-                f.valid_until?.toISOString() ?? null, f.expired_at?.toISOString() ?? null, f.source, f.confidence ?? 1.0,
-                f.claim_metric ?? null, f.claim_value ?? null, f.claim_unit ?? null, f.claim_period ?? null],
-            );
-          }
-          const inserted = inserts.length === 0
-            ? { inserted: 0 }
-            : await tx.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-              inserts.map(f => ({ ...f, superseded_by_row: undefined })),
-              { source_id: sourceId },
-            );
-          const insertedRows = new Set(inserts.map(f => f.row_num));
-          const linked = await syncSupersession(tx, sourceId, slug, extracted, chain, insertedRows);
-          opts.signal?.throwIfAborted();
-          const updated = new Set([...updates.map(f => f.row_num), ...linked.changed.filter(row => !insertedRows.has(row))]);
-          return { inserted: inserted.inserted, updated: updated.size, warnings: linked.warnings };
+          const written = await writeFenceReconcile(tx, sourceId, slug, plan, writes, opts.signal);
+          if (watermark && !deferInserts) await settleFactsReconcile(tx, sourceId, slug, 'complete', page.knowledge_revision ?? null);
+          return written;
         });
       } catch (error) {
         if (!isAborted(opts.signal)) throw error;
@@ -866,7 +1055,7 @@ export async function runExtractFacts(
         return null;
       }
     };
-    const outcome = detach.length === 0 && expireInPlace.length === 0 && updates.length === 0
+    const outcome = detach.length === 0 && expireInPlace.length === 0 && plan.updates.length === 0
       ? await apply()
       : await underPageLock(slug, async () => {
         if (await refuseDestructiveReconcileOnStaleCache(
@@ -875,13 +1064,14 @@ export async function runExtractFacts(
         if (isAborted(opts.signal)) return null;
         return apply();
       }, opts, result.warnings);
-    if (!outcome) return 'next';
+    if (!outcome) return isAborted(opts.signal) ? 'cancelled' : 'deferred';
     result.factsInserted += outcome.inserted;
     result.factsUpdated += outcome.updated;
-    result.factsDeleted += detach.length + expireInPlace.length;
+    result.factsDeleted += outcome.deleted ?? detach.length + expireInPlace.length;
     // resolveSupersededByRow prefixes each message with the slug + row.
     for (const w of outcome.warnings) result.warnings.push(w);
-    return 'next';
+    if (outcome.write_gate) result.writeGate = mergeGateTally(result.writeGate, outcome.write_gate);
+    return (outcome.deferred ?? deferInserts) ? 'deferred' : 'complete';
   };
 
   for (const slug of slugs) {
@@ -889,9 +1079,13 @@ export async function runExtractFacts(
     // independent delete-then-insert commit, so breaking leaves a consistent
     // partial state; the receipt/rollup below still runs with partial counts.
     if (isAborted(opts.signal)) break;
+    // Drained pages follow the explicit ones, so the drain budget ends the walk.
+    if (!explicit.has(slug) && Date.now() > drainDeadline) break;
     result.pagesScanned += 1;
+    revision = undefined;
+    let outcome: PageOutcome;
     try {
-      if (await reconcilePage(slug) === 'stop') break;
+      outcome = await reconcilePage(slug);
     } catch (error) {
       if (isAborted(opts.signal)) throw error;
       // One page the database rejects (CHECK/FK violation, malformed input the
@@ -899,7 +1093,15 @@ export async function runExtractFacts(
       // Its transaction rolled back, so the existing index is preserved.
       result.pagesFailed += 1;
       result.warnings.push(`${slug}: FACTS_RECONCILE_FAILED: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}`);
+      outcome = 'deferred';
     }
+    if (watermark && outcome !== 'complete' && outcome !== 'skipped') {
+      const settled = outcome === 'unchanged' ? 'complete' : outcome === 'stop' ? 'cancelled' : outcome;
+      await settleFactsReconcile(engine, sourceId, slug, settled, revision).catch((error: unknown) => {
+        result.warnings.push(`${slug}: facts reconcile watermark not recorded: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    if (outcome === 'stop') break;
   }
 
   // v0.42 Wave B3: receipt + rollup. extract_facts is deterministic
@@ -925,10 +1127,9 @@ export async function runExtractFacts(
       console.error(`[extract_facts] receipt write failed: ${(err as Error).message}`);
     }
   }
-  if (!opts.dryRun) {
-    // #3683: guard-triggered runs return early above (and book their halt
-    // there), so this path is always a completed round — the old
-    // `result.guardTriggered ? … : …` ternaries were dead in their true arm.
+  if (!opts.dryRun && !result.guardTriggered) {
+    // #3683: a guard-triggered run booked its halt above (one rollup per
+    // run), so this path is always a completed round.
     await upsertExtractRollup(engine, {
       kind: 'facts.fence',
       source_id: sourceId,
@@ -941,7 +1142,7 @@ export async function runExtractFacts(
 }
 
 async function expireDeletedPagesManaged(engine: BrainEngine, sourceId: string,
-  transact: <T>(slugs: string[], fn: (tx: BrainEngine) => Promise<T>) => Promise<T>): Promise<Array<{ id: number }>> {
+  managedAuthority: () => Promise<MaintenanceAuthority | null>): Promise<Array<{ id: number }>> {
   const pages = await engine.executeRaw<{ slug: string }>(
     `SELECT DISTINCT f.source_markdown_slug AS slug FROM facts f
       WHERE f.source_id = $1 AND f.row_num IS NOT NULL AND f.expired_at IS NULL
@@ -950,13 +1151,8 @@ async function expireDeletedPagesManaged(engine: BrainEngine, sourceId: string,
   );
   const expired: Array<{ id: number }> = [];
   for (const { slug } of pages) {
-    expired.push(...await transact([slug], tx => tx.executeRaw<{ id: number }>(
-      `UPDATE facts f SET expired_at = now()
-        WHERE f.source_id = $1 AND f.source_markdown_slug = $2 AND f.row_num IS NOT NULL AND f.expired_at IS NULL
-          AND EXISTS (SELECT 1 FROM pages p WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NOT NULL)
-        RETURNING f.id`,
-      [sourceId, slug],
-    )));
+    const authority = (await managedAuthority())!;
+    expired.push(...(await expireDeletedPageFactsManaged(engine, authority, slug)).map(id => ({ id })));
   }
   return expired;
 }

@@ -19,12 +19,13 @@ import { resolveRepairScope, runRepair } from '../src/core/repair/core.ts';
 import { performSync } from '../src/commands/sync.ts';
 import { handleToolCall } from '../src/mcp/server.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { inspectUnchanged } from '../src/core/persistence/noop-kernel.ts';
 import { ALL_SOURCES } from '../src/core/source-id.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, withGoogleAccount, connectorPendingSet } from './helpers/connector-fixture.ts';
+import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, withGoogleAccount, connectorPendingSet, withPausedOwnerBudget } from './helpers/connector-fixture.ts';
 
 const { home, engines, env, source, boundSource, setup, teardown } = createConnectorFixture();
 beforeAll(setup, 120_000);
@@ -214,7 +215,7 @@ test('pending set: a pending write that later fails is re-fetched under a new re
     const f = await boundSource(engine, githubConfig);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
     const run = () => runGitHubSync(engine, f.id, parseGitHubSourceConfig(githubConfig, f.dir), { ...options, githubItem: { repo: 'acme-example/app', number: 1, kind: 'issue' } }, githubFetch());
-    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => run())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [entry] = await connectorPendingSet(engine, f.id);
     const [accepted] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 AND request_id=$2::uuid', [f.id, entry.requestId]);
     await disposePersistenceConsumer(engine);
@@ -252,7 +253,7 @@ test('pending set: a committed-then-compacted pending receipt and a crash before
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
     const dup = async (url: string) => url.includes('/settings/sendAs') ? json({ sendAs: [] })
       : json({ connections: [contact('first', 'First Example'), contact('first', 'First Example')], nextSyncToken: 'contacts-dup' });
-    expect(await google(engine, f, dup)).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => google(engine, f, dup))).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const imports = await engine.executeRaw<WriteRequest>("SELECT * FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='connector_v2_import'", [f.id]);
     expect(imports).toHaveLength(1);
     await disposePersistenceConsumer(engine);
@@ -280,7 +281,7 @@ test('mixed versions: a v2 receipt refused by an old consumer names the consumer
     const denied = refusal(receipt('permission_denied', kind));
     expect(denied.code).toBe('permission_denied');
     expect(denied.detail).toBeUndefined();
-    expect(denied.suggestion).toBe('Inspect this receipt before submitting a new request_id.');
+    expect(denied.suggestion).toMatch(/^The submit_job write \(request_id [0-9a-f-]{36}\) ended failed with permission_denied; it will not publish\. Read the receipt and the current state before deciding to submit again; a new attempt needs a new request_id\.$/);
   }
   // A binary that predates the v2 namespace falls through to the same code for any kind it does not know.
   await expect(preparePersistedMutation({} as BrainEngine, receipt('', 'connector_v3_import') as WriteRequest & { operation: string }, { engine: 'pglite' }))
@@ -441,7 +442,7 @@ test('#5470 connector kernel: a safe-chunk reseal, projection lag, a pending con
     // render (#5567): the first re-walk may materialize it into the page once; it survives, and later re-walks skip.
     const summaries = () => engine.executeRaw<{ summary: string }>('SELECT t.summary FROM timeline_entries t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1 AND p.slug=$2', [f.id, slug]);
     expect(await admitted(() => engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () =>
-      tx.addTimelineEntry(slug, { date: '2026-01-02', summary: 'Met to review the example plan', source: 'meetings/2026-01-02' }, { sourceId: f.id }))))).toBeLessThanOrEqual(1);
+      tx.addTimelineEntry(slug, { date: '2026-01-02', summary: 'Met to review the example plan', source: 'meetings/2026-01-02' }, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION)))).toBeLessThanOrEqual(1);
     expect(await admitted(async () => {})).toBe(0);
     expect(await summaries()).toEqual([{ summary: 'Met to review the example plan' }]);
     expect(await admitted(() => engine.executeRaw('UPDATE pages SET text_projection_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [f.id, slug]))).toBe(1);
@@ -509,7 +510,7 @@ test('pending set: a checkpoint still pending at the end of a run is recorded an
     await google(engine, f, fetcher);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
     await disposePersistenceConsumer(engine);
-    expect(await google(engine, f, fetcher)).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => google(engine, f, fetcher))).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [checkpoint] = await connectorPendingSet(engine, f.id);
     expect(checkpoint).toMatchObject({ itemRef: '__managed_connector_checkpoint__' });
     await disposePersistenceConsumer(engine);
@@ -521,7 +522,7 @@ test('pending set: a checkpoint still pending at the end of a run is recorded an
     const f = await boundSource(engine, githubConfig);
     await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
     const run = (fetch: ReturnType<typeof githubFetch>, extra: object = {}) => runGitHubSync(engine, f.id, parseGitHubSourceConfig(githubConfig, f.dir), { ...options, ...extra }, fetch);
-    expect(await run(githubFetch())).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    expect(await withPausedOwnerBudget(() => run(githubFetch()))).toMatchObject({ status: 'partial', reason: 'writer_pending' });
     const [entry] = await connectorPendingSet(engine, f.id);
     const [accepted] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE request_id=$1::uuid', [entry.requestId]);
     await disposePersistenceConsumer(engine);

@@ -7,9 +7,12 @@
  * src/commands/doctor/registry.ts and src/core/doctor-categories.ts.
  */
 
+import { applyExtractAtomsNoPricing, readExtractAtomsNoPricing } from '../../../core/cycle/extract-atoms-cost-gate.ts';
+import { applyFactsReconcileBacklog, readFactsReconcileBacklog } from '../../../core/facts/reconcile-watermark.ts';
+import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
 import { join } from 'path';
 import { gbrainPath } from '../../../core/config.ts';
-import { multiSourceDriftGitRootSkipNote, multiSourceDriftAdvice } from '../schema-pack-checks.ts';
+import { multiSourceDriftCheck, multiSourceDriftNotVerified } from '../schema-pack-checks.ts';
 import { computeConversationFormatCoverageCheck } from './conversation-coverage.ts';
 import {
   computeExtractHealthCheck,
@@ -35,7 +38,9 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   // no live page backs. Fires append per-arm `reason` lines to
   // ~/.gbrain/audit/stub-guard-YYYY-Www.jsonl (pre-#4108 lines lack one and
   // count as unprefixed). The v0.36 sunset criterion covers 'unprefixed'
-  // ONLY; the fallback_resolution arm never sunsets.
+  // ONLY; the fallback_resolution arm never sunsets. 'db_only_page' (#6398)
+  // records facts routed DB-only for a page with no file; it is counted on
+  // its own and never feeds the resolver WARN threshold or the sunset count.
   //
   // WARN at >10 fires/24h — at that rate the resolver is probably missing
   // a case (typo prefix, alias, non-Latin script). Operators should grep
@@ -43,9 +48,11 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   // resolver branch or document them as legitimate bare-slug ingestion.
   try {
     const { readRecentStubGuardEvents } = await import('../../../core/facts/stub-guard-audit.ts');
-    const events = readRecentStubGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    const all = readRecentStubGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    const dbOnlyCount = all.filter((e) => e.reason === 'db_only_page').length;
+    const events = all.filter((e) => e.reason !== 'db_only_page');
     const fallbackCount = events.filter((e) => e.reason === 'fallback_resolution').length;
-    const reasonSplit = `unprefixed=${events.length - fallbackCount}, fallback_resolution=${fallbackCount}`;
+    const reasonSplit = `unprefixed=${events.length - fallbackCount}, fallback_resolution=${fallbackCount}, db_only_page=${dbOnlyCount}`;
     if (events.length > 10) {
       // Surface the top 3 slugs that hit it so operators have somewhere to start.
       const slugCounts = new Map<string, number>();
@@ -57,16 +64,16 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
         name: 'stub_guard_24h',
         status: 'warn',
         message:
-          `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; top: ${topSlugs}). ` +
+          `Stub guard fired ${all.length}x in last 24h (${reasonSplit}; top: ${topSlugs}). ` +
           `If this stays elevated, the prefix-expansion in resolveEntitySlug is ` +
           `missing a case. Check ~/.gbrain/audit/stub-guard-*.jsonl for the slugs ` +
           `that hit it.`,
       });
-    } else if (events.length > 0) {
+    } else if (all.length > 0) {
       checks.push({
         name: 'stub_guard_24h',
         status: 'ok',
-        message: `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; below WARN threshold of 10).`,
+        message: `Stub guard fired ${all.length}x in last 24h (${reasonSplit}; ${events.length} resolver hits, below WARN threshold of 10).`,
       });
     }
     // Zero hits is the goal — emit no check at all so the doctor output stays clean.
@@ -86,6 +93,11 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
   } catch {
     checks.push({ name: 'sync_failures', status: 'warn', message: 'Durable sync failure state could not be read; health is unknown.' });
   }
+  try {
+    const { checkManagedSyncBacklog } = await import('./managed-sync-backlog.ts');
+    const check = await checkManagedSyncBacklog(engine, orphanRatioSourceId ? [orphanRatioSourceId] : undefined);
+    if (check) checks.push(check);
+  } catch { /* managed backlog is informational; doctor's other checks report persistence health */ }
 
   // 3d. Slug-fallback audit (v0.32.7 CJK wave, codex C7). Informational
   // count of pages where importFromFile fell back to a frontmatter slug
@@ -110,7 +122,7 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
 
 export const stubGuardEntry: DoctorEntry = {
   name: 'stub_guard_24h',
-  emits: ['stub_guard_24h', 'sync_failures', 'slug_fallback_audit'],
+  emits: ['stub_guard_24h', 'sync_failures', 'managed_sync_backlog', 'slug_fallback_audit'],
   run: runStubGuard,
 };
 
@@ -190,7 +202,16 @@ async function runExtractionBacklogs(ctx: DoctorContext): Promise<Check[]> {
   // operator should know the DB cache is degraded). See plan A5 + D-EXTRACT-32.
   if (engine) {
     try {
+      // An explicit extract_atoms cap that refused an unpriced model is an
+      // expected limit in the rollup, not a halt; the overlay names the fix.
       const check = await computeExtractHealthCheck(engine);
+      applyExtractAtomsNoPricing(check, await readExtractAtomsNoPricing(engine).catch(() => []));
+      // #5151: unmanaged brains reconcile fences in the cycle, so fence pages
+      // behind their facts watermark are facts not indexed yet.
+      if (!await managedPersistenceEnabled(engine).catch(() => true)) {
+        const backlog = await readFactsReconcileBacklog(engine).catch(() => null);
+        if (backlog) applyFactsReconcileBacklog(check, backlog);
+      }
       checks.push(check);
     } catch {
       // Best-effort; rollup-table missing on pre-v106 brains is normal
@@ -347,6 +368,7 @@ export const extractionBacklogsEntry: DoctorEntry = {
     'progressive_batch_audit_health',
     'conversation_parser_probe_health',
   ],
+  engineChecks: ['malformed_path_pages', 'extract_health', 'conversation_facts_backlog', 'extract_atoms_backlog', 'atom_provenance_drift', 'conversation_format_coverage'],
   run: runExtractionBacklogs,
 };
 
@@ -424,28 +446,50 @@ async function runHomeDirInWorktree(ctx: DoctorContext): Promise<Check[]> {
     const durableEngine = (
       JSON.parse(readFileSync(join(gbrainPath(), 'config.json'), 'utf8')) as { engine?: unknown }
     ).engine;
-    const { assessPgliteLeftovers } = await import('../../../core/pglite-leftovers-check.ts');
+    const { assessPgliteLeftovers, SIZE_WALK_MAX_ENTRIES } = await import('../../../core/pglite-leftovers-check.ts');
+    const { readGraduationManifestSummary, TERMINAL_MANIFEST_STATES } = await import('../../../core/persistence/graduation-serve-guard.ts');
+    const manifest = readGraduationManifestSummary();
     const leftovers = assessPgliteLeftovers(
       typeof durableEngine === 'string' ? durableEngine : undefined,
       gbrainPath(),
+      SIZE_WALK_MAX_ENTRIES,
+      manifest ? { inFlight: !TERMINAL_MANIFEST_STATES.has(manifest.state), retainedPath: `${manifest.dataDir}.graduated-${manifest.runId}` } : null,
     );
     if (leftovers.status !== 'skip') {
+      const copy = leftovers.retained?.[0];
       checks.push({
         name: 'pglite_leftovers',
         status: leftovers.status,
         message: leftovers.message,
+        ...(copy ? {
+          details: { retained: leftovers.retained },
+          fix: {
+            argv: ['rm', '-rf', copy.path], consent: ['destructive'], actor: 'agent', requires_exclusive: false,
+            verify: { argv: ['gbrain', 'doctor', '--only', 'pglite_leftovers', '--json'] }, docs: 'docs/guides/move-to-postgres.md#after-the-move',
+            why: `${copy.path} is the PGLite brain engine graduation moved to Postgres; it still holds private memory and token hashes. Deleting it frees the disk and ends the option to roll back: afterwards a rollback to PGLite refuses with not_found and the brain stays on Postgres.`,
+            user_message: `After moving your brain to Postgres, gbrain kept the old local copy at ${copy.path}. It still contains your private memory and access-token hashes. Should I delete it? You could then no longer roll back to it.`,
+          },
+        } : {}),
       });
     }
   } catch {
     // Best-effort filesystem-hygiene check; never block doctor (a missing/
     // unparseable config.json lands here and skips, same fail-open posture).
   }
+  // Engine graduation state (filesystem only; src/commands/doctor/checks/engine-graduation.ts).
+  try {
+    const { graduationStateCheck } = await import('./engine-graduation.ts');
+    const graduation = graduationStateCheck();
+    if (graduation) checks.push(graduation);
+  } catch {
+    // Best-effort: a malformed manifest or marker never blocks doctor.
+  }
   return checks;
 }
 
 export const homeDirInWorktreeEntry: DoctorEntry = {
   name: 'home_dir_in_worktree',
-  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers'],
+  emits: ['home_dir_in_worktree', 'npm_squat', 'pglite_leftovers', 'graduation_interrupted'],
   run: runHomeDirInWorktree,
 };
 
@@ -497,49 +541,12 @@ async function runDefaultSourcePath(ctx: DoctorContext): Promise<Check[]> {
         engine!,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      if (result.walk_truncated) {
-        checks.push({
-          name: 'multi_source_drift',
-          status: 'warn',
-          message:
-            `Multi-source drift check skipped — FS walk hit limit/timeout. ` +
-            `Re-run on a quieter brain or shorter walk via GBRAIN_DRIFT_LIMIT/GBRAIN_DRIFT_TIMEOUT_MS.`,
-        });
-      } else if (result.count > 0) {
-        const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
-        const skipNote = result.git_root_skipped.length > 0
-          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-          : '';
-        checks.push({
-          name: 'multi_source_drift',
-          status: 'warn',
-          message: multiSourceDriftAdvice(result.count, sampleStr) + skipNote,
-        });
-      } else {
-        // #4712: if EVERY candidate source was skipped as git-root-pinned,
-        // no walk actually ran — 'ok' would misreport "verified clean" when
-        // nothing was checked at all. 'warn' only in that all-skipped case;
-        // a partial skip alongside real, clean coverage stays 'ok'.
-        const allSkipped =
-          result.git_root_skipped.length > 0 &&
-          result.git_root_skipped.length >= nonDefaultWithPath.length;
-        checks.push({
-          name: 'multi_source_drift',
-          status: allSkipped ? 'warn' : 'ok',
-          message: allSkipped
-            ? `Multi-source drift check performed no verification` +
-              multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-            : result.git_root_skipped.length > 0
-              ? `No cross-source slug drift detected among checked sources.` +
-                multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-              : 'No cross-source slug drift detected.',
-        });
-      }
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'local', await managedPersistenceEnabled(engine!).catch(() => false)));
     }
-  } catch {
-    // Best-effort. A broken sources table or unreadable local_path should
-    // not stop doctor. The walk itself catches per-directory errors; this
-    // outer try covers the executeRaw path.
+  } catch (e) {
+    // A broken sources table must not stop doctor, but the check still
+    // reports that it verified nothing (#5432).
+    checks.push(multiSourceDriftNotVerified(e));
   }
 
   // 3c. Orphan clone temp dirs (v0.28 P1). `gbrain sources add --url` clones
@@ -594,5 +601,6 @@ async function runDefaultSourcePath(ctx: DoctorContext): Promise<Check[]> {
 export const defaultSourcePathEntry: DoctorEntry = {
   name: 'default_source_local_path',
   emits: ['default_source_local_path', 'fts_reindex_incomplete', 'multi_source_drift', 'orphan_clones'],
+  engineChecks: ['default_source_local_path', 'fts_reindex_incomplete', 'multi_source_drift'],
   run: runDefaultSourcePath,
 };

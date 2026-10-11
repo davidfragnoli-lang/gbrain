@@ -25,12 +25,12 @@
       },
       "addLinksBatch#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -488,6 +488,19 @@
         "flagOnScopes": []
       },
       "findDuplicatePage#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
+      "findDuplicatePages#default": {
         "flagOffLanes": [
           "pool"
         ],
@@ -998,9 +1011,10 @@
       },
       "getHealth#default": {
         "flagOffLanes": [
-          "pool"
+          "pool",
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
           "pool",
@@ -1466,6 +1480,28 @@
         ],
         "flagOnScopes": []
       },
+      "getVersions#limit": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "getVersions#metadataOnly": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
       "getVersions#sourceId": {
         "flagOffLanes": [
           "pool"
@@ -1768,6 +1804,39 @@
         "flagOnScopes": []
       },
       "listFactsBySession#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "listFactsKeyset#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "listFactsKeyset#keyset": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "listFactsKeyset#strictTime": {
         "flagOffLanes": [
           "pool"
         ],
@@ -2404,6 +2473,19 @@
           "src-a"
         ]
       },
+      "readPageSnapshotsBatch#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
       "refreshPageBody#default": {
         "flagOffLanes": [
           "pool"
@@ -2483,7 +2565,23 @@
       },
       "replaceDerivedLinks#default": {
         "flagOffLanes": [
-          "tx"
+          "tx",
+          "tx>sp"
+        ],
+        "flagOffOpensTransaction": true,
+        "flagOn": "scoped",
+        "flagOnLanes": [
+          "tx",
+          "tx>sp"
+        ],
+        "flagOnScopes": [
+          "src-a"
+        ]
+      },
+      "replaceDerivedLinksBatch#default": {
+        "flagOffLanes": [
+          "tx",
+          "tx>sp"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
@@ -2651,11 +2749,13 @@
       },
       "searchKeyword#cjk": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2664,11 +2764,13 @@
       },
       "searchKeyword#cjk+sourceIds+detailLow": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2677,11 +2779,13 @@
       },
       "searchKeyword#fts": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2690,11 +2794,13 @@
       },
       "searchKeyword#fts+orFallback": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2704,11 +2810,13 @@
       },
       "searchKeyword#fts+sourceIds": {
         "flagOffLanes": [
+          "pool",
           "tx"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
         "flagOnLanes": [
+          "pool",
           "tx"
         ],
         "flagOnScopes": [
@@ -2846,6 +2954,7 @@
           "tx"
         ],
         "flagOnScopes": [
+          "src-a",
           "src-a",
           "src-a"
         ]
@@ -3271,13 +3380,14 @@
       }
     },
     "static": {
-      "callSites": 23,
+      "callSites": 25,
       "directMethods": {
         "_searchKeywordCJK": 1,
         "countChunklessPagesWithContent": 1,
         "countStaleChunks": 1,
         "countStalePagesForExtraction": 1,
         "findDuplicatePage": 1,
+        "findDuplicatePages": 1,
         "getAllSlugs": 1,
         "getBacklinks": 1,
         "getChunkWindows": 1,
@@ -3291,10 +3401,12 @@
         "listStaleChunks": 1,
         "listStalePagesForExtraction": 1,
         "readPageSnapshot": 1,
+        "readPageSnapshotsBatch": 1,
+        "runVectorAttempt": 1,
         "searchKeyword": 1,
         "searchKeywordChunks": 1,
         "searchTitles": 1,
-        "searchVector": 2
+        "searchVector": 1
       },
       "helper": "withScopedReadTransaction",
       "scoping": {
@@ -3335,10 +3447,12 @@
         "executeRaw": "none",
         "executeRawDirect": "none",
         "expireFact": "none",
+        "explainVectorSearch": "via:runVectorAttempt",
         "findAnomalies": "none",
         "findByTitleFuzzy": "none",
         "findCandidateDuplicates": "none",
         "findDuplicatePage": "direct",
+        "findDuplicatePages": "direct",
         "findOntologyConflicts": "none",
         "findOrphanPages": "none",
         "findTrajectory": "none",
@@ -3389,6 +3503,7 @@
         "insertFacts": "none",
         "invalidateContentDriftEmbeddings": "none",
         "invalidateStaleSignatureEmbeddings": "none",
+        "jitOffRead": "none",
         "listActiveTakesForPages": "none",
         "listAllPageRefs": "none",
         "listAllSources": "none",
@@ -3400,6 +3515,7 @@
         "listEvalCaptureFailures": "none",
         "listFactsByEntity": "none",
         "listFactsBySession": "none",
+        "listFactsKeyset": "none",
         "listFactsSince": "none",
         "listFilesForPage": "none",
         "listLinkSources": "direct",
@@ -3419,20 +3535,24 @@
         "markPagesExtractedBatch": "none",
         "mergeOntologyFact": "none",
         "migrateFactsToCanonical": "none",
+        "onCheckout": "none",
         "purgeDeletedPages": "none",
         "putContradictionCacheEntry": "none",
         "putDreamVerdict": "none",
         "putPage": "none",
         "putRawData": "none",
         "readPageSnapshot": "direct",
+        "readPageSnapshotsBatch": "direct",
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
+        "relationalChainHop": "none",
         "relationalFanout": "none",
         "removeLink": "none",
         "removeLinksByPagesAndSource": "none",
         "removeTag": "none",
         "replaceDerivedLinks": "none",
+        "replaceDerivedLinksBatch": "none",
         "resolveAliases": "none",
         "resolveFactsEmbeddingCast": "none",
         "resolveSlugWithAlias": "none",
@@ -3446,6 +3566,7 @@
         "rlsScopeBindingEnabled": "none",
         "runMigration": "none",
         "runUnsafe": "none",
+        "runVectorAttempt": "direct",
         "searchKeyword": "direct",
         "searchKeywordChunks": "direct",
         "searchTakes": "none",
@@ -3478,6 +3599,7 @@
         "upsertChunks": "via:_upsertChunksOnce",
         "upsertEventProjection": "none",
         "upsertFile": "none",
+        "vectorIterativeScanSupported": "none",
         "withReservedConnection": "none",
         "withScopedReadTransaction": "none",
         "writeContradictionsRun": "none"

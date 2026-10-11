@@ -9,8 +9,10 @@
 
 import { startHeartbeat } from '../../../core/progress.ts';
 import { quarantineFilterFragment } from '../../../core/quarantine.ts';
+import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../../../core/types.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
+import { brainScorePlanFix, checkError } from '../check-fix.ts';
 
 async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -84,6 +86,15 @@ async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
         status: 'ok',
         message: `Only code/test fixture entity pages found (${entityCount}); graph_coverage not applicable`,
       });
+    } else if (eligibleEntityCount < MIN_ENTITY_PAGES_FOR_COVERAGE) {
+      // Same small-N floor BrainHealth grades from: a 1-4 page ratio is noise,
+      // and warning on it leaves a WARN that `extract all` cannot clear.
+      const pages = eligibleEntityCount === 1 ? 'page' : 'pages';
+      checks.push({
+        name: 'graph_coverage',
+        status: 'ok',
+        message: `Only ${eligibleEntityCount} eligible entity ${pages} (< ${MIN_ENTITY_PAGES_FOR_COVERAGE}) — coverage ratio not meaningful at this scale`,
+      });
     } else if (linkCoverage >= 0.7 && timelineCoverage >= 0.5) {
       checks.push({ name: 'graph_coverage', status: 'ok', message: `Entity connected coverage (in/out) ${linkPct}%, entity timeline coverage ${timelinePct}%` });
     } else {
@@ -102,7 +113,7 @@ async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
       const parts = [
         `embed ${health.embed_coverage_score}/35`,
         `links ${health.link_density_score}/25`,
-        `timeline density (all pages) ${health.timeline_coverage_score}/15`,
+        `timeline density (entity and event pages) ${health.timeline_coverage_score}/15`,
         `orphans ${health.no_orphans_score}/15`,
         `dead-links ${health.no_dead_links_score}/10`,
       ];
@@ -110,12 +121,13 @@ async function runGraphCoverage(ctx: DoctorContext): Promise<Check[]> {
         name: 'brain_score',
         status: health.brain_score >= 70 ? 'ok' : 'warn',
         message: `Brain score ${health.brain_score}/100 (${parts.join(', ')})`,
+        ...(health.brain_score >= 70 ? {} : { fix: brainScorePlanFix() }),
       });
     } else {
       checks.push({ name: 'brain_score', status: 'ok', message: `Brain score 100/100` });
     }
   } catch {
-    checks.push({ name: 'graph_coverage', status: 'warn', message: 'Could not check graph coverage' });
+    checks.push(checkError('graph_coverage', 'check graph coverage'));
   }
   return checks;
 }
@@ -133,7 +145,7 @@ async function runOrphanRatio(ctx: DoctorContext): Promise<Check[]> {
 
   // 9b. v0.41.18.0 — orphan_ratio check (migration #1 of #1409).
   //
-  // Surfaces the fraction of linkable pages with no inbound links.
+  // Surfaces the fraction of linkable pages with no links in either direction.
   // Consumes the same canonical getOrphansData() pure fn as
   // `gbrain orphans --count` (D1), so the two surfaces cannot disagree.
   //
@@ -174,31 +186,35 @@ async function runOrphanRatio(ctx: DoctorContext): Promise<Check[]> {
         entityCount < 100
           ? ` — low scale (${entityCount} entity pages <100), interpret with caution`
           : '';
+      // #5877: --by-mention only runs against the database (`--source db`);
+      // the bare command exits 2 on the default fs source.
       const hint =
-        'Run: gbrain extract links --by-mention   (auto-links entity mentions in body text). ' +
-        'Run gbrain orphans for the list.';
-      if (ratio > 0.8) {
+        `Run: gbrain extract links --by-mention --source db${srcId ? ` --source-id ${srcId}` : ''}   (auto-links entity mentions in body text). ` +
+        `Run gbrain orphans${srcId ? ` --source ${srcId}` : ''} for the list.`;
+      const rendersExcluded = data.connector_renders_excluded ?? 0;
+      const renders = rendersExcluded > 0
+        ? ` ${rendersExcluded} connector email/meeting renders are reported apart and left out of the ratio.`
+        : '';
+      const details = { connector_renders_excluded: rendersExcluded };
+      const counts = `${data.total_orphans}/${data.total_linkable} linkable pages have no links in either direction`;
+      if (ratio > 0.5) {
         checks.push({
           name: 'orphan_ratio',
-          status: 'fail',
-          message: `Orphan ratio ${pct}%${inSource} (${data.total_orphans}/${data.total_linkable} linkable pages have no inbound links)${caveat}. ${hint}`,
-        });
-      } else if (ratio > 0.5) {
-        checks.push({
-          name: 'orphan_ratio',
-          status: 'warn',
-          message: `Orphan ratio ${pct}%${inSource} (${data.total_orphans}/${data.total_linkable} linkable pages have no inbound links)${caveat}. ${hint}`,
+          status: ratio > 0.8 ? 'fail' : 'warn',
+          message: `Orphan ratio ${pct}%${inSource} (${counts})${caveat}.${renders} ${hint}`,
+          details,
         });
       } else {
         checks.push({
           name: 'orphan_ratio',
           status: 'ok',
-          message: `Orphan ratio ${pct}%${inSource} (${data.total_orphans}/${data.total_linkable} linkable pages)${caveat}`,
+          message: `Orphan ratio ${pct}%${inSource} (${data.total_orphans}/${data.total_linkable} linkable pages)${caveat}${renders ? `.${renders}` : ''}`,
+          details,
         });
       }
     }
   } catch {
-    checks.push({ name: 'orphan_ratio', status: 'warn', message: 'Could not check orphan ratio' });
+    checks.push(checkError('orphan_ratio', 'check orphan ratio'));
   }
   return checks;
 }
@@ -265,15 +281,29 @@ export const timelineHistoryEntry: DoctorEntry = {
     'timeline_history',
     'derived_visibility',
     'safe_index_pending',
+    'credential_projection_pending',
     'connector_checkpoints',
     'persistence_request_indexes',
     'persistence_request_growth',
+    'persistence_write_stall',
+    'lost_caller_writes',
+    'persistence_session_timeouts',
     'connector_held_items',
+    'git_held_files',
+    'frontmatter_hook',
     'orphan_persistence_bindings',
     'unbound_source',
     'writer_version',
     'self_capture',
+    'vector_plan',
     'stale_embedding_effects',
+    'google_file_modes',
+    'extractor_facts_expired',
+    'conversation_label_facts',
+    'conversation_outcomes_stale',
+    'captured_facts_active',
+    'loop_facts_drift',
+    'ontology_facts_fenced',
   ],
   run: runTimelineHistory,
 };

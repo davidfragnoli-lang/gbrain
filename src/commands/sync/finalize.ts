@@ -4,7 +4,7 @@
  * gate, the shared failure-ledger bookmark gate, and the post-advance
  * extract / facts / embed passes.
  */
-import { CHUNKER_VERSION } from '../../core/chunkers/code.ts';
+import { chunkerStamp } from '../../core/chunkers/code.ts';
 import { serr, slog } from '../../core/console-prefix.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { clearOpCheckpoint } from '../../core/op-checkpoint.ts';
@@ -26,17 +26,19 @@ import {
 } from '../../core/sync.ts';
 import { shouldLogIngest } from '../import.ts';
 import type { SyncResult } from '../sync.ts';
+import { settleLegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 import { partial, flushCheckpoint } from './sync-run.ts';
 import type { SyncPlan, SyncRun } from './sync-run.ts';
 
 export async function finishWithoutChanges(
   engine: BrainEngine,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges' | 'holds'>,
   swept: number,
 ): Promise<SyncResult | undefined> {
   const { opts, company, gitContextRoot, lastCommit, pin, pullFailed, ckpt, malformedSkipped, totalChanges } = plan;
   if (totalChanges === 0) {
+    await settleLegacyHolds(engine, plan.holds);
     // #3068: same guard as the git-HEAD-equality gate above — a failed pull
     // plus zero imports must not produce a clean `up_to_date` (and must not
     // advance the anchor past commits this run never looked at remotely).
@@ -65,7 +67,7 @@ export async function finishWithoutChanges(
     // completes cleanly here).
     await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
+    await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
     // A commit whose ONLY changes are malformed filenames lands here with
     // totalChanges === 0 — the anchor advances past those files forever, so
@@ -121,6 +123,11 @@ export async function finalizeIncrementalSync(
   run.deregisterCheckpointCleanup();
 
   const headVerificationSucceeded = verifyPinnedHead(run, plan);
+
+  // #5988: a deleted or renamed-away held file clears its hold; so does one
+  // whose file is gone or no longer synced. A failed delete keeps it.
+  const failedPaths = new Set(run.failedFiles.map(f => f.path));
+  await settleLegacyHolds(engine, plan.holds, [...filtered.deleted, ...filtered.renamed.map(r => r.from)].filter(p => !failedPaths.has(p)));
 
   const elapsed = Date.now() - start;
 
@@ -185,8 +192,10 @@ export async function finalizeIncrementalSync(
     serr(`  (silence with: gbrain config set schema.type_warnings false)`);
   }
 
+  // A run that only re-screened held files (and imported none) changed nothing.
+  const onlyRescreened = totalChanges === (plan.holds?.rescreen.length ?? 0) && pagesAffected.length === 0 && run.swept === 0;
   return {
-    status: 'synced',
+    status: onlyRescreened ? 'up_to_date' : 'synced',
     fromCommit: lastCommit,
     toCommit: pin,
     added: filtered.added.length,
@@ -256,7 +265,7 @@ function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitCon
 
 async function applyBookmarkGate(
   run: SyncRun,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds'>,
   headVerificationSucceeded: boolean,
 ): Promise<{ done: SyncResult } | { gate: Awaited<ReturnType<typeof applySyncFailureGate>> }> {
   const { engine, succeededPaths, failedFiles, pagesAffected } = run;
@@ -282,7 +291,7 @@ async function applyBookmarkGate(
     await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
-    await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
+    await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
   };
 
@@ -292,6 +301,8 @@ async function applyBookmarkGate(
   // FAIL. Treat removed paths as resolved so the ledger self-heals.
   const resolvedPaths = [
     ...succeededPaths,
+    // #5988: a held file is accounted for by its hold, so its ledger rows resolve.
+    ...(plan.holds?.heldPaths ?? []),
     ...filtered.deleted,
     ...filtered.renamed.map(r => r.from),
     // A prior transient rev-parse timeout records a hard-blocking sentinel that

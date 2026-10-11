@@ -33,7 +33,8 @@ import {
   existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
-import { execFile, execFileSync, execSync, type ChildProcess, type ExecFileException } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
+import { execFileBounded } from './bounded-child-exec.ts';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
@@ -43,9 +44,15 @@ import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
 import { ensureGbrainHome, resolveGbrainHome } from './gbrain-home.ts';
 import { binaryOnPath } from './execution-env.ts';
 import { loadFilingRules, type FilingRulesDoc } from './filing-audit.ts';
+import { classifyGitCheckout } from './git-checkout.ts';
+import { OperationError, opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
 // Bundled into the --compile binary as the fallback taxonomy for repos that
 // don't ship their own — see resolveFilingRules().
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
+import { gitChildEnv } from './git-env.ts';
+
+export { execFileBounded, type BoundedExecOptions } from './bounded-child-exec.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -386,24 +393,31 @@ function patchResolverFile(repoPath: string, dryRun: boolean): { status: StepSta
 function gitDirPath(repoPath: string, rel: string): string {
   try {
     const p = execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-path', rel], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     if (p) return isAbsolute(p) ? p : join(repoPath, p);
   } catch { /* fall through to the classic layout */ }
   return join(repoPath, '.git', rel);
 }
 
+function pathContains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   let hooksPath = '';
   try {
     hooksPath = execFileSync('git', ['-C', repoPath, 'config', '--get', 'core.hooksPath'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { /* unset — normal */ }
   if (hooksPath) {
     const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
+    // A hooksPath in the working tree but outside the git dir (e.g. .githooks)
+    // is a TRACKED location. Classify by path containment, never by a '.git'
+    // substring, which matches '.githooks' and checkouts like 'site.github.io'.
+    const tracked = pathContains(repoPath, dir) && !pathContains(gitDirPath(repoPath, ''), dir);
     return { dir, tracked };
   }
   return { dir: gitDirPath(repoPath, 'hooks'), tracked: false };
@@ -431,6 +445,7 @@ function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStat
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
     if (cur.includes(HOOK_BANNER)) {
+      if (tracked && !dryRun) ensureExcluded(repoPath, relative(repoPath, hookPath));
       if (cur === script) return { status: 'ok', detail: `${relative(repoPath, hookPath)} already current` };
       if (dryRun) return { status: 'fixed', detail: `would refresh ${relative(repoPath, hookPath)} (dry-run)` };
       writeFileSync(hookPath, script); chmodSync(hookPath, 0o755);
@@ -474,109 +489,53 @@ export function isDurabilityHardened(repoPath: string): boolean {
   }
 }
 
-const BOUNDED_EXEC_TERM_GRACE_MS = 2_000;
-
 /**
- * Whether a stopped child has exited even if the runtime lost its exit event:
- * on Linux an exited-but-unreaped child is a zombie ('Z' in /proc/<pid>/stat).
- * Elsewhere only the delivered exit counts, so the grace timer bounds the wait.
+ * #6210: the durability probe never reads a failure as "not hardened". A
+ * failed probe is `git_unavailable` and the caller keeps its Git effect
+ * unfinished; only a directory that is positively not a Git checkout
+ * (`classifyGitCheckout`) or a hook file that is absent reads as false.
  */
-function childHasExited(child: ChildProcess): boolean {
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  if (process.platform !== 'linux' || child.pid === undefined) return false;
-  try {
-    const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
-  } catch {
-    return true;
-  }
+function durabilityProbeFailure(detail: string): OperationError {
+  return opError('git_unavailable', 'Cannot determine whether native Git durability is enabled.',
+    `${detail} This does not show that durability is off, so the Git effect stays unfinished and retries; nothing was committed or pushed for it yet. Check that the checkout is readable and that git works there (git status in the checkout), then read the owner's effect status.`,
+    { fix: readFix('Shows the canonical owner and its pending Git effects, read-only.', { argv: ['gbrain', 'sources', 'writer', 'status', '--json'] }) });
 }
 
-export interface BoundedExecOptions {
-  timeout: number;
-  env?: NodeJS.ProcessEnv;
-  maxBuffer?: number;
-  signal?: AbortSignal;
-}
-
-/**
- * `execFile` that settles within `timeout` or on abort even when the runtime
- * never delivers the child's exit or pipe close. Bun through 1.3.x drops
- * one-shot pidfd and pipe events when a callback re-enters the event loop
- * (bun:test `expect().resolves/.rejects`, oven-sh/bun#30301): execFile's
- * callback and its own `timeout` then never fire and the child stays a zombie,
- * so the deadline and abort are enforced with our own timer.
- *
- * Stopping sends SIGTERM first so git can remove its lockfiles (a SIGKILLed
- * `git add`/`commit` leaves `.git/index.lock` behind and every later git call
- * in that worktree fails), then SIGKILLs after a short grace period and
- * settles from the timer even if the exit event never arrives.
- */
-export function execFileBounded(file: string, args: string[], options: BoundedExecOptions): Promise<{ error: ExecFileException | null; stdout: string; stderr: string }> {
-  const { timeout, signal, ...rest } = options;
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = (error: ExecFileException | null, stdout: string, stderr = '') => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve({ error, stdout, stderr });
-    };
-    let stopped: ExecFileException | null = null;
-    let escalation: ReturnType<typeof setTimeout> | undefined;
-    let poll: ReturnType<typeof setInterval> | undefined;
-    const settleStopped = () => {
-      clearTimeout(escalation);
-      clearInterval(poll);
-      finish(stopped, '', '');
-    };
-    const child = execFile(file, args, { ...rest, encoding: 'utf8' }, (error, stdout, stderr) => {
-      clearTimeout(escalation);
-      clearInterval(poll);
-      if (stopped) finish(stopped, '', '');
-      else finish(error, stdout, stderr);
-    });
-    const stop = (message: string, code: string) => {
-      if (stopped) return;
-      stopped = Object.assign(new Error(message), { code, killed: true, signal: 'SIGTERM' as const });
-      child.kill('SIGTERM');
-      poll = setInterval(() => { if (childHasExited(child)) settleStopped(); }, 25);
-      escalation = setTimeout(() => {
-        child.kill('SIGKILL');
-        settleStopped();
-      }, BOUNDED_EXEC_TERM_GRACE_MS);
-    };
-    const timer = setTimeout(() => stop(`${file} did not finish within ${timeout}ms`, 'ETIMEDOUT'), timeout);
-    const onAbort = () => stop(`${file} was aborted`, 'ABORT_ERR');
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-/** A git probe that does not block the event loop; a failed probe reads as ''. */
-async function gitOutput(repoPath: string, args: string[]): Promise<string> {
-  const { error, stdout } = await execFileBounded('git', ['-C', repoPath, ...args], { timeout: 10_000, env: { ...process.env, ...GIT_ENV } });
-  return error ? '' : stdout.trim();
+/** A git probe that does not block the event loop. Exit 1 is an unset key for `config --get`; every other failure throws. */
+async function gitProbe(repoPath: string, args: string[]): Promise<string> {
+  const { error, stdout } = await execFileBounded('git', ['-C', repoPath, ...args],
+    { timeout: 10_000, env: gitChildEnv({ ...GIT_ENV, LC_ALL: 'C', LANGUAGE: 'C' }) });
+  if (!error) return stdout.trim();
+  if (error.code === 1 && args[0] === 'config' && args[1] === '--get') return '';
+  const status = typeof error.code === 'number' ? `exit ${error.code}` : typeof error.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'no exit status';
+  throw durabilityProbeFailure(`git ${args.slice(0, 2).join(' ')} failed (${status}).`);
 }
 
 /**
  * {@link isDurabilityHardened} for long-running owners: the same two git
  * probes, run concurrently as child processes the event loop does not wait on.
+ * Rejects with `git_unavailable` when it cannot tell (#6210).
  */
 export async function isDurabilityHardenedAsync(repoPath: string): Promise<boolean> {
+  const checkout = classifyGitCheckout(repoPath);
+  if (checkout === 'not_git') return false;
+  if (checkout === 'unknown') throw durabilityProbeFailure('The checkout directory, or a parent directory, could not be read.');
+  const [hooksPath, gitHooks] = await Promise.all([gitProbe(repoPath, ['config', '--get', 'core.hooksPath']),
+    gitProbe(repoPath, ['rev-parse', '--git-path', 'hooks'])]);
+  const reported = hooksPath || gitHooks;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is a registered local worktree root and the hooks path comes from git itself, resolved exactly as resolveHooksDir/gitDirPath do
+  const dir = !reported ? join(repoPath, '.git', 'hooks') : isAbsolute(reported) ? reported : join(repoPath, reported);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed hook filename inside the git-reported hooks directory, as in isDurabilityHardened
+  const hookPath = join(dir, 'post-commit');
+  let hook: string;
   try {
-    const [hooksPath, gitHooks] = await Promise.all([gitOutput(repoPath, ['config', '--get', 'core.hooksPath']),
-      gitOutput(repoPath, ['rev-parse', '--git-path', 'hooks'])]);
-    const reported = hooksPath || gitHooks;
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is a registered local worktree root and the hooks path comes from git itself, resolved exactly as resolveHooksDir/gitDirPath do
-    const dir = !reported ? join(repoPath, '.git', 'hooks') : isAbsolute(reported) ? reported : join(repoPath, reported);
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed hook filename inside the git-reported hooks directory, as in isDurabilityHardened
-    const hookPath = join(dir, 'post-commit');
-    return existsSync(hookPath) && readFileSync(hookPath, 'utf-8').includes(HOOK_BANNER);
-  } catch {
-    return false;
+    hook = readFileSync(hookPath, 'utf-8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw durabilityProbeFailure(`The post-commit hook could not be read (${typeof code === 'string' && /^E[A-Z]+$/.test(code) ? code : 'read error'}).`);
   }
+  return hook.includes(HOOK_BANNER);
 }
 
 /**
@@ -604,7 +563,7 @@ export function commitWriteThroughFile(
   try {
     const rel = relative(repoPath, absPath);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
-    const gitOpts = { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } } as const;
+    const gitOpts = { stdio: 'ignore', timeout: 30_000, env: gitChildEnv({ ...GIT_ENV }) } as const;
     execFileSync('git', ['-C', repoPath, 'add', '--', rel], gitOpts);
     execFileSync('git', ['-C', repoPath, 'commit', '-m', `gbrain: ${action} ${slug}`, '--', rel], gitOpts);
     return true;
@@ -688,19 +647,19 @@ function gitConfigGet(repoPath: string, key: string, localOnly = false): string 
   try {
     const scope = localOnly ? ['--local'] : [];
     return execFileSync('git', ['-C', repoPath, 'config', ...scope, '--get', key], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return ''; }
 }
 function gitConfigSet(repoPath: string, key: string, value: string): void {
   execFileSync('git', ['-C', repoPath, 'config', key, value], {
-    stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    stdio: 'ignore', timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
   });
 }
 function gitConfigUnset(repoPath: string, key: string): void {
   try {
     execFileSync('git', ['-C', repoPath, 'config', '--unset-all', key], {
-      stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: 'ignore', timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     });
   } catch { /* not set */ }
 }
@@ -708,7 +667,7 @@ function gitConfigUnset(repoPath: string, key: string): void {
 function remoteHost(repoPath: string): string {
   try {
     const url = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     return new URL(url).hostname || 'github.com';
   } catch { return 'github.com'; }
@@ -992,7 +951,7 @@ function isGitRepo(repoPath: string): boolean {
 function resolveRepoRoot(path: string): string {
   try {
     return execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch {
     throw new Error(`not a git repo: ${path}`);
@@ -1002,7 +961,7 @@ function resolveRepoRoot(path: string): string {
 export function currentBranch(repoPath: string): string {
   try {
     return execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return 'HEAD'; }
 }
@@ -1010,7 +969,7 @@ export function currentBranch(repoPath: string): string {
 function headSha(repoPath: string): string {
   try {
     return execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return ''; }
 }
@@ -1108,9 +1067,9 @@ function commitScaffolding(repoPath: string, branch: string, redact: (s: string)
   const resolver = findResolverFile(repoPath);
   if (resolver) paths.push(relative(repoPath, resolver));
   try {
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...paths], { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } });
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...paths], { stdio: 'ignore', timeout: 30_000, env: gitChildEnv({ ...GIT_ENV }) });
     const staged = execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--name-only'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     if (!staged) return { status: 'ok', detail: 'scaffolding already committed' };
     // #3925: suppress hooks on THIS commit. Step 3 already installed the
@@ -1122,10 +1081,10 @@ function commitScaffolding(repoPath: string, branch: string, redact: (s: string)
     // push below the ONLY push for the scaffolding commit; every later
     // operator/agent commit still fires the hook normally.
     execFileSync('git', ['-C', repoPath, '-c', 'core.hooksPath=/dev/null', 'commit', '-m', 'chore(gbrain): install brain durability scaffolding'], {
-      stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+      stdio: 'ignore', timeout: 30_000, env: gitChildEnv({ ...GIT_ENV }),
     });
     execFileSync('git', ['-C', repoPath, ...['-c', 'http.followRedirects=false'], 'push', 'origin', `HEAD:${branch}`], {
-      stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env: { ...process.env, ...GIT_ENV_AUTH },
+      stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env: gitChildEnv({ ...GIT_ENV_AUTH }),
     });
     return { status: 'fixed', detail: 'committed + pushed durability scaffolding' };
   } catch (e) {
@@ -1137,7 +1096,7 @@ function headMatchesOrigin(repoPath: string, branch: string): boolean {
   try {
     const local = headSha(repoPath);
     const remote = execFileSync('git', ['-C', repoPath, 'rev-parse', `origin/${branch}`], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     return !!local && local === remote;
   } catch { return false; }

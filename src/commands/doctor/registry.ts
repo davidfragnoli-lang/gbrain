@@ -53,13 +53,16 @@ import {
   embeddingQueryPrefixEntry,
   embeddingColumnRegistryEntry,
   embeddingEnvOverrideEntry,
+  embeddingKeySourceEntry,
 } from './checks/embedding-health.ts';
+import { projectionResidentEntry } from './checks/projection-readiness.ts';
 import {
   graphCoverageEntry,
   orphanRatioEntry,
   staleMentionsEntry,
   timelineHistoryEntry,
 } from './checks/graph-health.ts';
+import { extractionDateGroundingEntry } from './checks/ranking-extraction.ts';
 import {
   integrityEntry,
   jsonbIntegrityEntry,
@@ -76,10 +79,38 @@ import {
   salienceEntry,
 } from './checks/knowledge-health.ts';
 import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/queue-assets.ts';
+import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
+import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
+import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
+import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
+import { persistenceConsumersEntry } from './checks/persistence-consumers.ts';
+import { gitConvergenceEntry } from './checks/git-convergence.ts';
+import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
+import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
+import { autoChronicleEntry } from './checks/auto-chronicle.ts';
+import { factsDrainEntry } from './checks/facts-drain.ts';
+import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
 import { decideHealthEntry } from './checks/decide.ts';
+import { unlinkedFactsEntry } from './checks/unlinked-facts.ts';
+import { edgeValidityEntry } from './checks/edge-validity.ts';
+import { coreMemoryEntry } from './checks/core-memory.ts';
+import { plannerStatsEntry } from './checks/planner-stats.ts';
+import { revisionBackfillEntry } from './checks/revision-backfill.ts';
+import { trustTiersEntry } from './checks/trust-tiers.ts';
+import { trustScanEntry } from './checks/trust-scan.ts';
+import { trustSourcesUnclaimedEntry } from './checks/trust-sources-unclaimed.ts';
+import { harnessWiringDoctorEntry } from './checks/harness-wiring.ts';
+import { agentContractEntry } from './checks/agent-contract.ts';
+import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
+import { behaviorChangesEntry } from './checks/behavior-changes.ts';
+import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
+import { atomHeldFailedEntry } from './checks/atom-holds.ts';
 import { STOP_DOCTOR, type DoctorContext, type DoctorEntry } from './context.ts';
 import type { Check } from '../doctor.ts';
+import { infoCheck } from './check-fix.ts';
+import { withGitListingCache } from '../../core/git-visible-files.ts';
 
 export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   resolverHealthEntry,
@@ -94,7 +125,11 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   extractionBacklogsEntry,
   homeDirInWorktreeEntry,
   defaultSourcePathEntry,
+  embeddingKeySourceEntry,
+  harnessWiringDoctorEntry,
+  agentContractEntry,
   pgliteDataDirEntry,
+  projectionResidentEntry,
   offlineConnectionEntry,
   dbChecksGateEntry,
   connectionEntry,
@@ -109,10 +144,13 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   embeddingQueryPrefixEntry,
   embeddingColumnRegistryEntry,
   embeddingEnvOverrideEntry,
+  chatFallbackChainEntry,
+  behaviorChangesEntry,
   graphCoverageEntry,
   orphanRatioEntry,
   staleMentionsEntry,
   timelineHistoryEntry,
+  extractionDateGroundingEntry,
   integrityEntry,
   jsonbIntegrityEntry,
   whoknowsEntry,
@@ -127,24 +165,93 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   effectiveDateEntry,
   salienceEntry,
   queueHealthEntry,
+  globalMaintenanceTimeoutsEntry,
+  legacyJobAuthorityEntry,
+  legacyTokenGrantsEntry,
+  grantNewOpsEntry,
   indexAuditEntry,
   imageAssetsEntry,
   syncFreshnessEntry,
+  gitConvergenceEntry,
   decideHealthEntry,
+  unlinkedFactsEntry,
+  edgeValidityEntry,
+  autoChronicleEntry,
+  factsDrainEntry,
+  factTakeVectorsEntry,
+  plannerStatsEntry,
+  retrievalFeedbackEntry,
+  transcriptSecretExposureEntry,
+  revisionBackfillEntry,
+  trustTiersEntry,
+  trustScanEntry,
+  trustSourcesUnclaimedEntry,
+  coreMemoryEntry,
+  managedSyncMovementEntry,
+  persistenceConsumersEntry,
+  atomHeldFailedEntry,
+  fenceIntegrityEntry,
   searchModeEntry,
 ];
+
+const CONNECTION_LANE: ReadonlySet<DoctorEntry> = new Set([offlineConnectionEntry, dbChecksGateEntry, connectionEntry, connectionGateEntry]);
+
+/** Every check name the registry can emit (the `--only` vocabulary). */
+export function doctorCheckNames(): Set<string> {
+  return new Set(DOCTOR_CHECK_REGISTRY.flatMap((e) => e.emits));
+}
+
+/** `--only a,b` / `--only=a,b` (repeatable) → the requested check names, or null when absent. */
+export function parseOnlyChecks(args: readonly string[]): Set<string> | null {
+  const raw: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--only' && i + 1 < args.length) raw.push(args[++i]);
+    else if (args[i].startsWith('--only=')) raw.push(args[i].slice('--only='.length));
+  }
+  if (raw.length === 0) return null;
+  return new Set(raw.flatMap((r) => r.split(',')).map((n) => n.trim()).filter(Boolean));
+}
+
+/** True when any requested check is a DB check (after the DB-checks early stop) or a declared engine check of a pre-gate entry. */
+export function onlyNeedsEngine(only: ReadonlySet<string>): boolean {
+  const gate = DOCTOR_CHECK_REGISTRY.indexOf(dbChecksGateEntry);
+  return DOCTOR_CHECK_REGISTRY.some((e, i) => (i > gate ? e.emits : e.engineChecks ?? []).some((n) => only.has(n)));
+}
+
+function selected(entry: DoctorEntry, only: ReadonlySet<string> | null | undefined): boolean {
+  return !only || CONNECTION_LANE.has(entry) || entry.emits.some((n) => only.has(n));
+}
+
+/** `--only`: keep the requested checks; a requested check that produced nothing says why. */
+function onlyResult(checks: Check[], only: ReadonlySet<string>, stopped: boolean): Check[] {
+  const missing = [...only].filter((n) => !checks.some((c) => c.name === n));
+  const kept = checks.filter((c) => only.has(c.name) || (stopped && missing.length > 0 && c.name === 'connection'));
+  for (const name of missing) {
+    kept.push(stopped
+      ? { name, status: 'warn', message: 'Not run: the database checks stopped early (see the connection check).', fix_unavailable_reason: 'check_errored' }
+      : infoCheck(name, 'No finding: this check does not apply to this brain right now.', 'not_applicable'));
+  }
+  return kept;
+}
 
 /**
  * Run the registry in order. A STOP_DOCTOR result ends the run with the checks
  * gathered so far; a completed run finishes the DB-checks progress phase.
+ * Under `--only`, entries that emit none of the requested checks are skipped
+ * (the connection lane always runs so its early stops still hold). The run is
+ * one `withGitListingCache` scope, so entries that list the same source
+ * checkout share one `git ls-files` per listing.
  */
-export async function runDoctorRegistry(ctx: DoctorContext): Promise<Check[]> {
-  const checks: Check[] = [];
-  for (const entry of DOCTOR_CHECK_REGISTRY) {
-    const result = await entry.run(ctx);
-    if (result === STOP_DOCTOR) return checks;
-    checks.push(...result);
-  }
-  ctx.progress.finish();
-  return checks;
+export function runDoctorRegistry(ctx: DoctorContext): Promise<Check[]> {
+  return withGitListingCache(async () => {
+    const checks: Check[] = [];
+    for (const entry of DOCTOR_CHECK_REGISTRY) {
+      if (!selected(entry, ctx.only)) continue;
+      const result = await entry.run(ctx);
+      if (result === STOP_DOCTOR) return ctx.only ? onlyResult(checks, ctx.only, true) : checks;
+      checks.push(...result);
+    }
+    ctx.progress.finish();
+    return ctx.only ? onlyResult(checks, ctx.only, false) : checks;
+  });
 }

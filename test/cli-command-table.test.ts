@@ -27,7 +27,7 @@ import {
   THIN_CLIENT_REFUSED_COMMANDS,
   findCliCommand,
 } from '../src/cli/command-table.ts';
-import { buildCliAliases } from '../src/cli.ts';
+import { buildCliAliases } from '../src/cli/main.ts';
 import type { Operation } from '../src/core/operations.ts';
 import { COMMAND_TABLE_PATH, parseSource, readCommandModule, readTableRecords } from '../scripts/lib/cli-pipeline.ts';
 import { extractCliDispatch } from './helpers/cli-dispatch-extract.ts';
@@ -89,6 +89,27 @@ describe('CLI command table', () => {
     const outside = CLI_COMMANDS.filter((r) => r.thinClient !== 'none' && !THIN_CLIENT_REFUSED_COMMANDS.has(r.name)).map((r) => r.name).sort();
     const shape = extractCliDispatch();
     expect(outside).toEqual([...shape.thinClientGuard.members, 'jobs'].sort());
+  });
+
+  test("D3: every curated help is () => import('./help/<name>.ts') naming an existing module that exports help", async () => {
+    const withHelp = astRecords.filter((r) => r.helpSpecifier !== undefined);
+    expect(withHelp.map((r) => r.name)).toEqual(CLI_COMMANDS.filter((r) => r.help).map((r) => r.name));
+    for (const r of withHelp) {
+      expect(r.helpSpecifier, `${r.name}: help is not an arrow returning import('<literal>')`).toBe(`./help/${r.name}.ts`);
+      expect(existsSync(join(ROOT, 'src/cli', r.helpSpecifier!)), `${r.name}: ${r.helpSpecifier} does not exist`).toBe(true);
+      expect((await findCliCommand(r.name)!.help!()).help.summary.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('D3: every src/cli/help spec module has a record; the renderer and validator import none of them (cold start)', () => {
+    const shared = new Set(['render.ts', 'validate.ts']);
+    const files = readdirSync(join(ROOT, 'src/cli/help')).filter((f) => f.endsWith('.ts') && !shared.has(f)).sort();
+    expect(files).toEqual(astRecords.filter((r) => r.helpSpecifier).map((r) => r.helpSpecifier!.slice('./help/'.length)).sort());
+    for (const f of shared) {
+      const imports = parseSource(ROOT, `src/cli/help/${f}`).statements.filter(ts.isImportDeclaration)
+        .map((st) => (st.moduleSpecifier as ts.StringLiteral).text);
+      expect(imports.filter((spec) => files.some((h) => spec === `./${h}`))).toEqual([]);
+    }
   });
 
   test('the table module loads no command module at import time (cold start)', () => {

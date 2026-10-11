@@ -11,7 +11,7 @@
  *
  * Lane: unit. Run: `bun test test/transcripts-ingest-pglite.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -27,7 +27,6 @@ import {
   indexImportedSessions,
 } from '../src/core/transcripts/discover.ts';
 import type { HarnessRoot } from '../src/core/transcripts/detect.ts';
-import { MESSAGE_CHAR_CAP } from '../src/core/transcripts/render.ts';
 import { buildTranscriptSlug } from '../src/core/transcripts/types.ts';
 import { buildHermesFixture } from './fixtures/transcripts/hermes-fixture-builder.ts';
 
@@ -103,7 +102,7 @@ function writeBigAgentSession(dir: string, id: string, messageCount: number): st
   const lines: string[] = [
     JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-08-10T08:00:00.000Z', cwd: '/tmp' }),
   ];
-  const filler = 'lorem widget fact '.repeat(Math.ceil((MESSAGE_CHAR_CAP - 100) / 18));
+  const filler = 'lorem widget fact '.repeat(Math.ceil(3_900 / 18));
   for (let i = 0; i < messageCount; i++) {
     lines.push(
       JSON.stringify({

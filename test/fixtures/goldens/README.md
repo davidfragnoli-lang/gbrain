@@ -48,7 +48,10 @@ reproduce byte for byte. Each file is written by `test/helpers/golden.ts` as
   skills dir, reduced PATH, keyless, `fetch` refused and logged by
   `test/helpers/no-network-preload.ts`). Variants: PGLite fresh / `--fast` / degraded
   embedding config, no config, unreachable Postgres (+`--fast`), fresh Postgres in a
-  scratch database.
+  scratch database. The `schema_version` message carries `<latest>` for the migration
+  registry maximum (as the package version is `<version>`), so a migration renumber does
+  not regenerate these files; `expectSchemaLatestMatchesRegistry` asserts the raw report
+  names the registry maximum (`test/doctor-json-golden-latest.test.ts` pins both).
 - `doctor/early-stop-*.json` (`test/doctor-early-stop-golden.serial.test.ts`,
   `doctor-checks-v1`): `buildChecks` null-engine, `--fast`, connect-error and
   getStats-failure early stops.
@@ -93,7 +96,7 @@ reproduce byte for byte. Each file is written by `test/helpers/golden.ts` as
 ## CLI goldens (A16b / EO5 / EO13)
 
 - `cli/*.json` (`test/cli-goldens.test.ts`, `test/cli-dispatch-phase.test.ts`,
-  `test/cli-thin-client-refusal-matrix.test.ts`, `test/cli-engine-free-db-down.serial.test.ts`):
+  `test/cli-thin-client-refusal-matrix.test.ts`, `test/cli-engine-free-db-down.test.ts`):
   `--help` / `--version` / `--tools-json` / unknown command, membership sets and alias
   table, per-command dispatch phase and thin-client mode (AST,
   `test/helpers/cli-dispatch-extract.ts`), literal command imports, the thin-client
@@ -111,3 +114,11 @@ reproduce byte for byte. Each file is written by `test/helpers/golden.ts` as
   PGLite brain (`brain.tar.gz` + `MANIFEST.json`, rebuilt only on master with
   `bun scripts/build-pglite-upgrade-fixture.ts`), its post-boot catalog, and the
   objects a repeat boot recreates.
+- `doctor/hot-checks-{pglite,postgres}-json.json` (`test/doctor-hot-checks-golden.test.ts`,
+  `test/e2e/doctor-hot-checks-golden.test.ts`): full `doctor --json` on the hot-check
+  fixture. The fence trend's calendar day is pinned, never dropped: PGLite runs every
+  CLI process on one clock that starts on the capture day (`makeDoctorHome({ clock })`,
+  `test/helpers/fixed-clock-preload.ts`); Postgres, whose server stamps its own times,
+  stores `fence_integrity.details.trend[].by_day[].day` as `<sync-day>` only after
+  `stampSyncDay` checks it equals the day the fixture's sync stamped (one of the days
+  read around the sync). Regenerating writes the marker again.

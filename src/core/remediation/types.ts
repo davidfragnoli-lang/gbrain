@@ -9,7 +9,10 @@
 //   - src/core/operations.ts (MCP op run_onboard, admin scope)
 
 import type { RemediationStep } from '../remediation-step.ts';
-import type { RepairPlanStep, RepairStepResult } from './repairs.ts';
+import type { RepairPlanStep, RepairPreviewFailure, RepairStepResult } from './repairs.ts';
+import type { ExplicitRepairNotice, RepairKindSpec } from '../repair/registry.ts';
+import type { CapSource } from '../consent.ts';
+import type { RenderedAction } from '../agent-output.ts';
 
 /**
  * Options for computeRemediationPlan. All fields are optional with
@@ -51,6 +54,10 @@ export interface RemediationPlan {
   blocked: Array<{ check: string; reason: string }>;
   /** Present when `repairs` was requested: PROTECTED steps that need `--include-repairs`. */
   repair_steps?: RepairPlanStep[];
+  /** Present with `repair_steps`: explicit-only kinds, never planned as steps; preview each by name. */
+  explicit_repairs?: ExplicitRepairNotice[];
+  /** Only when an automatic kind's preview threw: that kind is missing from `repair_steps`. */
+  repair_preview_failures?: RepairPreviewFailure[];
 }
 
 /**
@@ -62,10 +69,18 @@ export interface RemediationPlan {
 export interface RemediationOpts {
   /** Target brain_score (default: 90). */
   targetScore?: number;
+  /**
+   * Run each submitted job step in this process when no registered worker
+   * serves the queue (PGLite always lacks one), as `jobs submit --follow`
+   * does, instead of waiting out the step timeout. Set by the CLI entry point.
+   */
+  inlineJobs?: boolean;
   /** Cap inner loop iterations (default: Infinity). */
   maxJobs?: number;
   /** USD cap for total plan cost. Pre-flight refuse + mid-run BudgetExhausted gate. */
   maxUsd?: number;
+  /** A4: where `maxUsd` came from (default `user`); a `derived` cap warns-and-runs an unpriced model and logs its exhaustion. */
+  capSource?: CapSource;
   /** Read-only dry-run; submits no jobs; returns plan in result. */
   dryRun?: boolean;
   /** Resume from checkpoint matching this plan_hash, OR newest if undefined+resume=true. */
@@ -86,9 +101,10 @@ export interface RemediationOpts {
    * Doctor CLI only. Plans the registered repair kinds as PROTECTED steps and
    * runs them when `include` is true (the user's `--include-repairs`
    * agreement) and the caller is trusted local (`remote === false`). A
-   * remote caller asking to include repairs is refused.
+   * remote caller asking to include repairs is refused. `registry` replaces
+   * the registered repair kinds (tests register stub specs).
    */
-  repairs?: { include: boolean; remote: boolean; noEmbed?: boolean };
+  repairs?: { include: boolean; remote: boolean; noEmbed?: boolean; registry?: readonly RepairKindSpec[] };
 }
 
 /**
@@ -107,6 +123,22 @@ export interface StepResult {
    *  the content-hash key. Carries that stale row's id; the step re-ran for
    *  real under a `:r:<doctor_run_id>`-rotated key (job_id is the fresh job). */
   deduped_job_id?: number;
+}
+
+/**
+ * A planned manual-only step the run did not submit (`manual-only.ts`).
+ * `queued_jobs` lists rows of that job an earlier run already queued: they
+ * still run when a worker picks them up, so the skip does not prevent them.
+ */
+export interface ManualOnlySkippedStep {
+  code: 'manual_only_skipped';
+  id: string;
+  job: string;
+  params: Record<string, unknown>;
+  est_usd_cost?: number;
+  why: string;
+  fix: RenderedAction;
+  queued_jobs?: Array<{ id: number; status: string }>;
 }
 
 /**
@@ -134,14 +166,21 @@ export interface RemediationResult {
     target: number;
     ceiling: number;
   };
-  /** Set when job steps were skipped for an unreachable target while repair steps still ran. */
-  job_steps_skipped?: { reason: 'target_unreachable'; target: number; ceiling: number };
+  /**
+   * Set when the score target is unreachable: the paid job steps (`skipped`
+   * ids) were not run; free job steps and included repair steps still ran.
+   */
+  job_steps_skipped?: { reason: 'target_unreachable'; target: number; ceiling: number; skipped?: string[] };
+  /** Manual-only steps the plan held; never submitted by this run, and their cost is outside the --max-usd estimate. */
+  manual_only_skipped?: ManualOnlySkippedStep[];
   /** Set when `--resume` refused (a checkpoint for another brain). */
   resume_refused?: { reason: string; checkpoint_brain_id: string; brain_id: string; plan_hash: string };
   /** Repair steps the run applied or refused (only when `repairs` was passed). */
   repairs?: RepairStepResult[];
   /** Repair steps planned but not run because the user's agreement was missing. */
   repairs_skipped?: RepairPlanStep[];
+  /** Only when an automatic kind's preview threw: this run neither planned nor applied that kind. */
+  repair_preview_failures?: RepairPreviewFailure[];
   /** Cumulative cap and settled spend across the original run and its resumes. */
   budget?: { max_usd: number | null; spent_usd: number; include_repairs: boolean; plan_hash: string };
 }

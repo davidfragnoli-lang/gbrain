@@ -26,9 +26,12 @@ import { contentHash } from '../utils.ts';
 import { withPageLock } from '../page-lock.ts';
 import { assertSourceFilesystemActive, withSourceFilesystemLock } from '../minions/source-filesystem.ts';
 import { resolvePageWriteTarget } from '../write-through.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { getProposal, transitionProposal, type ProposalRow } from '../ai/decide/proposals-store.ts';
 import { strikeFenceRow, supersededFact } from './forget.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { withTrustKeep } from '../persistence/context.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 
@@ -57,6 +60,32 @@ export interface ProposalActionResult {
   action: ProposalAction | 'reject';
   status: 'accepted' | 'rejected' | 'stale' | 'undone' | 'refused' | 'not_found';
   reason?: string;
+}
+
+/**
+ * The proposal record a checked supersede reads and transitions: decide_proposals
+ * (S9) by default, or another typed store with the same pair shape (#5575
+ * trust_proposals, trust/supersede-handlers.ts TRUST_PAIR_STORE). `onAccept` /
+ * `onUndo` run inside the same transaction after the facts change.
+ */
+export type PairProposal = Pick<ProposalRow, 'id' | 'source_id' | 'old_fact_id' | 'new_fact_id' | 'status' | 'before_state' | 'after_state'>;
+export interface PairProposalStore {
+  name: string;
+  get(engine: BrainEngine, id: number, lock?: boolean): Promise<PairProposal | null>;
+  transition(engine: BrainEngine, id: number, from: string, to: string, state?: { before?: string | null; after?: string | null }): Promise<boolean>;
+  onAccept?(tx: BrainEngine, proposal: PairProposal): Promise<void>;
+  onUndo?(tx: BrainEngine, proposal: PairProposal): Promise<void>;
+}
+export const DECIDE_PROPOSAL_STORE: PairProposalStore = {
+  name: 'decide', get: getProposal,
+  transition: (engine, id, from, to, state) => transitionProposal(engine, id, from as ProposalRow['status'], to as ProposalRow['status'], state),
+};
+/** The store a managed decide_proposal intent names; loaded lazily so the trust module and this one never cycle at init. */
+async function pairStore(name: unknown): Promise<PairProposalStore | null> {
+  if (name === undefined || name === null) return DECIDE_PROPOSAL_STORE;
+  if (name === 'trust') return (await import('../trust/supersede-handlers.ts')).TRUST_PAIR_STORE;
+  if (name === 'trust_reverse') return (await import('../trust/supersede-handlers.ts')).TRUST_REVERSE_PAIR_STORE;
+  return null;
 }
 
 export class ProposalConflictError extends Error {
@@ -135,7 +164,7 @@ export function undoRefusal(state: { before: SupersedeState; after: SupersedeSta
 // Database units (shared by the unmanaged and managed paths)
 // ---------------------------------------------------------------------------
 
-async function expireOld(tx: BrainEngine, proposal: ProposalRow): Promise<void> {
+async function expireOld(tx: BrainEngine, proposal: PairProposal): Promise<void> {
   const rows = await tx.executeRaw<{ id: number }>(
     `UPDATE facts SET expired_at = now(), valid_until = LEAST(COALESCE(valid_until, now()), now()), superseded_by = $3
       WHERE id = $1 AND source_id = $2 AND expired_at IS NULL RETURNING id`,
@@ -144,24 +173,26 @@ async function expireOld(tx: BrainEngine, proposal: ProposalRow): Promise<void> 
 }
 
 /** Record the after state (read back inside the transaction) and move the proposal to accepted. */
-async function finishAccept(tx: BrainEngine, proposal: ProposalRow, before: SupersedeState, fenceAfter: FenceState | null): Promise<void> {
+async function finishAccept(tx: BrainEngine, proposal: PairProposal, before: SupersedeState, fenceAfter: FenceState | null, store: PairProposalStore): Promise<void> {
   const [oldF, newF] = await Promise.all([loadPairFact(tx, proposal.old_fact_id), loadPairFact(tx, proposal.new_fact_id)]);
   const after: SupersedeState = { old: factFields(oldF!), new: factFields(newF!), fence: fenceAfter };
-  if (!await transitionProposal(tx, proposal.id, 'pending', 'accepted', { before: JSON.stringify(before), after: JSON.stringify(after) })) {
+  if (!await store.transition(tx, proposal.id, 'pending', 'accepted', { before: JSON.stringify(before), after: JSON.stringify(after) })) {
     throw new ProposalConflictError('the proposal is no longer pending');
   }
+  await store.onAccept?.(tx, proposal);
 }
 
-async function applyUndoDb(tx: BrainEngine, proposal: ProposalRow, before: SupersedeState, after: SupersedeState): Promise<void> {
+async function applyUndoDb(tx: BrainEngine, proposal: PairProposal, before: SupersedeState, after: SupersedeState, store: PairProposalStore): Promise<void> {
   const rows = await tx.executeRaw<{ id: number }>(
     `UPDATE facts SET expired_at = $3::timestamptz, valid_until = $4::timestamptz, superseded_by = $5
       WHERE id = $1 AND source_id = $2 AND superseded_by IS NOT DISTINCT FROM $6 RETURNING id`,
     [proposal.old_fact_id, proposal.source_id, before.old.expired_at, before.old.valid_until, before.old.superseded_by, after.old.superseded_by]);
   if (rows.length !== 1) throw new ProposalConflictError('the old fact changed during undo');
-  if (!await transitionProposal(tx, proposal.id, 'accepted', 'undone')) throw new ProposalConflictError('the proposal is no longer accepted');
+  if (!await store.transition(tx, proposal.id, 'accepted', 'undone')) throw new ProposalConflictError('the proposal is no longer accepted');
+  await store.onUndo?.(tx, proposal);
 }
 
-function parseStates(p: ProposalRow): { before: SupersedeState; after: SupersedeState } | null {
+function parseStates(p: PairProposal): { before: SupersedeState; after: SupersedeState } | null {
   try { return p.before_state && p.after_state ? { before: JSON.parse(p.before_state), after: JSON.parse(p.after_state) } : null; } catch { return null; }
 }
 
@@ -200,15 +231,15 @@ async function withFenceLocks<T>(engine: BrainEngine, slug: string | null, sourc
   return withSourceFilesystemLock(engine, target.writeRoot, () => withPageLock(slug, () => run(target.filePath), { timeoutMs: 5_000 }));
 }
 
-async function acceptUnmanaged(engine: BrainEngine, proposal: ProposalRow): Promise<ProposalActionResult> {
+async function acceptUnmanaged(engine: BrainEngine, proposal: PairProposal, store: PairProposalStore): Promise<ProposalActionResult> {
   const first = await loadPairFact(engine, proposal.old_fact_id);
   return withFenceLocks(engine, first?.source_markdown_slug ?? null, proposal.source_id, async (filePath) => {
-    const fresh = await getProposal(engine, proposal.id);
+    const fresh = await store.get(engine, proposal.id);
     if (!fresh || fresh.status !== 'pending') return { id: proposal.id, action: 'accept', status: 'refused', reason: fresh?.status ?? 'not_found' };
     const [oldF, newF] = await Promise.all([loadPairFact(engine, fresh.old_fact_id), loadPairFact(engine, fresh.new_fact_id)]);
     const stale = staleReason(fresh, oldF, newF, Date.now());
     if (stale) {
-      await transitionProposal(engine, fresh.id, 'pending', 'stale');
+      await store.transition(engine, fresh.id, 'pending', 'stale');
       return { id: fresh.id, action: 'accept', status: 'stale', reason: stale };
     }
     const slug = oldF!.source_markdown_slug;
@@ -220,12 +251,13 @@ async function acceptUnmanaged(engine: BrainEngine, proposal: ProposalRow): Prom
     const before: SupersedeState = { old: factFields(oldF!), new: factFields(newF!), fence: plan ? fence(plan.before, snapshot?.revision ?? null) : null };
     let published = false;
     try {
-      await engine.transaction(async (tx) => {
+      // The strike edits a managed fence without authoring the page: it keeps its trust tier (#5575 ENG-1).
+      await maintenanceTransaction(engine, (tx) => withTrustKeep(tx, ['pages'], async () => {
         const revision = plan ? await mirrorBody(tx, slug!, fresh.source_id, plan.body, fileBody !== null) : null;
         await expireOld(tx, fresh);
-        await finishAccept(tx, fresh, before, plan ? fence(plan.after, revision) : null);
+        await finishAccept(tx, fresh, before, plan ? fence(plan.after, revision) : null, store);
         if (plan && fileBody !== null) { publishFile(filePath!, plan.body); published = true; }
-      });
+      }));
     } catch (err) {
       if (published) writeFileSync(filePath!, fileBody!, 'utf-8');
       throw err;
@@ -234,10 +266,10 @@ async function acceptUnmanaged(engine: BrainEngine, proposal: ProposalRow): Prom
   });
 }
 
-async function undoUnmanaged(engine: BrainEngine, proposal: ProposalRow): Promise<ProposalActionResult> {
+async function undoUnmanaged(engine: BrainEngine, proposal: PairProposal, store: PairProposalStore): Promise<ProposalActionResult> {
   const first = await loadPairFact(engine, proposal.old_fact_id);
   return withFenceLocks(engine, first?.source_markdown_slug ?? null, proposal.source_id, async (filePath) => {
-    const fresh = await getProposal(engine, proposal.id);
+    const fresh = await store.get(engine, proposal.id);
     if (!fresh || fresh.status !== 'accepted') return { id: proposal.id, action: 'undo', status: 'refused', reason: fresh?.status ?? 'not_found' };
     const states = parseStates(fresh);
     if (!states) return { id: fresh.id, action: 'undo', status: 'refused', reason: 'no_recorded_state' };
@@ -257,11 +289,11 @@ async function undoUnmanaged(engine: BrainEngine, proposal: ProposalRow): Promis
     }
     let published = false;
     try {
-      await engine.transaction(async (tx) => {
+      await maintenanceTransaction(engine, (tx) => withTrustKeep(tx, ['pages'], async () => {
         if (plan) await mirrorBody(tx, before.fence!.slug, fresh.source_id, plan.body, fileBody !== null);
-        await applyUndoDb(tx, fresh, before, after);
+        await applyUndoDb(tx, fresh, before, after, store);
         if (plan && fileBody !== null) { publishFile(filePath!, plan.body); published = true; }
-      });
+      }));
     } catch (err) {
       if (published) writeFileSync(filePath!, fileBody!, 'utf-8');
       throw err;
@@ -274,15 +306,20 @@ async function undoUnmanaged(engine: BrainEngine, proposal: ProposalRow): Promis
 // Managed path: coordinator mutation `decide_proposal`
 // ---------------------------------------------------------------------------
 
+const proposalsFix = (why: string) => readFix(why, { argv: ['gbrain', 'decide', 'proposals', 'list', '--status', 'all', '--json'] });
+
 /** Coordinator preparer: the same plan as the unmanaged path, published by the coordinator as one unit. */
 export async function prepareProposalMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
-  const p = row.intent as { proposal_id?: number; action?: ProposalAction } | null;
+  const p = row.intent as { proposal_id?: number; action?: ProposalAction; store?: string } | null;
   const id = Number(p?.proposal_id);
-  if (row.operation !== DECIDE_PROPOSAL_OPERATION || !Number.isSafeInteger(id) || (p?.action !== 'accept' && p?.action !== 'undo') || row.authority.remote) {
-    throw new OperationError('permission_denied', 'Unsupported decide proposal intent.');
+  const store = await pairStore(p?.store);
+  if (row.operation !== DECIDE_PROPOSAL_OPERATION || !Number.isSafeInteger(id) || (p?.action !== 'accept' && p?.action !== 'undo') || row.authority.remote || !store) {
+    throw opError('permission_denied', 'Unsupported decide proposal intent.',
+      `Request ${row.request_id} in source ${row.source_id} is not a local accept or undo of a proposal, so the coordinator refused it and nothing changed. Decide proposals from the brain host's CLI with gbrain decide proposals accept or undo.`,
+      { fix: proposalsFix('Lists proposals with their ids and status, read-only.') });
   }
   const action = p.action;
-  const proposal = await getProposal(engine, id);
+  const proposal = await store.get(engine, id);
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
   const observedRevision = snapshot?.revision ?? null;
   const done = (outcome: Record<string, unknown>): PreparedMutation => ({ observedRevision, noop: true, apply: async () => outcome });
@@ -290,22 +327,28 @@ export async function prepareProposalMutation(engine: BrainEngine, row: WriteReq
   if (proposal.status !== (action === 'accept' ? 'pending' : 'accepted')) return done({ id, action, status: 'refused', reason: proposal.status });
   const [oldF, newF] = await Promise.all([loadPairFact(engine, proposal.old_fact_id), loadPairFact(engine, proposal.new_fact_id)]);
   const unchanged = async (tx: BrainEngine) => {
-    const current = await getProposal(tx, id, true);
+    const current = await store.get(tx, id, true);
     const [o, n] = await Promise.all([loadPairFact(tx, proposal.old_fact_id, true), loadPairFact(tx, proposal.new_fact_id, true)]);
     if (current?.status !== proposal.status || !o || !n || !oldF || !newF || !sameFields(factFields(o), factFields(oldF)) || !sameFields(factFields(n), factFields(newF))) {
-      throw new OperationError('revision_conflict', 'The proposal or its facts changed during preparation.');
+      throw opError('revision_conflict', 'The proposal or its facts changed during preparation.',
+        `Proposal ${id} or its facts changed while request ${row.request_id} was prepared, so nothing was applied. Review its current status, then decide it again if it still applies.`,
+        { fix: proposalsFix(`Shows proposal ${id}'s current status, read-only.`) });
     }
   };
   const pageFor = async (body: string): Promise<PreparedMutation | undefined> => {
     if (!snapshot) return undefined;
     const page = await preparePage(engine, { ...row, intent: { ...row.intent, content: serializePageToMarkdown({ ...snapshot.page, compiled_truth: body }, snapshot.tags), expected_revision: observedRevision, force: false } }, config);
-    if (page.observedRevision !== observedRevision) throw new OperationError('revision_conflict', 'The fact page changed during preparation.');
+    if (page.observedRevision !== observedRevision) {
+      throw opError('revision_conflict', 'The fact page changed during preparation.',
+        `Fact page ${row.slug} in source ${row.source_id} changed while proposal ${id} (request ${row.request_id}) was prepared, so nothing was applied. Review the page and the proposal, then decide it again if it still applies.`,
+        { fix: readFix(`Shows page ${row.slug} as it is now, read-only.`, { argv: ['gbrain', 'get', '--source', row.source_id, '--', row.slug] }) });
+    }
     return page;
   };
   if (action === 'accept') {
     const stale = staleReason(proposal, oldF, newF, Date.now());
     if (stale) return { observedRevision, validate: unchanged, apply: async (tx) => {
-      await transitionProposal(tx, id, 'pending', 'stale');
+      await store.transition(tx, id, 'pending', 'stale');
       return { id, action, status: 'stale', reason: stale };
     } };
     const plan = oldF!.source_markdown_slug === row.slug && snapshot ? planAcceptFence(snapshot.page.compiled_truth, oldF!, newF!, formatFenceDate(new Date())) : null;
@@ -317,7 +360,7 @@ export async function prepareProposalMutation(engine: BrainEngine, row: WriteReq
       await expireOld(tx, proposal);
       await page?.apply(tx);
       const revision = plan ? (await tx.readPageSnapshot(row.slug, { sourceId: row.source_id }))?.revision ?? null : null;
-      await finishAccept(tx, proposal, before, plan ? fence(plan.after, revision) : null);
+      await finishAccept(tx, proposal, before, plan ? fence(plan.after, revision) : null, store);
       return { id, action, status: 'accepted' };
     } };
   }
@@ -334,7 +377,7 @@ export async function prepareProposalMutation(engine: BrainEngine, row: WriteReq
   }
   return { observedRevision, file: page?.file, validate: async (tx) => { await unchanged(tx); await page?.validate?.(tx); }, apply: async (tx) => {
     await page?.apply(tx);
-    await applyUndoDb(tx, proposal, before, after);
+    await applyUndoDb(tx, proposal, before, after, store);
     return { id, action, status: 'undone' };
   } };
 }
@@ -344,7 +387,7 @@ async function preparePage(engine: BrainEngine, row: WriteRequest, config: GBrai
   return preparePageMutation(engine, row, config);
 }
 
-async function submitManaged(engine: BrainEngine, proposal: ProposalRow, action: ProposalAction, config: GBrainConfig): Promise<ProposalActionResult> {
+async function submitManaged(engine: BrainEngine, proposal: PairProposal, action: ProposalAction, config: GBrainConfig, store: PairProposalStore): Promise<ProposalActionResult> {
   const { initializeLocalPersistence, requestPrincipalForContext } = await import('../persistence/page-mutations.ts');
   const { submissionAuthority } = await import('../persistence/authority.ts');
   const { admitWrite } = await import('../persistence/journal.ts');
@@ -356,7 +399,11 @@ async function submitManaged(engine: BrainEngine, proposal: ProposalRow, action:
   await initializeLocalPersistence(ctx as never);
   const principal = await requestPrincipalForContext(ctx as never);
   const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean }>('SELECT incarnation, archived FROM sources WHERE id = $1', [sourceId]);
-  if (!source || source.archived) throw new OperationError('source_changed', 'The proposal source is not active.');
+  if (!source || source.archived) {
+    throw opError('source_changed', 'The proposal source is not active.',
+      `Proposal ${proposal.id} belongs to source ${sourceId}, which is archived or missing, so nothing changed. Restore the source to decide it (the user's call), or reject the proposal.`,
+      { fix: readFix('Lists sources with their archived state, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'] }) });
+  }
   const oldF = await loadPairFact(engine, proposal.old_fact_id);
   const slug = oldF?.source_markdown_slug ?? oldF?.entity_slug ?? 'memory/unattributed';
   const authority = await submissionAuthority(ctx as never, DECIDE_PROPOSAL_OPERATION, sourceId, source.incarnation, slug);
@@ -364,7 +411,7 @@ async function submitManaged(engine: BrainEngine, proposal: ProposalRow, action:
   const writeThrough = !/^(false|0|off|no)$/i.test(await engine.getConfig('sync.write_through') ?? 'true');
   const binding = snapshot && writeThrough ? await getWorktreeBinding(engine, sourceId) : null;
   if (!writeThrough) authority.databaseOnlyReason = 'disabled_by_config';
-  const intent = { proposal_id: proposal.id, action };
+  const intent = { proposal_id: proposal.id, action, ...(store === DECIDE_PROPOSAL_STORE ? {} : { store: store.name }) };
   const row = await admitWrite(engine, {
     principal, operation: DECIDE_PROPOSAL_OPERATION, sourceId, sourceIncarnation: source.incarnation, slug, pageId: snapshot?.page.id ?? null,
     requestId: randomUUID(), callerIntent: intent, intent, authority, worktreeId: binding?.worktree_id ?? null, topologyGeneration: binding?.topology_generation ?? null,
@@ -381,13 +428,14 @@ async function managed(engine: BrainEngine): Promise<boolean> {
 }
 
 /** Accept or undo one proposal through the brain's supersede write path. */
-export async function applyProposalAction(engine: BrainEngine, id: number, action: ProposalAction, config?: GBrainConfig): Promise<ProposalActionResult> {
-  const proposal = await getProposal(engine, id);
+export async function applyProposalAction(engine: BrainEngine, id: number, action: ProposalAction, config?: GBrainConfig,
+  store: PairProposalStore = DECIDE_PROPOSAL_STORE): Promise<ProposalActionResult> {
+  const proposal = await store.get(engine, id);
   if (!proposal) return { id, action, status: 'not_found' };
   const want = action === 'accept' ? 'pending' : 'accepted';
   if (proposal.status !== want) return { id, action, status: 'refused', reason: proposal.status };
-  if (await managed(engine)) return submitManaged(engine, proposal, action, config ?? ({ engine: engine.kind } as GBrainConfig));
-  return action === 'accept' ? acceptUnmanaged(engine, proposal) : undoUnmanaged(engine, proposal);
+  if (await managed(engine)) return submitManaged(engine, proposal, action, config ?? ({ engine: engine.kind } as GBrainConfig), store);
+  return action === 'accept' ? acceptUnmanaged(engine, proposal, store) : undoUnmanaged(engine, proposal, store);
 }
 
 export async function rejectProposal(engine: BrainEngine, id: number): Promise<ProposalActionResult> {

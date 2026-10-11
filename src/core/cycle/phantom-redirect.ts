@@ -51,6 +51,8 @@ import {
   FACTS_FENCE_END,
   type ParsedFact,
 } from '../facts-fence.ts';
+import { locateOutsideCode } from '../fence-scan.ts';
+import { assertFenceRewritable } from '../fence-shared.ts';
 import { parseMarkdown, splitBody, serializeMarkdown } from '../markdown.ts';
 import { tryAcquireDbLock, syncLockId, type DbLockHandle } from '../db-lock.ts';
 import { isAborted } from '../abort-check.ts';
@@ -58,6 +60,7 @@ import { logPhantomEvent, type PhantomOutcome } from '../facts/phantom-audit.ts'
 import { MOVE_WITHDRAWAL_SUBJECT_SQL } from '../facts/withdrawal-schema.ts';
 import { resolvePageWriteTarget } from '../write-through.ts';
 import { recordRenameAlias } from '../page-state/rename-alias.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 /** Tagged-union outcome of a single phantom-redirect attempt. */
@@ -142,10 +145,9 @@ export function stripFenceAndFrontmatterAndLeadingH1(body: string): string {
   // 1. Strip the entire `## Facts\n\n<fence>...<fence>` block. We grab
   //    the `## Facts` heading too (with surrounding blank lines) so the
   //    section header doesn't count as residue.
-  const beginIdx = working.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx = beginIdx >= 0
-    ? working.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length)
-    : -1;
+  const located = locateOutsideCode(working, FACTS_FENCE_BEGIN, FACTS_FENCE_END);
+  const beginIdx = located.beginIdx;
+  const endIdx = beginIdx >= 0 ? located.endIdx : -1;
   if (beginIdx !== -1 && endIdx !== -1) {
     // Walk backward from beginIdx to swallow a leading `## Facts\n\n`
     // (or `## facts\n\n` — case-insensitive markdown headings).
@@ -242,6 +244,8 @@ function appendPhantomFenceRowsToCanonical(
  * The canonical body with the phantom's rows appended (null when every row
  * dedups onto an existing canonical row) and the phantom -> canonical row
  * number map. Shared by the file writer above and the managed redirect.
+ * Throws `FenceRewriteRefusal` when the canonical fence does not parse
+ * cleanly; the pass records the phantom as `drift` and moves nothing.
  */
 export function mergePhantomFenceRows(
   body: string,
@@ -249,7 +253,10 @@ export function mergePhantomFenceRows(
   dbMaxRowNum: number,
 ): { body: string | null; renumber: Map<number, number> } {
   const renumber = new Map<number, number>();
-  const { facts: existingFacts } = parseFactsFence(body);
+  const parsed = parseFactsFence(body);
+  // Re-rendering a canonical fence the parser skipped rows of would delete them.
+  assertFenceRewritable('facts', parsed);
+  const existingFacts = parsed.facts;
 
   // Dedup key combines claim + valid_from. We deliberately do NOT include
   // valid_until or status in the key so that a "fact about Alice" already
@@ -302,7 +309,7 @@ async function migratePhantomFacts(
   canonicalSlug: string,
   rowMap: ReadonlyMap<number, number>,
 ): Promise<number> {
-  return engine.transaction(tx => movePhantomFacts(tx, sourceId, phantomSlug, canonicalSlug, rowMap));
+  return maintenanceTransaction(engine, tx => movePhantomFacts(tx, sourceId, phantomSlug, canonicalSlug, rowMap));
 }
 
 /** The body of migratePhantomFacts inside the caller's transaction. */
@@ -492,7 +499,7 @@ export async function tryRedirectPhantom(
   }
 
   // Codex #1: phantom-specific resolver bypasses exact-self-match.
-  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug);
+  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug, { type: page.type });
   if (!canonical) {
     logPhantomEvent({
       phantom_slug: page.slug,
@@ -522,6 +529,18 @@ export async function tryRedirectPhantom(
       phantom_slug: page.slug,
       outcome: 'drift',
       source_id: sourceId,
+    });
+    return { outcome: 'drift', canonical };
+  }
+
+  // Only parsed rows move and the phantom is then deleted, so a phantom fence
+  // the parser skipped rows of would lose them: leave it for a person.
+  if (parseFactsFence(page.compiled_truth ?? '').warnings.length > 0) {
+    logPhantomEvent({
+      phantom_slug: page.slug,
+      outcome: 'drift',
+      source_id: sourceId,
+      reason: 'phantom facts fence does not parse cleanly',
     });
     return { outcome: 'drift', canonical };
   }
@@ -578,13 +597,13 @@ export async function tryRedirectPhantom(
     frontmatter: reparsed.frontmatter,
     tags: canonicalTags,
   });
-  await engine.refreshPageBody(
+  await maintenanceTransaction(engine, tx => tx.refreshPageBody(
     canonical,
     sourceId,
     reparsed.compiled_truth,
     reparsed.timeline,
     newContentHash,
-  );
+  ));
 
   // Withdrawals are scoped to the entity; the phantom was the canonical
   // entity. Moved first, so the withdrawal trigger honors them as the
@@ -599,7 +618,7 @@ export async function tryRedirectPhantom(
   // Round 19/20: soft-delete + unlink. Order matters — softDelete first
   // so a concurrent sync that observes the phantom .md gone treats it as
   // a normal deletion (not a regression).
-  await engine.softDeletePage(page.slug, { sourceId });
+  await maintenanceTransaction(engine, tx => tx.softDeletePage(page.slug, { sourceId }));
   const phantomPath = path.join(brainDir, `${page.slug}.md`);
   if (fs.existsSync(phantomPath)) {
     try {

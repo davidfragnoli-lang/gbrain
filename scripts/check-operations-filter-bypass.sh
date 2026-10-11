@@ -44,10 +44,11 @@ ALLOWED=(
   "src/core/grants/profiles.ts"                 # snapshots eligible remote ops with !op.localOnly; grant validation never exposes local-only operations
   "src/core/bootstrap/harness.ts"              # trusted owner provisioning; filters localOnly and scopes before minting explicit follow operation snapshots
   "src/core/token-mint.ts"                     # trusted token creation validates explicit snapshots against public scope-compatible operations
+  "src/core/grants/legacy-token.ts"             # trusted local rescope-token; validates and refreshes snapshots against !op.localOnly scope-compatible operations
   "src/core/shared-skills/tool-access.ts"       # skill usability intersects locality, scopes, snapshots, source fences, surface and publication gates
   "src/mcp/skill-resources.ts"                  # resources map only catalog reads through equivalent scope/snapshot/surface/gate checks and shared dispatch
   "src/core/harness/capabilities.ts"            # introspection applies !op.localOnly plus effective surface, scope, fence, snapshot and publish-gate filters
-  "src/cli.ts"                                  # local CLI; user owns the machine, no trust boundary
+  "src/cli/main.ts"                             # local CLI dispatcher (loaded by src/cli.ts); user owns the machine, no trust boundary
   "src/mcp/dispatch.ts"                         # shared dispatch; sets ctx.remote from caller, handlers self-gate
   "src/mcp/server.ts"                           # stdio MCP; local-trusted (binary on user's box)
   "src/mcp/http-transport.ts"                   # superseded by serve-http.ts; kept for back-compat tests
@@ -55,14 +56,18 @@ ALLOWED=(
   "src/core/minions/tools/brain-allowlist.ts"   # subagent registry; has its own opt-in allowlist (separate from localOnly)
   "src/commands/capture.ts"                     # local CLI tool; not network-exposed
   "src/commands/recall.ts"                      # local CLI delegates forget through the frozen operation before acquiring an engine
+  "src/commands/forget-purge.ts"                # local CLI runs the cliOnly purge_fact op as the trusted owner (remote: false) or over the 0600 owner socket
+  "src/commands/pages-purges.ts"                # local CLI runs the cliOnly list_page_purges / unpurge_page ops as the trusted owner (remote: false)
   "src/commands/takes-mutation.ts"              # local CLI adapter; trusted execution or authenticated persistence IPC only
   "src/core/persistence/administration.ts"      # trusted-admin grant diagnostics; does not expose an operation transport
   "src/core/persistence/provider.ts"            # authenticated local registrations; shared dispatch enforces localOnly and the immutable trust lane
   "src/commands/enrich.ts"                       # local CLI tool; calls put_page handler with remote=false, not network-exposed
   "src/core/extract-takes-from-pages.ts"          # local CLI extraction calls put_page with remote=false; it does not expose operations to a transport
   "src/commands/book-mirror.ts"                 # local CLI tool; not network-exposed
+  "src/commands/edge-proposals.ts"              # local CLI review of edge proposals; calls trusted handlers with remote=false, not network-exposed
+  "src/core/cycle/edge-contradictions.ts"       # dream phase appends closure lines via add_timeline_entry with remote=false; never exposes operations
   "src/commands/tools-json.ts"                  # gbrain --tools-json introspection; full op list IS the purpose
-  "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets; never lists/exposes ops
+  "src/mcp/publish-gates.ts"                    # reads op.publishGateKey/name only to compute gate-DISABLED sets and the gate key set; never lists/exposes ops
   "src/mcp/tool-catalog.ts"                     # docs/TOOL_CATALOG.md renderer; filters !op.localOnly at the boundary; never a transport surface
   "src/commands/serve-http.ts"                  # MUST APPLY .filter(op => !op.localOnly) — verified by grep below
   "src/core/ops/request-tools.ts"               # visibleOpsForCaller loads the assembled list lazily (verbs.ts house pattern) and applies (isLocal || !op.localOnly) + surface + gate filtering

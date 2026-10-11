@@ -3,6 +3,7 @@
  * Each stage reads the resolved request (HybridRequest, request.ts) and
  * writes its per-request accumulators only as `req.<field>`.
  */
+import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import { perArmPoolLimit } from '../eval-pool-depth.ts';
 import type { DegradedStageEntry, HybridSearchMeta, SearchOpts, SearchResult } from '../../types.ts';
@@ -16,11 +17,14 @@ import { normalizeExpansionVariantBudget } from '../fusion-lists.ts';
 import { normalizeKeywordArmConfidenceFloor } from '../arm-confidence.ts';
 import { normalizeMetadataBoostGate } from '../metadata-boost-gate.ts';
 import { normalizeRelationalRerankPin } from '../relational-rerank-pin.ts';
-import { parseRelationalQuery } from '../relational-intent.ts';
+import { isRelationalQuery } from '../relational-plan.ts';
 import { pushDegraded } from './degraded.ts';
 import { recordSearchTelemetry } from '../telemetry.ts';
 import { resolveBoostMap, resolveHardExcludes } from '../source-boost.ts';
 import { resolveEmbeddingColumn } from '../embedding-column.ts';
+import { resolveVectorLegacyGuard } from '../vector-legacy-guard.ts';
+import { resolveHnswIterativeScan } from '../hnsw-iterative-scan.ts';
+import { resolveCjkKeywordDeadlineMs } from '../cjk-keyword-deadline.ts';
 import { resolveSearchDateBounds } from '../date-bounds.ts';
 import { type DecideSearchContext, decideMetaFor, resolveAndLaunchDecide } from '../decide-stage.ts';
 import { applySearchIntent } from '../decide-retrieval.ts';
@@ -53,6 +57,8 @@ export interface HybridRequest {
   degraded: DegradedStageEntry[];
   /** v0.46.15: max-escalations searchVector exhaustion event, accumulated across vector calls. */
   vectorPoolUnderfill: HybridSearchMeta['vector_pool_underfilled'];
+  /** #5989: the last bounded CJK keyword arm outcome. */
+  keywordCandidates?: HybridSearchMeta['keyword_candidates'];
   /** v0.25.0: whether query expansion actually produced variants (onMeta). */
   expansionApplied: boolean;
   /** Telemetry counters set at each return path before emitHybridMeta. */
@@ -63,6 +69,8 @@ export interface HybridRequest {
   decide?: DecideSearchContext;
   /** Set by the rerank stage when the System One reranker answered. */
   rerankMeta?: { model_resolved: string };
+  /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
+  relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
 }
 
 const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
@@ -123,6 +131,10 @@ export async function resolveHybridRequest(
       // Ranker wave (R1) — relational rerank pin per-call thread-through (eval
       // A/B); normalized through the ONE range contract (relational-rerank-pin.ts).
       relational_rerank_pin: normalizeRelationalRerankPin(opts?.relationalRerankPin),
+      // Multi-hop planner + one-hop orientation per-call thread-through (eval A/B).
+      relational_planner: typeof opts?.relationalPlanner === 'boolean' ? opts.relationalPlanner : undefined,
+      relational_orient_onehop: typeof opts?.relationalOrientOneHop === 'boolean' ? opts.relationalOrientOneHop : undefined,
+      relational_chain_slots: normalizeChainSlots(opts?.relationalChainSlots),
       // Ranker wave (Phase E2) — keyword-arm confidence floor per-call thread-through.
       keyword_arm_confidence_floor: normalizeKeywordArmConfidenceFloor(opts?.keywordArmConfidenceFloor),
       // Ranker wave (Phase E3) — metadata boost gate per-call thread-through (eval A/B).
@@ -164,7 +176,12 @@ export async function resolveHybridRequest(
   // System One S2: an above-threshold intent replaces the regex one before
   // weights, detail and search options are derived (regex is the fallback).
   const decide = decidePending ? await decidePending : undefined;
-  const suggestions = decide ? await applySearchIntent(decide, query, regexSuggestions).catch(() => regexSuggestions) : regexSuggestions;
+  const intended = decide ? await applySearchIntent(decide, query, regexSuggestions).catch(() => regexSuggestions) : regexSuggestions;
+  // An inferred image intent needs a multimodal embedding model; without one
+  // the image arm cannot run, so the query stays a text query (keyword arm and
+  // expansion included). An explicit `crossModal` still routes as asked.
+  const suggestions = intended.suggestedModality !== 'text' && (await import('../../ai/multimodal-model.ts')).multimodalEmbeddingModel() === null
+    ? { ...intended, suggestedModality: 'text' as const } : intended;
   const intentWeightingOn = resolvedMode.intentWeighting;
   const intentWeights = intentWeightingOn
     ? weightsForIntent(suggestions.intent)
@@ -221,10 +238,25 @@ export async function resolveHybridRequest(
     // hybrid hot path.
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
+    // #5575 — the read floor and proactive activation control, same leak
+    // class: dropping them would return rows below a connection's floor.
+    minTrust: opts?.minTrust,
+    suppressFlagged: opts?.suppressFlagged,
     // v0.36 (D11): pass the pre-validated descriptor into the engine so
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
+    // #5824 rollback switch, latched once per process from env/config.
+    vectorLegacyGuard: resolveVectorLegacyGuard(cfgForColumn),
+    hnswIterativeScan: resolveHnswIterativeScan(cfgForColumn),
+    // #5989: bound the CJK keyword arm by one deadline; its outcome and wall time ride the meta.
+    cjkKeyword: {
+      deadlineMs: resolveCjkKeywordDeadlineMs(cfgForColumn),
+      onMeta: (m) => {
+        if (m.incomplete) pushDegraded(degraded, 'keyword_candidates_incomplete', m.reason);
+        req.keywordCandidates = m;
+      },
+    },
     // D2 fix (fix/title-retrieval-arm, Reviewer F1): the hybrid keyword arm
     // is a recall arm — opt in to the engine's AND→OR zero-recall fallback.
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
@@ -281,14 +313,14 @@ export async function resolveHybridRequest(
   // Intent identity boosts (exact/mentioned title or slug, mentioned alias),
   // shared by the fused path and both keyword-only paths. Caller re-sorts.
 export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[]): Promise<void> {
-  const { engine, query, opts, suggestions, intentWeightingOn, intentWeights } = req;
+  const { engine, query, opts, suggestions, intentWeightingOn, intentWeights, resolvedMode } = req;
   if (intentWeights.exactMatchBoost === 1.0) {
     // #4694: general and temporal questions still honor a multi-token
     // title that is the query's subject. Not concept intent (Cat 13: a
     // lexical title decoy is exactly what paraphrase probes must not
     // reward) and not a relational question ("who invested in <title>"),
     // whose answer is the pages linked to that title, not the title page.
-    if (intentWeightingOn && suggestions.intent !== 'concept' && parseRelationalQuery(query) === null) {
+    if (intentWeightingOn && suggestions.intent !== 'concept' && !isRelationalQuery(query, resolvedMode.relational_planner)) {
       applyTitleMentionBoost(list, query);
     }
     return;
@@ -307,12 +339,16 @@ export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult
   // search_telemetry rollup. Telemetry write is sync (bumps a bucket map),
   // flush is fire-and-forget on 60s / 100-call thresholds. The hot path
   // never waits.
-export function emitHybridMeta(req: HybridRequest, rawMeta: HybridSearchMeta): void {
+export function emitHybridMeta(req: HybridRequest, armMeta: HybridSearchMeta): void {
   const { engine, opts } = req;
+  const rawMeta = req.keywordCandidates ? { ...armMeta, keyword_candidates: req.keywordCandidates } : armMeta;
   const decide = decideMetaFor(req.decide);
   const answerability = req.decide?.answerability;
-  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability
-    ? { ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}), ...(answerability ? { answerability } : {}) }
+  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan
+    ? {
+        ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}),
+        ...(answerability ? { answerability } : {}), ...(req.relationalPlan ? { relational_plan: req.relationalPlan } : {}),
+      }
     : rawMeta;
   try {
     opts?.onMeta?.(meta);

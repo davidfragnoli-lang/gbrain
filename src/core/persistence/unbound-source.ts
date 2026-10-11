@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 
 /**
@@ -21,7 +21,8 @@ export const UNBOUND_COLLISION_MESSAGE = 'A database-only page written while its
 
 export function parseUnboundWriteValue(value: string): UnboundWritePolicy {
   if ((UNBOUND_WRITE_VALUES as readonly string[]).includes(value)) return value as UnboundWritePolicy;
-  throw new OperationError('invalid_params', `${UNBOUND_WRITE_KEY} must be one of: ${UNBOUND_WRITE_VALUES.join(', ')} (got '${value}').`);
+  throw opError('invalid_params', `${UNBOUND_WRITE_KEY} must be one of: ${UNBOUND_WRITE_VALUES.join(', ')} (got '${value}').`,
+    `Set it with gbrain config set ${UNBOUND_WRITE_KEY} ${UNBOUND_WRITE_VALUES[0]} (the default) or ${UNBOUND_WRITE_VALUES[1]}.`);
 }
 
 /** A missing or unreadable value keeps the refusal. */
@@ -38,16 +39,46 @@ export function unboundBindCommand(sourceId: string, path: string | null): strin
  * `path` is filled only for trusted local callers; remote callers get a
  * placeholder instead of a host path.
  */
-export function unboundSourceError(sourceId: string, path: string | null, scope: 'database_only_eligible' | 'file_backed'): OperationError {
+export function unboundSourceError(sourceId: string, path: string | null, scope: 'database_only_eligible' | 'file_backed', classic = false): OperationError {
   const bind = `bind the source on the brain host: ${unboundBindCommand(sourceId, path)} `
     + '(if an operator has locked writer administration, ask the operator to unlock it first)';
-  const suggestion = scope === 'database_only_eligible'
+  // #6122: on a brain whose managed persistence is not activated, a claim alone fences classic sync of the source,
+  // so the working path is the file plus classic sync; claiming is named with that consequence.
+  // Classic sync imports commits, not the working tree, so the hint names the commit; a remote caller cannot reach the checkout.
+  const edit = path
+    ? `write the page as ${path}/<slug>.md (check generated frontmatter with gbrain frontmatter validate --stdin --path <slug>.md), commit it in that checkout, then run gbrain sync --source ${sourceId}`
+    : `ask the user to write the page as <slug>.md in the source's checkout on the brain host, commit it, and run gbrain sync --source ${sourceId}`;
+  const trap = `For a gbrain-owned checkout instead (a brain-wide change: ask the user first), ${bind}, then activate managed persistence (preview first: gbrain sources writer activate --confirm-quiesced --dry-run --json). `
+    + `Managed persistence is not activated on this brain, so a claim without activation blocks classic sync of ${sourceId} until it is activated or the claim is released with gbrain sources writer deactivate.`;
+  const suggestion = classic ? scope === 'database_only_eligible'
+    ? `Source '${sourceId}' has a checkout path but no canonical owner. Choose one: ${edit}; or allow database-only writes to unbound sources `
+      + `with gbrain config set ${UNBOUND_WRITE_KEY} database_only. Pages written that way stay database-only and are not materialized into canonical files after binding. ${trap}`
+    : `Source '${sourceId}' has a checkout path but no canonical owner. To change this page, ${edit}. `
+      + `${UNBOUND_WRITE_KEY}=database_only does not apply: this page came from a canonical file, and a database-only edit would be lost on the next sync. ${trap}`
+    : scope === 'database_only_eligible'
     ? `Source '${sourceId}' has a checkout path but no canonical owner. Choose one: ${bind}; or allow database-only writes to unbound sources `
       + `with gbrain config set ${UNBOUND_WRITE_KEY} database_only. Pages written that way stay database-only and are not materialized into canonical files after binding.`
     : `Source '${sourceId}' has a checkout path but no canonical owner. To write this page, ${bind}. `
       + `${UNBOUND_WRITE_KEY}=database_only does not apply: this page came from a canonical file, and a database-only edit would be lost on the owner's next sync.`;
   const error = new OperationError('owner_unavailable', 'This source has no designated canonical owner.', suggestion, UNBOUND_SOURCE_DOCS);
   error.detail = 'unbound_source';
+  // A configuration state, not a transient one: a retry gets the same refusal, and every way out is the user's choice.
+  error.retryable = false;
+  error.fix = {
+    ask_user: true,
+    consent: [],
+    actor: path ? 'agent' : 'user',
+    why: classic
+      ? `The brain is in classic mode: the checkout of '${sourceId}' is the source of truth and gbrain only reads it, so a page is saved as a committed file followed by gbrain sync. Don't retry, claim the source or activate managed mode to get one write through.`
+      : `Source '${sourceId}' has no canonical owner; binding it or allowing database-only pages is a brain-wide decision for the user.`,
+    user_message: classic
+      ? path
+        ? `Your brain is in classic mode, so pages are saved as files in the checkout. I can write it as <slug>.md in ${path}, commit it and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+        : `Your brain is in classic mode, so I can't save pages directly. Save it as <slug>.md in the ${sourceId} folder, commit it, and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+      : `Source '${sourceId}' has no canonical owner, so I can't save this page. You can bind the source on the brain host, or allow database-only pages${scope === 'file_backed' ? ' (not for this page, which came from a file)' : ''}; I can explain what each changes.`,
+    docs: UNBOUND_SOURCE_DOCS,
+    requires_exclusive: false,
+  };
   return error;
 }
 

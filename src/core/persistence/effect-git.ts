@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve as resolvePath, sep } from 'node:path';
 import { execFileBounded, isDurabilityHardenedAsync } from '../brain-repo-durability.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import type { GitCommitNote } from './effect-model.ts';
 import { persistenceHome } from './identity.ts';
 import { nativeFileTarget } from './native-file-target.ts';
-import { isSourceDbTrackedSlug } from './source-storage.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 /** An index lock younger than this is contention; an older one is reported as stale. */
 const INDEX_LOCK_GRACE_MS = 10 * 60 * 1000;
@@ -17,12 +19,21 @@ const LOCK_REFUSAL = /Unable to create '([\s\S]*)': File exists/;
  */
 const canonical = (path: string) => { try { return join(realpathSync(dirname(path)), basename(path)); } catch { return path; } };
 
+const effectStatusFix = readFix('Shows each source\'s canonical owner with its retrying and parked Git effects, read-only.',
+  { argv: ['gbrain', 'sources', 'writer', 'status', '--json'] });
+const gitFailure = (message: string, cause: string) => opError('git_unavailable', message,
+  `${cause} The page write itself is committed; the effect worker tries this Git effect again and parks it after repeated failures. If it keeps failing, check the checkout with git status on the brain host.`,
+  { fix: effectStatusFix });
+const rootGone = (relativePath: string) => opError('git_target_unsafe', 'The canonical Git root disappeared.',
+  `The canonical checkout was moved or deleted while ${relativePath} was being committed, so nothing was committed for it; the page write itself is committed. Inspect the owner and tell the user: Git effects resume only once the checkout is back, and how to restore it is their decision.`,
+  { fix: effectStatusFix });
+
 const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never', GIT_GLOB_PATHSPECS: '0', GIT_NOGLOB_PATHSPECS: '0',
   GIT_ICASE_PATHSPECS: '0', LC_ALL: 'C' };
 
 async function run(root: string, hooks: string, args: string[], signal?: AbortSignal) {
   return execFileBounded('git', ['--literal-pathspecs', '-C', root, '-c', `core.hooksPath=${hooks}`, '-c', 'commit.gpgsign=false', ...args], {
-    timeout: 20_000, maxBuffer: 1024 * 1024, signal, env: { ...process.env, ...GIT_ENV },
+    timeout: 20_000, maxBuffer: 1024 * 1024, signal, env: gitChildEnv(GIT_ENV),
   });
 }
 
@@ -51,7 +62,8 @@ async function indexLockError(root: string, hooks: string, stderr: string, signa
 
 async function git(root: string, hooks: string, args: string[], signal?: AbortSignal): Promise<{ stdout: string; code: number }> {
   const { error, stdout, stderr } = await run(root, hooks, args, signal);
-  if (error && (error.killed || typeof error.code !== 'number')) throw new OperationError('git_unavailable', 'Git execution did not finish within its bounded attempt.');
+  if (error && (error.killed || typeof error.code !== 'number')) throw gitFailure('Git execution did not finish within its bounded attempt.',
+    'A git command in the canonical checkout did not finish within 20 seconds or could not start.');
   const code = error?.code as number ?? 0;
   if (code !== 0) { const locked = await indexLockError(root, hooks, stderr, signal); if (locked) throw locked; }
   return { stdout, code };
@@ -69,48 +81,36 @@ async function stageTarget(root: string, hooks: string, relativePath: string, si
   const path = nativeFileTarget(root, resolvePath(root, relativePath), 'git_target_unsafe');
   relativePath = relative(root, path).split(sep).join('/');
   const tracked = await git(root, hooks, ['ls-files', '-z', '--error-unmatch', '--', relativePath], signal);
-  if (tracked.code !== 0 && tracked.code !== 1) throw new OperationError('git_unavailable', 'Cannot inspect the canonical Git target.');
+  if (tracked.code !== 0 && tracked.code !== 1) throw gitFailure('Cannot inspect the canonical Git target.', `git ls-files failed for ${relativePath}.`);
   const changed = await git(root, hooks, ['status', '--porcelain', '--untracked-files=all', '--', relativePath], signal);
-  if (changed.code !== 0) throw new OperationError('git_unavailable', 'Cannot inspect the canonical Git target.');
+  if (changed.code !== 0) throw gitFailure('Cannot inspect the canonical Git target.', `git status failed for ${relativePath}.`);
   if (changed.stdout.trim()) {
     if (tracked.code === 0 || existsSync(path)) {
       const add = await git(root, hooks, ['add', '-A', '--', relativePath], signal);
-      if (add.code !== 0) throw new OperationError('git_unavailable', 'Cannot stage the canonical Git target.');
+      if (add.code !== 0) throw gitFailure('Cannot stage the canonical Git target.', `git add failed for ${relativePath}.`);
     }
     const diff = await git(root, hooks, ['diff', '--cached', '--quiet', '--', relativePath], signal);
     if (diff.code === 1) return { path: relativePath, state: 'changed' };
-    if (diff.code !== 0) throw new OperationError('git_unavailable', 'Cannot compare the canonical Git target.');
+    if (diff.code !== 0) throw gitFailure('Cannot compare the canonical Git target.', `git diff --cached failed for ${relativePath}.`);
     return { path: relativePath, state: 'unchanged' };
   }
   if (tracked.code === 0) return { path: relativePath, state: 'unchanged' };
-  if (existsSync(path)) {
-    // A reviewed storage declaration is the source's explicit instruction to
-    // retain this page in Git.  It must outrank a stale broad .gitignore rule;
-    // otherwise retry-effects can never repair the retained receipt.
-    const slug = relativePath.endsWith('.md') ? relativePath.slice(0, -3) : relativePath;
-    if (!isSourceDbTrackedSlug(root, slug)) throw new OperationError('git_target_unsafe', 'Git cannot identify the existing canonical file by its native spelling.',
-      'Reconcile the index and worktree spelling before retrying publication.');
-    const add = await git(root, hooks, ['add', '-f', '--', relativePath], signal);
-    if (add.code !== 0) throw new OperationError('git_unavailable', 'Cannot stage the declared database-tracked Git target.');
-    const diff = await git(root, hooks, ['diff', '--cached', '--quiet', '--', relativePath], signal);
-    if (diff.code === 1) return { path: relativePath, state: 'changed' };
-    if (diff.code !== 0) throw new OperationError('git_unavailable', 'Cannot compare the declared database-tracked Git target.');
-    return { path: relativePath, state: 'unchanged' };
-  }
+  if (existsSync(path)) throw new OperationError('git_target_unsafe', 'Git cannot identify the existing canonical file by its native spelling.',
+    'Reconcile the index and worktree spelling before retrying publication.');
   let parent = dirname(path);
   while (!existsSync(parent)) {
-    if (parent === resolvePath(root)) throw new OperationError('git_target_unsafe', 'The canonical Git root disappeared.');
+    if (parent === resolvePath(root)) throw rootGone(relativePath);
     parent = dirname(parent);
   }
   const scope = relative(root, parent).split(sep).join('/') || '.';
   const deleted = await git(root, hooks, ['diff', '--name-only', '--diff-filter=D', '--no-renames', '-z', '--', scope], signal);
   const staged = await git(root, hooks, ['diff', '--cached', '--name-only', '--diff-filter=D', '--no-renames', '-z', '--', scope], signal);
-  if (deleted.code !== 0 || staged.code !== 0) throw new OperationError('git_unavailable', 'Cannot inspect canonical Git deletions.');
+  if (deleted.code !== 0 || staged.code !== 0) throw gitFailure('Cannot inspect canonical Git deletions.', `git diff could not list the deletions under ${scope}.`);
   for (const entry of new Set(`${deleted.stdout}${staged.stdout}`.split('\0').filter(Boolean))) {
     if (existsSync(join(root, entry))) continue;
     let missingParent = dirname(nativeFileTarget(root, join(root, entry), 'git_target_unsafe'));
     while (!existsSync(missingParent)) {
-      if (missingParent === resolvePath(root)) throw new OperationError('git_target_unsafe', 'The canonical Git root disappeared.');
+      if (missingParent === resolvePath(root)) throw rootGone(relativePath);
       missingParent = dirname(missingParent);
     }
     if (missingParent === parent) throw new OperationError('git_target_unsafe', 'The absent target cannot be distinguished from an indexed deletion.',
@@ -126,13 +126,23 @@ function withHooks<T>(run: (hooks: string) => Promise<T>): Promise<T> {
   return run(hooks).finally(() => rmSync(hooks, { recursive: true, force: true }));
 }
 
+const commitText = (text: string) => text.replace(/[\u0000-\u001f\u007f]/g, '');
+
 /**
  * #5530: commit a group of single-file targets with one `commit --only`. The
  * caller owns the native worktree lock and has probed durability. Each
  * target's outcome (or its own error) is keyed by its requested relative
  * path; a failing target never enters the commit. Nothing is pushed.
+ *
+ * `notes` (keyed by requested path) carry a preparer's commit metadata: a
+ * path that commits alone with a note uses its subject; a group keeps the
+ * generic subject and lists the noted paths' lines in the body, in path
+ * order. A note's `gbrain-repair:` trailer goes in the message's last
+ * paragraph (one line per noted path), where Git reads trailers. Control
+ * characters are stripped from all three.
  */
-export async function commitGitTargets(root: string, relativePaths: string[], signal?: AbortSignal): Promise<Map<string, GitOutcome | OperationError>> {
+export async function commitGitTargets(root: string, relativePaths: string[], signal?: AbortSignal,
+  notes?: ReadonlyMap<string, GitCommitNote>): Promise<Map<string, GitOutcome | OperationError>> {
   const results = new Map<string, GitOutcome | OperationError>();
   await withHooks(async hooks => {
     // One ls-files, one status, one add and one diff for the group; targets
@@ -146,7 +156,7 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
     const paths = [...new Set(normalized.values())];
     const list = async (args: string[]) => {
       const out = paths.length ? await git(root, hooks, [...args, '--', ...paths], signal) : { stdout: '', code: 0 };
-      if (out.code !== 0) throw new OperationError('git_unavailable', 'Cannot inspect the canonical Git target.');
+      if (out.code !== 0) throw gitFailure('Cannot inspect the canonical Git target.', `git ${args[0]} failed for this group of ${paths.length} file(s).`);
       return out.stdout;
     };
     const tracked = new Set((await list(['ls-files', '-z'])).split('\0').filter(Boolean));
@@ -166,9 +176,9 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
     }
     if (staged.length) {
       const add = await git(root, hooks, ['add', '-A', '--', ...new Set(staged)], signal);
-      if (add.code !== 0) throw new OperationError('git_unavailable', 'Cannot stage the canonical Git target.');
+      if (add.code !== 0) throw gitFailure('Cannot stage the canonical Git target.', `git add failed for this group of ${new Set(staged).size} file(s).`);
       const diff = await git(root, hooks, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--', ...new Set(staged)], signal);
-      if (diff.code !== 0) throw new OperationError('git_unavailable', 'Cannot compare the canonical Git target.');
+      if (diff.code !== 0) throw gitFailure('Cannot compare the canonical Git target.', `git diff --cached failed for this group of ${new Set(staged).size} file(s).`);
       const indexed = new Set(diff.stdout.split('\0').filter(Boolean));
       for (const [requested, path] of normalized) {
         if (!staged.includes(path) || results.has(requested)) continue;
@@ -180,9 +190,15 @@ export async function commitGitTargets(root: string, relativePaths: string[], si
     // --only keeps unrelated staged paths out of this commit. After a lost
     // database acknowledgment the same HEAD/file state is an exact no-op.
     const commitPaths = [...new Set(changed.map(c => c.path))];
-    const message = commitPaths.length === 1 ? 'gbrain: persist canonical memory update' : `gbrain: persist ${commitPaths.length} canonical memory updates`;
-    const result = await git(root, hooks, ['commit', '--only', '-m', message, '--', ...commitPaths], signal);
-    const outcome = result.code === 0 ? { git: 'committed' } : new OperationError('git_unavailable', 'Cannot commit the canonical Git target.');
+    const noted = new Map<string, GitCommitNote>();
+    for (const c of changed) { const note = notes?.get(c.requested); if (note && !noted.has(c.path)) noted.set(c.path, note); }
+    const subject = commitPaths.length > 1 ? `gbrain: persist ${commitPaths.length} canonical memory updates`
+      : commitText(noted.get(commitPaths[0]!)?.subject ?? '') || 'gbrain: persist canonical memory update';
+    const body = commitPaths.length > 1 ? [...new Set([...noted.keys()].sort().map(path => commitText(noted.get(path)!.line)).filter(Boolean))] : [];
+    const trailers = [...new Set([...noted.keys()].sort().map(path => commitText(noted.get(path)!.trailer ?? '')).filter(Boolean))];
+    const result = await git(root, hooks, ['commit', '--only', '-m', subject, ...(body.length ? ['-m', body.join('\n')] : []), ...(trailers.length ? ['-m', trailers.join('\n')] : []), '--', ...commitPaths], signal);
+    const outcome = result.code === 0 ? { git: 'committed' } : gitFailure('Cannot commit the canonical Git target.',
+      `git commit failed for ${commitPaths.length} file(s); a missing Git identity (user.name, user.email) in that checkout is one cause to check.`);
     for (const c of changed) results.set(c.requested, outcome);
   });
   return results;
@@ -197,10 +213,15 @@ export async function pushGitRoot(root: string, signal?: AbortSignal): Promise<{
     const merge = await git(root, hooks, ['config', '--get', `branch.${branch.stdout.trim()}.merge`], signal);
     if (remote.code !== 0 || merge.code !== 0 || !remote.stdout.trim() || remote.stdout.trim() === '.') return { push: 'skipped', reason: 'no_tracking_remote' } as const;
     const push = await git(root, hooks, ['push', '--', remote.stdout.trim(), `HEAD:${merge.stdout.trim()}`], signal);
-    if (push.code !== 0) throw new OperationError('git_push_unavailable', 'The canonical commit is durable locally; its push will retry.');
+    if (push.code !== 0) throw opError('git_push_unavailable', 'The canonical commit is durable locally; its push will retry.',
+      `git push to ${remote.stdout.trim()} failed (network, credentials or a rejected non-fast-forward). Nothing is lost locally and the worker pushes again on a later pass; gbrain never pulls or rebases the checkout. If it keeps failing, check the remote and its credentials with git push on the brain host.`,
+      { fix: effectStatusFix });
     return { push: 'committed' } as const;
   });
 }
+
+/** The outcome a Git effect records when its root has no durability hook: no git command ran. */
+export const DURABILITY_NOT_ENABLED = { git: 'skipped', reason: 'durability_not_enabled', push: 'skipped' } as const;
 
 /**
  * Caller owns the native worktree lock. Never run pull, rebase, or legacy hooks.
@@ -208,9 +229,9 @@ export async function pushGitRoot(root: string, signal?: AbortSignal): Promise<{
  * the worktree.
  */
 export async function publishGitEffect(root: string, relativePath: string, signal?: AbortSignal,
-  hardened?: boolean): Promise<Record<string, unknown>> {
-  if (!(hardened ?? await isDurabilityHardenedAsync(root))) return { git: 'skipped', reason: 'durability_not_enabled', push: 'skipped' };
-  const outcome = (await commitGitTargets(root, [relativePath], signal)).get(relativePath)!;
+  hardened?: boolean, note?: GitCommitNote): Promise<Record<string, unknown>> {
+  if (!(hardened ?? await isDurabilityHardenedAsync(root))) return { ...DURABILITY_NOT_ENABLED };
+  const outcome = (await commitGitTargets(root, [relativePath], signal, note ? new Map([[relativePath, note]]) : undefined)).get(relativePath)!;
   if (outcome instanceof OperationError) throw outcome;
   if (outcome.reason === 'target_absent') return outcome;
   const pushed = await pushGitRoot(root, signal);

@@ -3,6 +3,10 @@ import { hasFlag, parseFlag, parseJobIsolationFlag, parseMaxRssFlag, parseNiceFl
 import { applyNiceness, formatNice, getEffectiveNiceness } from '../../core/minions/niceness.ts';
 import { resolveChildCliInvocation } from '../../core/minions/job-isolation.ts';
 import { WORKER_EXIT_CONFIGURATION } from '../../core/minions/worker-exit-codes.ts';
+import { writeStdoutFinal } from '../../core/cli-force-exit.ts';
+import { opError } from '../../core/ops/contract.ts';
+import { usageError, writeCliRefusal } from '../../cli/cli-error.ts';
+import type { BrainEngine } from '../../core/engine.ts';
 
 export async function runJobsSupervisor({ args, engine, engineOrNull }: JobsCommandContext): Promise<void> {
   // Dispatcher for supervisor subcommands:
@@ -29,20 +33,23 @@ export async function runJobsSupervisor({ args, engine, engineOrNull }: JobsComm
 
   // ----- stop subcommand -----
   if (isStopCmd) {
-    await stopSupervisor(pidFile, jsonMode);
+    await stopSupervisor(engine, args, pidFile, jsonMode);
     return;
   }
 
   // ----- start subcommand (default) -----
+  // D2: refusals keep their stderr line; under --json the envelope is the stdout document
+  // (written directly: the `jobs` record has no record-wide json contract, see runJobsSupervisor's detach branch).
   if (!isStartCmd) {
-    console.error(`Unknown supervisor subcommand: ${supCmd}. Expected: start, status, stop.`);
-    process.exit(1);
+    process.exit(writeCliRefusal(usageError(`Unknown supervisor subcommand: ${supCmd}. Expected: start, status, stop.`,
+      'Example: gbrain jobs supervisor start --detach --json'), 'jobs', { json: jsonMode }));
   }
 
   const config = (await import('../../core/config.ts')).loadConfig();
   if (config?.engine === 'pglite') {
-    console.error('Error: Supervisor requires Postgres. PGLite uses an exclusive file lock that blocks other processes.');
-    process.exit(1);
+    process.exit(writeCliRefusal(opError('config_error', 'Supervisor requires Postgres. PGLite uses an exclusive file lock that blocks other processes.',
+      'On PGLite, run background maintenance through `gbrain serve` (or run jobs inline with `gbrain jobs submit --follow`).'),
+    'jobs', { json: jsonMode, human: 'Error: Supervisor requires Postgres. PGLite uses an exclusive file lock that blocks other processes.' }));
   }
 
   const { resolveGbrainCliPath } = await import('../autopilot.ts');
@@ -58,15 +65,14 @@ export async function runJobsSupervisor({ args, engine, engineOrNull }: JobsComm
   if (supHealthRaw !== undefined) {
     const parsed = parseInt(supHealthRaw, 10);
     if (!Number.isFinite(parsed) || parsed < 0) {
-      console.error(`Error: --health-interval must be a non-negative integer (ms), got "${supHealthRaw}"`);
-      process.exit(1);
+      process.exit(writeCliRefusal(usageError(`--health-interval must be a non-negative integer (ms), got "${supHealthRaw}"`,
+        'Example: gbrain jobs supervisor start --health-interval 60000'), 'jobs',
+      { json: jsonMode, human: `Error: --health-interval must be a non-negative integer (ms), got "${supHealthRaw}"` }));
     }
     if (parsed > 0 && parsed < 1000) {
-      console.error(
-        `Error: --health-interval ${parsed} is suspiciously low (likely a unit-confusion typo). ` +
-        `The flag takes milliseconds; for 60-second probes pass 60000. Use 0 to disable.`,
-      );
-      process.exit(1);
+      const msg = `--health-interval ${parsed} is suspiciously low (likely a unit-confusion typo). ` +
+        `The flag takes milliseconds; for 60-second probes pass 60000. Use 0 to disable.`;
+      process.exit(writeCliRefusal(usageError(msg, 'Example: gbrain jobs supervisor start --health-interval 60000'), 'jobs', { json: jsonMode, human: `Error: ${msg}` }));
     }
     healthInterval = parsed;
   }
@@ -92,11 +98,16 @@ export async function runJobsSupervisor({ args, engine, engineOrNull }: JobsComm
     ? { cmd: explicitCliPath, argsPrefix: [] }
     : resolveChildCliInvocation({}, process.execPath, process.argv[1], resolveGbrainCliPath);
   if (!workerInvocation) {
-    console.error('Could not resolve this worker installation. Repair the CLI or pass --cli-path.');
+    writeCliRefusal(opError('config_error', 'Could not resolve this worker installation. Repair the CLI or pass --cli-path.',
+      'Pass --cli-path <path to the gbrain CLI>, or reinstall gbrain.'), 'jobs', { json: jsonMode });
     process.exit(WORKER_EXIT_CONFIGURATION);
   }
 
   // --detach: fork a background supervisor, print PID payload, exit 0.
+  // D2: the payload is the one stdout document (writeStdoutFinal works without
+  // the guard; the `jobs` record declares no record-wide json because other
+  // jobs subcommands stream). status names the outcome; stderr_log is the
+  // detached child's log.
   // #4418: the child gets a DURABLE stderr sink (audit-dir log, null-device
   // fallback) instead of inheriting the invoker's stderr — an inherited
   // capture pipe closing killed the worker (SIGPIPE 141) and then the
@@ -108,14 +119,20 @@ export async function runJobsSupervisor({ args, engine, engineOrNull }: JobsComm
       process.argv[1],
       process.argv.slice(2).filter(a => a !== '--detach'),
     );
+    if (started.pid === undefined) {
+      process.exit(writeCliRefusal(opError('unavailable', 'The detached supervisor process could not be started.',
+        `Run \`gbrain jobs supervisor start\` in the foreground to see the error${started.stderrPath ? `, or read ${started.stderrPath}` : ''}.`),
+      'jobs', { json: true }));
+    }
     const payload = {
       event: 'started',
+      status: 'started',
       supervisor_pid: started.pid,
       pid_file: pidFile,
       detached: true,
       ...(started.stderrPath ? { stderr_log: started.stderrPath } : {}),
     };
-    console.log(JSON.stringify(payload));
+    await writeStdoutFinal(`${JSON.stringify(payload)}\n`);
     process.exit(0);
   }
 
@@ -275,25 +292,67 @@ async function showSupervisorStatus(
   process.exit(running ? 0 : 1);
 }
 
-/** `gbrain jobs supervisor stop`: SIGTERM + drain wait; always exits the process. */
-async function stopSupervisor(pidFile: string, jsonMode: boolean): Promise<void> {
+/** #5062: supervisor's own 35s worker drain + 5s SIGKILL confirmation + slack. */
+const STOP_WAIT_MS = 45_000;
+
+/**
+ * `gbrain jobs supervisor stop`: SIGTERM, wait for the exit, then verify the
+ * stop before calling it drained; always exits the process. #5062: "the pid
+ * is gone" is not enough. Success also needs the supervisor's own `stopped`
+ * audit row (after its `shutting_down`) saying the worker drained, every
+ * worker it spawned gone, and its queue lock row released. Anything less is
+ * reported with the failing check and exits 1. W9F item 7: the audit rows are
+ * the run's own (from its `started` row, searched back across weekly files);
+ * a worker is live only when its pid is alive with the start time recorded at
+ * spawn; a run with no `started` row on record is `unverified`, never
+ * `drained`; and a PID file whose pid now belongs to a different process
+ * (start time mismatch) is reported `stale_pid_file` without signaling it.
+ */
+async function stopSupervisor(engine: BrainEngine, args: string[], pidFile: string, jsonMode: boolean): Promise<void> {
   const { existsSync, readFileSync } = await import('fs');
-  if (!existsSync(pidFile)) {
-    const payload = { stopped: false, reason: 'pid_file_missing', pid_file: pidFile };
+  const { hostname } = await import('os');
+  const { readSupervisorRun } = await import('../../core/minions/handlers/supervisor-audit.ts');
+  const { supervisorLockId } = await import('../../core/minions/supervisor.ts');
+  const { inspectLock } = await import('../../core/db-lock.ts');
+  const { processStartTime } = await import('../../core/pglite-lock.ts');
+  const report = (payload: Record<string, unknown>, human: string, ok: boolean): never => {
     if (jsonMode) console.log(JSON.stringify(payload));
-    else console.error(`No PID file at ${pidFile}; supervisor not running.`);
-    process.exit(1);
+    else if (ok) console.log(human);
+    else console.error(human);
+    process.exit(ok ? 0 : 1);
+  };
+  const isAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+  };
+  // W9F item 7: a live pid whose kernel start time differs from the recorded
+  // one is a different (recycled) process. Unknown start times compare equal.
+  const sameProcess = (pid: number, recordedStart: unknown): boolean => {
+    if (!isAlive(pid)) return false;
+    const current = processStartTime(pid);
+    return typeof recordedStart !== 'string' || current === null || current === recordedStart;
+  };
+
+  if (!existsSync(pidFile)) {
+    report({ stopped: false, reason: 'pid_file_missing', pid_file: pidFile }, `No PID file at ${pidFile}; supervisor not running.`, false);
   }
   let supervisorPid: number;
+  let recordedStart: string | null;
   try {
-    supervisorPid = parseInt(readFileSync(pidFile, 'utf8').trim().split('\n')[0], 10);
+    const [pidLine, startLine] = readFileSync(pidFile, 'utf8').trim().split('\n');
+    supervisorPid = parseInt(pidLine, 10);
     if (isNaN(supervisorPid) || supervisorPid <= 0) throw new Error('invalid pid');
+    recordedStart = /^\d+$/.test(startLine?.trim() ?? '') ? startLine!.trim() : null;
   } catch (err) {
-    const payload = { stopped: false, reason: 'pid_file_corrupt', error: String(err) };
-    if (jsonMode) console.log(JSON.stringify(payload));
-    else console.error(`PID file corrupt: ${err}`);
-    process.exit(1);
+    return report({ stopped: false, reason: 'pid_file_corrupt', error: String(err) }, `PID file corrupt: ${err}`, false);
   }
+
+  const before = readSupervisorRun(supervisorPid, { supervisorStart: recordedStart });
+  const supervisorStart = recordedStart ?? before.started?.supervisor_start;
+  if (isAlive(supervisorPid) && !sameProcess(supervisorPid, supervisorStart)) {
+    report({ stopped: false, reason: 'stale_pid_file', supervisor_pid: supervisorPid, pid_file: pidFile },
+      `PID file ${pidFile} names pid ${supervisorPid}, which now belongs to a different process; the supervisor is not running and nothing was signaled.`, true);
+  }
+  const queue = (typeof before.started?.queue === 'string' ? before.started.queue : undefined) ?? parseFlag(args, '--queue') ?? 'default';
 
   try { process.kill(supervisorPid, 'SIGTERM'); }
   catch (err: unknown) {
@@ -308,21 +367,65 @@ async function stopSupervisor(pidFile: string, jsonMode: boolean): Promise<void>
     process.exit(code === 'ESRCH' ? 0 : 1);
   }
 
-  // Poll for up to 40s (supervisor's own 35s drain + 5s slack).
-  const deadline = Date.now() + 40_000;
-  let stoppedCleanly = false;
-  while (Date.now() < deadline) {
-    try { process.kill(supervisorPid, 0); }
-    catch { stoppedCleanly = true; break; }
+  const deadline = Date.now() + STOP_WAIT_MS;
+  while (Date.now() < deadline && isAlive(supervisorPid)) {
     await new Promise(r => setTimeout(r, 250));
   }
+  if (isAlive(supervisorPid)) {
+    report({ stopped: false, supervisor_pid: supervisorPid, reason: 'timeout', waited_ms: STOP_WAIT_MS },
+      `Supervisor ${supervisorPid} did not exit within ${STOP_WAIT_MS / 1000}s.`, false);
+  }
 
-  const payload = {
-    stopped: stoppedCleanly,
-    supervisor_pid: supervisorPid,
-    reason: stoppedCleanly ? 'drained' : 'timeout_40s',
+  const run = readSupervisorRun(supervisorPid, { supervisorStart: typeof supervisorStart === 'string' ? supervisorStart : null });
+  if (!run.started) {
+    report({ stopped: true, supervisor_pid: supervisorPid, queue, reason: 'unverified', drained: false, audit_files: run.files },
+      `Supervisor ${supervisorPid} exited, but its audit trail has no record of the run (missing, pruned or corrupt; searched ${run.files.length ? run.files.join(', ') : 'no existing audit files'}), so the drain cannot be verified. ` +
+      'Inspect in-flight jobs with `gbrain jobs list --status active`.', false);
+  }
+  const events = run.events;
+  const shuttingIdx = events.map(e => e.event).lastIndexOf('shutting_down');
+  const stoppedEvt = shuttingIdx >= 0 ? events.slice(shuttingIdx + 1).find(e => e.event === 'stopped') : undefined;
+  // The live set: spawns with no later exit. An exit row carries the child's
+  // pid (null: no process was created); a row written before exits carried
+  // one (no `pid` key) pairs with the oldest open spawn.
+  const open: Array<{ pid: number; start: unknown }> = [];
+  let legacyPairing = false;
+  for (const e of events) {
+    if (e.event === 'worker_spawned' && typeof e.pid === 'number') open.push({ pid: e.pid, start: e.pid_start });
+    if (e.event !== 'worker_exited' || e.pid === null) continue;
+    if (!('pid' in e)) legacyPairing = true;
+    const idx = typeof e.pid === 'number' ? open.findIndex(w => w.pid === e.pid) : 0;
+    if (idx >= 0) open.splice(idx, 1);
+  }
+  const liveWorkers = open.filter(w => sameProcess(w.pid, w.start)).map(w => w.pid);
+  let lockReleased: boolean | null;
+  try {
+    const snap = await inspectLock(engine, supervisorLockId(queue));
+    lockReleased = !(snap && snap.holder_pid === supervisorPid && snap.holder_host === hostname());
+  } catch {
+    lockReleased = null;
+  }
+  const checks = {
+    process_exited: true,
+    stopped_event: stoppedEvt !== undefined,
+    worker_drained: stoppedEvt?.drained === true,
+    workers_exited: liveWorkers.length === 0,
+    lock_released: lockReleased,
   };
-  if (jsonMode) console.log(JSON.stringify(payload));
-  else console.log(stoppedCleanly ? `Supervisor ${supervisorPid} stopped.` : `Supervisor ${supervisorPid} did not exit within 40s.`);
-  process.exit(stoppedCleanly ? 0 : 1);
+  const reason = !checks.stopped_event ? 'no_stopped_event'
+    : !checks.workers_exited ? 'worker_still_running'
+      : lockReleased === null ? 'lock_unverified'
+        : !lockReleased ? 'lock_still_held'
+          : !checks.worker_drained ? 'forced'
+            : 'drained';
+  const drained = reason === 'drained';
+  const human = drained
+    ? `Supervisor ${supervisorPid} stopped; worker drained.`
+    : `Supervisor ${supervisorPid} exited but the stop is not verified as drained (${reason}): ` +
+      `${JSON.stringify(checks)}${liveWorkers.length > 0 ? `; live worker pid(s): ${liveWorkers.join(', ')}` : ''}. ` +
+      'Inspect in-flight jobs with `gbrain jobs list --status active`.';
+  if (legacyPairing) console.error('Warning: audit rows written before worker exits carried a pid were paired with spawns by order.');
+  report({ stopped: true, supervisor_pid: supervisorPid, queue, reason, drained, checks,
+    ...(liveWorkers.length > 0 ? { live_worker_pids: liveWorkers } : {}),
+    ...(legacyPairing ? { warnings: ['legacy_exit_pairing'] } : {}) }, human, drained);
 }

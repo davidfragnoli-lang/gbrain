@@ -27,7 +27,10 @@ existing launch options throughout the repair.
 | Autopilot under user systemd | `gbrain autopilot --status --json`; `systemctl --user status gbrain-autopilot.service` | `systemctl --user stop gbrain-autopilot.service` | `systemctl --user start gbrain-autopilot.service` |
 | Autopilot under launchd | `gbrain autopilot --status --json`; `launchctl print "gui/$(id -u)/com.gbrain.autopilot"` | `launchctl bootout "gui/$(id -u)/com.gbrain.autopilot"` | `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gbrain.autopilot.plist"` |
 
-These are the default user-service names. If the installation uses a different
+These are the default brain's user-service names. A brain under any other
+`GBRAIN_HOME` uses its own suffixed names; `gbrain autopilot --status --json`
+prints them under `job` ([several brains on one host](live-sync.md#several-brains-on-one-host)).
+If the installation uses a different
 service definition, use its actual name and recorded launcher. For a foreground
 autopilot or a container/cron owner, stop and restart that owner through its
 existing launcher; do not start a competing standalone supervisor. A timed-out
@@ -441,6 +444,16 @@ fail:
 
 ```
 [FAIL] minions_migration: MINIONS HALF-INSTALLED (partial migration: 0.11.0). Run: gbrain apply-migrations --yes
+```
+
+Three or more partial records in a row read as `WEDGED MIGRATION(s)` and name
+`gbrain apply-migrations --force-retry <version>`. After that retry the version
+is pending again, and doctor warns that it has not run yet with the plain
+`gbrain apply-migrations --yes` command. Doctor also warns when the ledger shows
+a host migration that a newer one already ran past, so it never ran:
+
+```
+[WARN] minions_migration: 1 host migration(s) not run yet: 0.53.0. Run: gbrain apply-migrations --yes
 ```
 
 (Missing `~/.gbrain/preferences.json` on a fresh install is a valid

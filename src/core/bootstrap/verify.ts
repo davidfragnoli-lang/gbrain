@@ -30,10 +30,12 @@
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { pendingReceiptOf, pollCommand, resolveCliWriteWaitMs, WRITE_WAIT_ENV } from '../persistence/write-wait.ts';
+import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { operations, type Operation, type OperationContext } from '../operations.ts';
@@ -43,11 +45,15 @@ import { resolveGbrainHome } from '../gbrain-home.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { runMaintenanceSweep } from '../sweep.ts';
 import { detectCapabilities, renderCapabilityReport, type CapabilityReport } from '../capability.ts';
-import { loadWorkspaceAllowlist, matchesGlob, scanFiles, type SecretFinding } from '../secret-scan.ts';
-import { PUSH_DENY_GLOBS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses } from '../workspace-push.ts';
+import { loadWorkspaceAllowlist, matchesGlob, SCAN_ALLOW_FILENAME, scanFiles, type SecretFinding } from '../secret-scan.ts';
+import {
+  PUSH_DENY_GLOBS, SECRET_SCAN_REFUSAL_DOCS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses,
+} from '../workspace-push.ts';
+import { shellQuote } from '../mcp-registration.ts';
 import { FACTS_DEFAULT_VISIBILITY_KEY } from '../facts/visibility.ts';
 import { byteFloors } from './render.ts';
-import { CLAUDE_HOOK_EVENTS, GBRAIN_HOOK_MARKER_KEY, claudeUserSettingsPath } from './host-specs.ts';
+import { CLAUDE_HOOK_EVENTS, claudeUserSettingsPath } from './host-specs.ts';
+import { groupsCarryGbrainHook } from './hooks.ts';
 import { BOOTSTRAP_TEMPLATES, loadQuestionBank } from './assets.ts';
 import { readManifest, writeManifest } from './format.ts';
 import { status as interviewStatus } from './interview.ts';
@@ -61,6 +67,7 @@ import {
   startResolveIpcServer,
 } from '../context/resolve-ipc.ts';
 import { assembleTurnContext } from '../context/turn-context.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -128,16 +135,26 @@ function findOp(name: string): Operation {
   return op;
 }
 
-function localCtx(engine: BrainEngine, sourceId: string, log?: (l: string) => void): OperationContext {
+export function localCtx(engine: BrainEngine, sourceId: string, log?: (l: string) => void): OperationContext {
   const sink = log ?? (() => {});
+  const config = (loadConfigFileOnly() ?? { engine: 'pglite' }) as GBrainConfig;
   return {
     engine,
-    config: (loadConfigFileOnly() ?? { engine: 'pglite' }) as GBrainConfig,
+    config,
     logger: { info: sink, warn: sink, error: sink },
     dryRun: false,
     remote: false,
     sourceId,
+    writeWaitMs: resolveCliWriteWaitMs({ config }),
   };
+}
+
+/** The roundtrip detail for a failed probe write: an admitted, still-pending write names its request and the next step. */
+export function putPageFailureDetail(error: unknown, waitMs: number | undefined): string {
+  const receipt = pendingReceiptOf(error);
+  if (!receipt) return `put_page failed: ${(error as Error).message}`;
+  return `put_page was admitted but is still pending after ${Math.round((waitMs ?? 0) / 1000)}s (request ${receipt.request_id}); `
+    + `check it with \`${pollCommand(receipt.request_id)}\`, or raise ${WRITE_WAIT_ENV} and rerun gbrain bootstrap verify`;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +235,10 @@ async function removeProbes(engine: BrainEngine, ws: string, sourceId: string): 
     // must survive verify's cleanup [G13].
     const sql = `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug IN ($2, $3)`;
     const params = [sourceId, VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG];
-    if (managed) await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params)));
+    if (managed) {
+      const attribution = await maintenanceAttribution(engine);
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params), attribution));
+    }
     else await engine.executeRaw(sql, params);
   } catch {
     /* facts table may not exist on a pre-migration brain — doctor_green names that */
@@ -318,6 +338,7 @@ export function checkWritebackContract(ws: string): VerifyCheck {
 function trackedWorkspaceFiles(ws: string): { files: string[]; via: 'git' | 'fallback' } {
   try {
     const out = execFileSync('git', ['-C', ws, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
+      env: gitChildEnv(),
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 15_000,
       maxBuffer: 16 * 1024 * 1024,
@@ -345,8 +366,16 @@ function checkSecretScan(ws: string): VerifyCheck {
       workspaceRoot: ws,
     });
     if (findings.length > 0) {
-      const sample = findings.slice(0, 5).map((f) => `${f.file}:${f.line} [${f.pattern}] ${f.fingerprint}`).join('; ');
-      return { id, ok: false, detail: `${findings.length} secret-scan finding(s): ${sample}${findings.length > 5 ? '; …' : ''} — fix, or allowlist a false positive in .gbrain-scan-allow` };
+      const sample = findings.slice(0, 5).map((f) => {
+        const { since } = f as SecretFinding & { since?: string };
+        return `${f.file}:${f.line} [${f.pattern}${since ? ` since gbrain v${since.replace(/^v/, '')}` : ''}] ${f.fingerprint}`;
+      }).join('; ');
+      return {
+        id, ok: false,
+        detail: `${findings.length} secret-scan finding(s): ${sample}${findings.length > 5 ? '; …' : ''} — ` +
+          'remove a real credential first; allowlist only a reviewed false positive by appending its fingerprint to ' +
+          `${shellQuote(resolve(ws, SCAN_ALLOW_FILENAME))} (${SECRET_SCAN_REFUSAL_DOCS})`,
+      };
     }
     return { id, ok: true, detail: `no secrets in ${files.length} ${via === 'git' ? 'tracked' : 'workspace'} file(s)` };
   } catch (e) {
@@ -377,6 +406,7 @@ function checkMcpJsonHygiene(ws: string): VerifyCheck {
     if (!existsSync(join(ws, '.mcp.json'))) return { id, ok: true, detail: 'no .mcp.json in the workspace' };
     try {
       execFileSync('git', ['-C', ws, 'ls-files', '--error-unmatch', '.mcp.json'], {
+        env: gitChildEnv(),
         stdio: 'ignore', timeout: 5_000,
       });
     } catch {
@@ -421,7 +451,7 @@ export function checkHookCarrierOverlap(
         try {
           const parsed = JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> };
           const groups = parsed?.hooks?.[event];
-          return Array.isArray(groups) && JSON.stringify(groups).includes(`"${GBRAIN_HOOK_MARKER_KEY}"`);
+          return groupsCarryGbrainHook(groups, event);
         } catch {
           return false;
         }
@@ -506,6 +536,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
         ok: true,
         detail:
           `facts default visibility: world (set by bootstrap verify — was unset). ` +
+          `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
           `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} private\` if less-trusted surfaces will read this brain.`,
       };
     }
@@ -514,6 +545,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
       ok: true,
       detail:
         `facts default visibility: ${existing.trim()} (explicit operator value — untouched). ` +
+        `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
         `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} <world|private>\`.`,
     };
   } catch (e) {
@@ -791,7 +823,7 @@ async function runRoundtrip(
       return { checks };
     }
   } catch (e) {
-    checks.push({ id: 'roundtrip', ok: false, detail: `put_page failed: ${(e as Error).message}` });
+    checks.push({ id: 'roundtrip', ok: false, detail: putPageFailureDetail(e, ctx.writeWaitMs) });
     return { checks };
   }
 

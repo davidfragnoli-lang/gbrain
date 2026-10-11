@@ -31,6 +31,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
+import { gbrainPath } from '../core/config.ts';
 import {
   DEFAULT_ALIASES,
   TIER_DEFAULTS,
@@ -42,6 +43,16 @@ import {
   type ResolveSource,
 } from '../core/model-config.ts';
 import { resolveExtractAtomsModelWithSource } from '../core/cycle/extract-atoms.ts';
+import { resolveFenceRepairModelWithSource } from '../core/fence-repair/model.ts';
+import { resolveContentRepairModelWithSource } from '../core/content-repair/llm.ts';
+import { resolveFactsExtractionModel } from '../core/facts/extract.ts';
+import {
+  NIGHTLY_PROBE_EXTRACTOR_ROUTE,
+  NIGHTLY_PROBE_READER_ROUTE,
+  NIGHTLY_PROBE_SLOT_KEYS,
+  resolveNightlyProbeModelRoutes,
+  type NightlyProbeSlotId,
+} from '../core/cycle/nightly-probe-routes.ts';
 import { maybeAttachVersionSuffixHint } from '../core/ai/base-url-probe.ts';
 import { newerAnthropicModel } from '../core/ai/anthropic-model-ids.ts';
 import type { AIGatewayConfig } from '../core/ai/types.ts';
@@ -72,7 +83,7 @@ interface PerTaskModelRoute {
    * chain visible rather than implying full resolveModel() coverage — can
    * never disagree with the resolved value.
    */
-  narrowResolver?: (engine: BrainEngine) => Promise<{ model: string; source: 'config' | 'tier_default' }>;
+  narrowResolver?: (engine: BrainEngine) => Promise<{ model: string; source: 'config' | 'tier_default' | 'measured'; label?: string }>;
 }
 
 const PER_TASK_KEYS: PerTaskModelRoute[] = [
@@ -94,8 +105,29 @@ const PER_TASK_KEYS: PerTaskModelRoute[] = [
   { key: 'models.drift',                    tier: 'reasoning', description: 'Drift LLM judge (v0.29 scaffold)' },
   { key: 'models.auto_think',               tier: 'deep',      description: 'Auto-think question answering' },
   { key: 'models.think',                    tier: 'deep',      description: '`gbrain think` synthesis op' },
+  {
+    key: 'models.fence_repair',
+    tier: 'deep',
+    description: 'Model repair (Tier 3) of malformed facts/takes fence rows; unset: the first measured model with a key, else none (off)',
+    narrowResolver: async engine => { const r = await resolveFenceRepairModelWithSource(engine); return { model: r.model ?? 'none', source: r.source }; },
+  },
+  {
+    key: 'models.content_repair',
+    tier: 'deep',
+    description: 'Slug-conflict judgment of the content-repair lane (#6377); unset: models.fence_repair, else the first measured model with a key, else none (off)',
+    narrowResolver: async engine => { const r = await resolveContentRepairModelWithSource(engine); return { model: r.model ?? 'none', source: r.source === 'measured' ? 'measured' : 'config' }; },
+  },
   { key: 'models.subagent',                 tier: 'subagent',  description: '`gbrain agent run` subagent loop' },
-  { key: 'facts.extraction_model',          tier: 'reasoning', description: 'Real-time facts extraction during sync' },
+  {
+    key: 'facts.extraction_model',
+    tier: 'reasoning',
+    description: 'Real-time facts extraction during sync; unset: claude-haiku-5-5 when the reasoning tier resolves through Anthropic',
+    narrowResolver: async engine => {
+      const r = await resolveFactsExtractionModel(engine);
+      if (r.source === 'measured_default') return { model: r.model, source: 'measured' };
+      return { model: r.model, source: r.source === 'config_key' ? 'config' : 'tier_default', label: sourceLabel(r.source, { configKey: 'facts.extraction_model', tier: 'reasoning' }, 'tier.reasoning') };
+    },
+  },
   { key: 'models.eval.longmemeval',         tier: 'reasoning', description: 'LongMemEval benchmark answer-gen' },
   { key: 'models.eval.contradictions_judge', tier: 'utility',  description: 'Contradiction probe judge (v0.34 temporal-aware)' },
   { key: 'models.expansion',                tier: 'utility',   description: 'Query expansion for hybrid search' },
@@ -131,12 +163,31 @@ interface PerTaskEntry {
   newer_available?: NewerAvailable;
 }
 
+interface NightlyProbeRouteEntry {
+  model: string;
+  source: string;
+}
+
+interface NightlyProbeReport {
+  reader: NightlyProbeRouteEntry;
+  extractor: NightlyProbeRouteEntry;
+  /** Judge panel in slot order; `source` is `config: <slot key>`, `panel default` or `substitute for <default> (no usable provider)`. */
+  slots: Array<NightlyProbeRouteEntry & { id: string }>;
+  /**
+   * Slot availability, substitutes and key-aware defaults are judged from this
+   * process's environment, not the daemon's: says which keys the daemon may
+   * hold that this report cannot see.
+   */
+  environment_note?: string;
+}
+
 interface ModelsReport {
   schema_version: 1;
   global_default: { value: string | null };
   tiers: Record<ModelTier, ModelEntry>;
   per_task: PerTaskEntry[];
   aliases: { defaults: Record<string, string>; user: Record<string, string> };
+  nightly_probe: NightlyProbeReport;
 }
 
 /**
@@ -195,8 +246,8 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
       // ONE resolver call feeds both the resolved model and the attribution,
       // so the label can never disagree with what `resolved` actually
       // reflects (previously a separate getConfig truthiness re-check).
-      const { model: resolved, source: narrowSource } = await narrowResolver(engine);
-      const source = narrowSource === 'config' ? `config: ${key}` : `tier.${tier} (caller-specific)`;
+      const { model: resolved, source: narrowSource, label } = await narrowResolver(engine);
+      const source = label ?? (narrowSource === 'config' ? `config: ${key}` : narrowSource === 'measured' ? 'measured default' : `tier.${tier} (caller-specific)`);
       const newer = narrowSource === 'config' ? newerAvailable(resolved, key) : undefined;
       per_task.push({ key, tier, resolved, source, description, ...(newer ? { newer_available: newer } : {}) });
       continue;
@@ -238,6 +289,47 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
     tiers,
     per_task,
     aliases: { defaults: { ...DEFAULT_ALIASES }, user: userAliases },
+    nightly_probe: await buildNightlyProbeReport(engine),
+  };
+}
+
+/**
+ * The nightly quality probe's routes as the probe resolves them (#5872): the
+ * probe's own route resolver, then the #4636 substitution over the panel
+ * defaults against this process's brain-configured gateway (silent log —
+ * the report labels each substituted slot instead). The daemon's launcher
+ * also sources the gbrain env file, which this command never loads, so the
+ * report names that gap instead of reading a secrets file.
+ */
+async function buildNightlyProbeReport(engine: BrainEngine): Promise<NightlyProbeReport> {
+  const routes = await resolveNightlyProbeModelRoutes(engine);
+  const { substituteUnavailableDefaultSlots } = await import('./eval-cross-modal.ts');
+  const { DEFAULT_SLOTS } = await import('../core/cross-modal-eval/runner.ts');
+  const explicit: Record<string, string | undefined> = routes.slots;
+  const panel = substituteUnavailableDefaultSlots(
+    DEFAULT_SLOTS.map(s => ({ id: s.id, model: explicit[s.id] ?? s.model })),
+    explicit,
+    () => {},
+  );
+  return {
+    reader: {
+      model: routes.reader.model,
+      source: sourceLabel(routes.reader.source, NIGHTLY_PROBE_READER_ROUTE, 'tier.reasoning'),
+    },
+    extractor: {
+      model: routes.extractor.model,
+      source: sourceLabel(routes.extractor.source, NIGHTLY_PROBE_EXTRACTOR_ROUTE, 'tier.utility'),
+    },
+    slots: panel.map((slot, i) => {
+      const panelDefault = DEFAULT_SLOTS[i]!.model;
+      const source = explicit[slot.id]
+        ? `config: ${NIGHTLY_PROBE_SLOT_KEYS[slot.id as NightlyProbeSlotId]}`
+        : slot.model === panelDefault ? 'panel default' : `substitute for ${panelDefault} (no usable provider)`;
+      return { id: slot.id, model: slot.model, source };
+    }),
+    environment_note:
+      "Slot availability, substitutes and key-aware defaults are judged from this process's environment; " +
+      `a provider key set only in ${gbrainPath('env')} (sourced by the autopilot daemon's launcher) reads here as unavailable.`,
   };
 }
 
@@ -260,6 +352,18 @@ function formatText(report: ModelsReport): string {
   for (const t of report.per_task) {
     lines.push(`  ${t.key.padEnd(34)} → ${t.resolved.padEnd(45)} [${t.source}]${formatNewer(t.newer_available)}`);
   }
+  lines.push('');
+  lines.push('Nightly quality probe (autopilot.nightly_quality_probe):');
+  const probe = report.nightly_probe;
+  const probeRows: Array<[string, NightlyProbeRouteEntry]> = [
+    ['reader (LongMemEval answers)', probe.reader],
+    ['extractor (trajectory claims)', probe.extractor],
+    ...probe.slots.map(s => [`judge slot ${s.id}`, s] as [string, NightlyProbeRouteEntry]),
+  ];
+  for (const [label, route] of probeRows) {
+    lines.push(`  ${label.padEnd(34)} → ${route.model.padEnd(45)} [${route.source}]`);
+  }
+  if (probe.environment_note) lines.push(`  Note: ${probe.environment_note}`);
   lines.push('');
   lines.push('Aliases:');
   for (const [k, v] of Object.entries(report.aliases.defaults)) {
@@ -526,6 +630,14 @@ async function probeRerankerConfig(engine: BrainEngine): Promise<ProbeResult> {
  * when set — so a CPU-only local reranker's cold-start warmup doesn't
  * cause the probe to false-fail with `network`/timeout.
  */
+/** #6381: one relevant and one unrelated passage; a working cross-encoder separates them by a clear margin. */
+const RERANK_PROBE = {
+  query: 'What is the capital of France?',
+  relevant: 'Paris is the capital of France.',
+  unrelated: 'Bananas are a yellow fruit.',
+} as const;
+const RERANK_PROBE_MIN_MARGIN = 0.1;
+
 export async function probeRerankerReachability(engine: BrainEngine, deps: ProbeDeps = {}): Promise<ProbeResult | null> {
   const modelStr = await resolveLiveRerankerModel(engine);
   if (!modelStr) return null;
@@ -544,18 +656,34 @@ export async function probeRerankerReachability(engine: BrainEngine, deps: Probe
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error(`probe timed out after ${probeTimeoutMs}ms`)), probeTimeoutMs);
     try {
-      await rerank({
+      const results = await rerank({
         model: modelStr,
-        query: 'probe',
-        documents: ['probe document'],
+        query: RERANK_PROBE.query,
+        documents: [RERANK_PROBE.relevant, RERANK_PROBE.unrelated],
         signal: controller.signal,
         timeoutMs: probeTimeoutMs,
       });
+      const relevant = results.find(r => r.index === 0)?.relevanceScore;
+      const unrelated = results.find(r => r.index === 1)?.relevanceScore;
+      const discriminates = Number.isFinite(relevant) && Number.isFinite(unrelated)
+        && (relevant as number) - (unrelated as number) > RERANK_PROBE_MIN_MARGIN;
+      if (!discriminates) {
+        return {
+          model: modelStr,
+          touchpoint: 'reranker_config',
+          status: 'config',
+          message: Number.isFinite(relevant) && Number.isFinite(unrelated)
+            ? `reachable, but it scores an unrelated passage as high as a relevant one (${relevant} vs ${unrelated})`
+            : 'reachable, but it did not return a score for both probe passages',
+          elapsed_ms: Date.now() - start,
+          fix: 'The model is likely a broken GGUF conversion; see docs/ai-providers/llama-server-reranker.md step 2.',
+        };
+      }
       return {
         model: modelStr,
         touchpoint: 'reranker_config',
         status: 'ok',
-        message: 'reachable',
+        message: 'reachable; ranks a relevant passage above an unrelated one',
         elapsed_ms: Date.now() - start,
       };
     } finally {
@@ -644,6 +772,8 @@ export async function probeModel(modelStr: string, touchpoint: 'chat' | 'expansi
     try {
       await chat({
         model: modelStr,
+        // A probe reports on this model; a chain hop would answer for another.
+        allowFallback: false,
         messages: [{ role: 'user', content: '.' }],
         // OpenAI rejects max_output_tokens below 16 ("Invalid
         // 'max_output_tokens': integer below minimum value. Expected a value

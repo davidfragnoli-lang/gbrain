@@ -49,6 +49,7 @@ import {
   GBRAIN_HOOK_MARKER_KEY,
   GBRAIN_HOOK_MARKER_VALUE,
 } from './host-specs.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 // ---------------------------------------------------------------------------
 // The phase list [D5] — single TS source of truth
@@ -100,6 +101,7 @@ interface PhaseSpec {
 export function gitOriginUrl(ws: string): string | null {
   try {
     const out = execFileSync('git', ['-C', ws, 'remote', 'get-url', 'origin'], {
+      env: gitChildEnv(),
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 5_000,
     })
@@ -537,14 +539,13 @@ export async function statusReport(ws: string, opts: StatusReportOpts = {}): Pro
     }
   }
 
-  // Support blob [B5]. Push status via the shared per-root reader [D8/D13]:
-  // a failing workspace wins over another's success; else the newest record.
+  // Support blob [B5]. Push status of THIS workspace's root via the shared
+  // per-root reader [D8/D13] (#5432): another root's failure or success is
+  // never reported as this workspace's; no receipt for this root is null.
   let lastPush: StatusSupport['last_push'] = null;
   try {
-    const { readPushStatuses, summarizePushStatuses } = await import('../workspace-push.ts');
-    const entries = readPushStatuses();
-    const { failing } = summarizePushStatuses(entries);
-    const pick = failing[0] ?? entries.sort((a, b) => Date.parse(b.ts ?? '') - Date.parse(a.ts ?? ''))[0];
+    const { readPushStatuses, pushStatusForWorkspace } = await import('../workspace-push.ts');
+    const pick = pushStatusForWorkspace(readPushStatuses(), ws);
     if (pick) {
       lastPush = {
         ...(pick.ts !== undefined ? { ts: pick.ts } : {}),

@@ -84,18 +84,6 @@ function findFunction(sf: ts.SourceFile, name: string): ts.FunctionDeclaration {
   throw new Error(`cli-dispatch-extract: function ${name} not found`);
 }
 
-/** String members of `const NAME = new Set([...])`, in source order. */
-export function setLiteral(sf: ts.SourceFile, name: string): string[] {
-  const init = findVariable(sf, name).initializer;
-  if (!init || !ts.isNewExpression(init) || !init.arguments?.[0] || !ts.isArrayLiteralExpression(init.arguments[0])) {
-    throw new Error(`cli-dispatch-extract: ${name} is not new Set([...])`);
-  }
-  return init.arguments[0].elements.map((e) => {
-    if (!ts.isStringLiteral(e)) throw new Error(`cli-dispatch-extract: ${name} has a non-literal member`);
-    return e.text;
-  });
-}
-
 /** Property names of `const NAME = { ... }`, in source order. */
 export function objectKeys(sf: ts.SourceFile, name: string): string[] {
   const init = findVariable(sf, name).initializer;
@@ -334,7 +322,7 @@ function tableRule(name: string, run: ts.FunctionDeclaration): BranchRule {
 }
 
 export function extractCliDispatch(): CliDispatchShape {
-  const sf = parseTs('src/cli.ts');
+  const sf = parseTs('src/cli/main.ts');
   const cliOnly = [...TABLE_CLI_ONLY];
   const refused = [...TABLE_REFUSED];
   const setsByName: Record<string, string[]> = {

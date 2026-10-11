@@ -275,6 +275,8 @@ describe('verifyWorkspace — keyless pass', () => {
       const scan = check(res.checks, 'secret_scan')[0];
       expect(scan.ok).toBe(false);
       expect(scan.detail).toContain('openai');
+      expect(scan.detail).toContain(`allowlist only a reviewed false positive by appending its fingerprint to ${join(ws, '.gbrain-scan-allow')}`);
+      expect(scan.detail).toContain('write-refusals.md#secret-scan-refusals-and-redaction');
       // Redaction discipline: the finding detail NEVER carries the secret value.
       expect(scan.detail).not.toContain('sk-AAAAAAAAAAAAAAAAAAAAAAAA');
 
@@ -354,6 +356,10 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       expect(check.detail).toContain('world');
       expect(check.detail).toContain('facts.default_visibility');
       expect(check.detail).toContain('gbrain config set');
+      // The key governs extraction-path writes only; `remember` hard-defaults
+      // to 'world' — the message must disclose that carve-out (#5605).
+      expect(check.detail).toContain('`remember`');
+      expect(check.detail).toContain('extraction-path');
 
       // Pre-set explicit value survives verify (set-if-unset, never override).
       await e2.setConfig('facts.default_visibility', 'private');
@@ -368,6 +374,7 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       const check2 = res2.checks.find((c) => c.id === 'facts_visibility')!;
       expect(check2.detail).toContain('private');
       expect(check2.detail).toContain('untouched');
+      expect(check2.detail).toContain('`remember`');
     } finally {
       await e2.disconnect();
       rmSync(ws2, { recursive: true, force: true });
@@ -640,4 +647,34 @@ describe('verifyWorkspace — managed brain (#5280)', () => {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     }
   }, 240_000);
+});
+
+describe('bootstrap verify write wait (#6356)', () => {
+  test('the probe ctx waits as long as a CLI write: 30 s by default, GBRAIN_WRITE_WAIT_MS when set', async () => {
+    const verify = await import('../src/core/bootstrap/verify.ts') as Record<string, unknown>;
+    const localCtx = verify.localCtx as (engine: unknown, sourceId: string) => OperationContext;
+    expect(typeof localCtx).toBe('function');
+    const saved = process.env.GBRAIN_WRITE_WAIT_MS;
+    try {
+      delete process.env.GBRAIN_WRITE_WAIT_MS;
+      expect(localCtx({}, 'default').writeWaitMs).toBe(30_000);
+      process.env.GBRAIN_WRITE_WAIT_MS = '45000';
+      expect(localCtx({}, 'default').writeWaitMs).toBe(45_000);
+    } finally {
+      if (saved === undefined) delete process.env.GBRAIN_WRITE_WAIT_MS; else process.env.GBRAIN_WRITE_WAIT_MS = saved;
+    }
+  });
+
+  test('an admitted, still-pending probe write names its request and the poll command', async () => {
+    const verify = await import('../src/core/bootstrap/verify.ts') as Record<string, unknown>;
+    const detail = verify.putPageFailureDetail as (e: unknown, waitMs: number | undefined) => string;
+    expect(typeof detail).toBe('function');
+    const pending = { message: 'write pending', toJSON: () => ({ error: 'write_pending', write_request: { request_id: '0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44', state: 'queued', retry_after_ms: 1000 } }) };
+    const text = detail(pending, 30_000);
+    expect(text).toContain('still pending after 30s');
+    expect(text).toContain('0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44');
+    expect(text).toContain('gbrain write-request -- 0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44');
+    expect(text).toContain('GBRAIN_WRITE_WAIT_MS');
+    expect(detail(new Error('boom'), 30_000)).toBe('put_page failed: boom');
+  });
 });

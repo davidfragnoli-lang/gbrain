@@ -211,7 +211,7 @@ describe('v0.37 Lane C.3 — Voyage key reaches buildGatewayConfig', () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
     try {
-      const { buildGatewayConfig } = await import('../src/cli.ts');
+      const { buildGatewayConfig } = await import('../src/cli/main.ts');
       const cfg = {
         engine: 'pglite' as const,
         voyage_api_key: 'test-voyage-key',
@@ -237,7 +237,7 @@ describe('v0.37 Lane C.3 — Voyage key reaches buildGatewayConfig', () => {
     const saved = process.env.VOYAGE_API_KEY;
     process.env.VOYAGE_API_KEY = 'env-wins-key';
     try {
-      const { buildGatewayConfig } = await import('../src/cli.ts');
+      const { buildGatewayConfig } = await import('../src/cli/main.ts');
       const cfg = { engine: 'pglite' as const, voyage_api_key: 'file-key' };
       const gwCfg = buildGatewayConfig(cfg as any);
       expect(gwCfg.env?.VOYAGE_API_KEY).toBe('env-wins-key');
@@ -298,7 +298,7 @@ describe('v0.37 deferred TODO shipped — gbrain reinit-pglite', () => {
     expect(CLI_ONLY_SELF_HELP.has('reinit-pglite')).toBe(true);
   });
 
-  test('embeddingMismatchMessage PGLite branch recommends `gbrain reinit-pglite`', async () => {
+  test('embeddingMismatchMessage PGLite branch keeps `gbrain reinit-pglite` as the labelled last resort', async () => {
     const { embeddingMismatchMessage } = await import('../src/core/embedding-dim-check.ts');
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
@@ -308,14 +308,13 @@ describe('v0.37 deferred TODO shipped — gbrain reinit-pglite', () => {
       engineKind: 'pglite',
       databasePath: '/tmp/test.pglite',
     });
-    // The one-command path appears before the by-hand recipe.
+    // reinit-pglite stays available, labelled as the last resort AFTER the
+    // data-preserving migration (A7: no hand-run wipe recipe).
     expect(msg).toContain('gbrain reinit-pglite --embedding-model voyage:voyage-4 --embedding-dimensions 1024');
-    // The by-hand path is still present as fallback.
-    expect(msg).toContain('mv /tmp/test.pglite /tmp/test.pglite.bak');
-    // The recommended-section header precedes the by-hand section.
-    const recIdx = msg.indexOf('Recommended');
-    const handIdx = msg.indexOf('Or by hand');
-    expect(recIdx).toBeGreaterThan(0);
-    expect(handIdx).toBeGreaterThan(recIdx);
+    expect(msg).not.toMatch(/\bmv /);
+    const migrateIdx = msg.indexOf('gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run');
+    const lastResortIdx = msg.indexOf('Last resort');
+    expect(migrateIdx).toBeGreaterThan(0);
+    expect(lastResortIdx).toBeGreaterThan(migrateIdx);
   });
 });

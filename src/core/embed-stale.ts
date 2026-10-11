@@ -31,6 +31,7 @@ import {
   quoteIdentifier,
 } from './search/embedding-column.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
+import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
 import { AbortError } from './abort-check.ts';
 
 /**
@@ -74,7 +75,7 @@ export interface StaleCursor {
 export interface EmbedStaleOpts {
   /** Chunks per cursor page. Default 2000 (matches the legacy CLI default). */
   batchSize?: number;
-  /** Max parallel slug-keys embedded inside a single batch. Default 20. */
+  /** Max parallel slug-keys embedded inside a single batch. Default: half the engine pool, at most 20 (`resolveStaleEmbedConcurrency`, #5902). */
   concurrency?: number;
   /** Resume cursor from a prior run. Default: from start. */
   cursor?: StaleCursor;
@@ -348,7 +349,7 @@ export async function embedStaleForSource(
   opts: EmbedStaleOpts = {},
 ): Promise<EmbedStaleResult> {
   const batchSize = opts.batchSize ?? 2000;
-  const concurrency = opts.concurrency ?? 20;
+  const concurrency = opts.concurrency ?? resolveStaleEmbedConcurrency(engine);
   const signal = opts.signal;
   const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
     embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
@@ -393,8 +394,10 @@ export async function embedStaleForSource(
     readiness = await prepareEmbeddingProjections(engine, { ...readinessOptions, repair: true });
     if (stopped()) return { ...result, aborted: true };
   }
-  if (readiness.blocked) return { ...result, blocked: readiness.blocked, complete: false, done: true,
-    remaining: await engine.countStaleChunks({ sourceId, ...(signature && { signature }) }) };
+  // #6223: pages still waiting for a projection never block the rest of the
+  // source; the drain skips their unsealed snapshots and the result stays
+  // incomplete with them counted in `blocked`.
+  const projectionBlocked = readiness.blocked;
   const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
   if (stopped()) return { ...result, aborted: true };
   await opts.assertOwned?.();
@@ -483,6 +486,7 @@ export async function embedStaleForSource(
     if (batch.length === 0) {
       const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
+      if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
       const remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
       if (remaining || result.chunksProcessed || result.blocked) {
         result.remaining = remaining;
@@ -630,6 +634,7 @@ export async function embedStaleForSource(
     if (batch.length < batchSize) {
       const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
+      if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
       result.remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
       result.complete = result.remaining === 0 && !result.blocked;
       result.done = true;

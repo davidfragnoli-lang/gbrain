@@ -10,7 +10,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, symlinkSync,
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -19,6 +19,7 @@ import {
   workspacePush, acquirePushLock, pushLockDir, pushStatusPath, pushStatusPathForRoot,
   readPushStatuses, readPushStatusForRoot, summarizePushStatuses, verifyRemotePrivacy,
   parseGithubOwnerRepo, resolveWorkspaceRoot, PUSH_LOCK_STALE_MS, PUSH_DENY_GLOBS,
+  sanitizePushReason, SECRET_SCAN_REFUSAL_DOCS,
 } from '../src/core/workspace-push.ts';
 import { SCAN_ALLOW_FILENAME } from '../src/core/secret-scan.ts';
 import { visibilityCachePath } from '../src/core/repo-visibility.ts';
@@ -267,6 +268,31 @@ describe('secret-scan gate', () => {
   }, T);
 });
 
+describe('secret-scan refusal guidance (DX-3/ENG-11)', () => {
+  test('the status-file reason survives sanitizePushReason; fix steps ride findings[]', async () => {
+    const deep = join(work, ...Array.from({ length: 10 }, (_, i) => `folder-level-${i}`));
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(join(deep, 'notes.md'), `ok\nmy key: ${OPENAI}\n`);
+    writeFileSync(join(work, 'other.md'), `again: ${OPENAI}\n`);
+    const r = await push();
+    expect(r.status).toBe('blocked_secrets');
+    expect(r.findings?.length).toBe(2);
+    const status = readPushStatuses()[0]!;
+    expect(status.reason).toBe(r.reason);
+    expect(r.reason!.length).toBeLessThanOrEqual(140);
+    expect(sanitizePushReason(status.reason)).toBe(status.reason!);
+    expect(status.reason).toMatch(/^2 secret finding\(s\), first .*notes\.md:2 \[openai\]; nothing committed/);
+    const repoRoot = git(work, 'rev-parse', '--show-toplevel');
+    for (const f of r.findings!) {
+      expect(f.allowlistPath).toBe(join(repoRoot, SCAN_ALLOW_FILENAME));
+      expect(f.allowCommand).toContain(f.fingerprint);
+      expect(f.retryCommand).toBe(`gbrain sources push --path ${work} --branch main --allow-unverified-remote`);
+      expect(f.docs).toBe(SECRET_SCAN_REFUSAL_DOCS);
+    }
+    expect(JSON.stringify(r).includes(OPENAI)).toBe(false);
+  }, T);
+});
+
 describe('secret-scan gate — fails CLOSED on unscannable staged blobs', () => {
   test('a staged blob that fails cat-file (non-deletion) BLOCKS the push', async () => {
     // A gitlink to a nested repo whose commit is not in the parent object db:
@@ -507,6 +533,24 @@ describe('single-flight lock [G14/A5, CX2-6]', () => {
       r.handle.release();
     }
     expect(existsSync(lockDir)).toBe(false);
+  }, T);
+
+  test('a symlinked spelling of the repo shares the physical lock (#5400)', () => {
+    const alias = join(root, 'alias-of-work');
+    symlinkSync(work, alias);
+    expect(pushLockDir(alias)).toBe(pushLockDir(work));
+    const first = acquirePushLock(work);
+    expect(first.acquired).toBe(true);
+    try {
+      const second = acquirePushLock(alias);
+      expect(second.acquired).toBe(false);
+      if (!second.acquired) expect(second.holderPid).toBe(process.pid);
+    } finally {
+      if (first.acquired) first.handle.release();
+    }
+    const absent = join(root, 'never-created');
+    expect(pushLockDir(absent)).toBe(pushLockDir(absent));
+    expect(existsSync(absent)).toBe(false);
   }, T);
 
   test('a corrupt owner file is never stolen while young (mtime fallback)', () => {
