@@ -34,19 +34,23 @@ const hasScript = process.platform === 'linux' && existsSync('/usr/bin/script');
 
 let provider: ReturnType<typeof Bun.serve>;
 const embeddingCalls: string[] = [];
+const chatCalls: string[] = [];
 
 /** A brain upgraded from the previous release: schema one behind, every older orchestrator recorded complete. */
 async function seedBrain(home: string): Promise<void> {
   const dir = join(home, '.gbrain');
   mkdirSync(join(dir, 'migrations'), { recursive: true });
+  mkdirSync(join(home, 'brain'), { recursive: true });
+  writeFileSync(join(home, 'brain', 'upgrade-check.md'), '# Upgrade check\n\nNo provider call is needed.\n');
   const databasePath = join(home, 'brain.pglite');
-  writeFileSync(join(dir, 'config.json'), JSON.stringify({ engine: 'pglite', database_path: databasePath, ...LEGACY_EMBEDDING_CONFIG }));
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ engine: 'pglite', database_path: databasePath, chat_model: 'openai:gpt-5.2', ...LEGACY_EMBEDDING_CONFIG }));
   writeFileSync(join(dir, 'migrations', 'completed.jsonl'), migrations.filter(m => m.version !== '0.60.31')
     .map(m => JSON.stringify({ version: m.version, status: 'complete' })).join('\n') + '\n');
   const engine = new PGLiteEngine();
   await engine.connect({ database_path: databasePath });
   try {
     await engine.initSchema();
+    await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [join(home, 'brain')]);
     await engine.setConfig('mcp.publish_skills_prompted', 'true');
     for (const [slug, body] of [['notes/old-chunker', `## Old\n\n${words(40, 'legacy')}\n`], ['notes/deploy-key', `## Deploy\n\n${words(40, 'deploy')}\n\n${KEY}\n${words(20, 'after')}\n`]] as const) {
       await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: body, timeline: '', frontmatter: {} });
@@ -54,6 +58,43 @@ async function seedBrain(home: string): Promise<void> {
     }
     await engine.executeRaw(`UPDATE pages SET chunker_version = 3 WHERE slug = 'notes/old-chunker'`);
     await engine.setConfig('version', '186');
+  } finally {
+    await engine.disconnect();
+  }
+}
+
+async function runCli(home: string, args: string[]): Promise<{ exitCode: number; out: string }> {
+  const env = keylessBrainEnv(process.env, home, {
+    OPENAI_API_KEY: ['fixture', 'not', 'a', 'key'].join('-'),
+    OPENAI_BASE_URL: `http://127.0.0.1:${provider.port}/v1`,
+    GBRAIN_SKIP_STARTUP_HOOKS: '1', GBRAIN_SKIP_REFERENCE_SWEEP: '1', GBRAIN_NO_AUTOPILOT_INSTALL: '1',
+    DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined,
+  });
+  const proc = Bun.spawn({ cmd: [process.execPath, '--no-env-file', join(REPO, 'src/cli.ts'), ...args], env, cwd: home, stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { exitCode, out: stdout + stderr };
+}
+
+interface SpendSnapshot {
+  timestamp: string;
+  ledger: Array<{ scope: string; resolver_id: string; reserved: string; committed: string }>;
+  paidJobs: Array<{ name: string; status: string }>;
+}
+
+async function spendSnapshot(home: string): Promise<SpendSnapshot> {
+  const engine = new PGLiteEngine();
+  await engine.connect({ database_path: join(home, 'brain.pglite') });
+  try {
+    const ledger = await engine.executeRaw<{ scope: string; resolver_id: string; reserved: string; committed: string }>(
+      `SELECT scope, resolver_id, reserved_usd::text AS reserved, committed_usd::text AS committed
+         FROM budget_ledger ORDER BY scope, resolver_id, local_date`,
+    );
+    const jobs = await engine.executeRaw<{ name: string; status: string; data: unknown }>(
+      `SELECT name, status, data FROM minion_jobs WHERE status IN ('waiting', 'active', 'delayed', 'waiting-children') ORDER BY id`,
+    );
+    const paidJobs = jobs.filter((job) => /embed|embedding|facts?|takes?/i.test(`${job.name} ${JSON.stringify(job.data)}`))
+      .map(({ name, status }) => ({ name, status }));
+    return { timestamp: new Date().toISOString(), ledger, paidJobs };
   } finally {
     await engine.disconnect();
   }
@@ -94,7 +135,10 @@ describe('post-upgrade with a configured embedding provider', () => {
       hostname: '127.0.0.1',
       async fetch(req) {
         const path = new URL(req.url).pathname;
-        if (!path.endsWith('/embeddings')) return new Response('not found', { status: 404 });
+        if (!path.endsWith('/embeddings')) {
+          chatCalls.push(path);
+          return new Response('unexpected chat/provider call', { status: 500 });
+        }
         embeddingCalls.push(path);
         const body = await req.json() as { input: string[] | string };
         const inputs = Array.isArray(body.input) ? body.input : [body.input];
@@ -118,9 +162,12 @@ describe('post-upgrade with a configured embedding provider', () => {
       homes.push(home);
       await seedBrain(home);
       embeddingCalls.length = 0;
+      chatCalls.length = 0;
+      const before = await spendSnapshot(home);
       const run = await postUpgrade(home, tty);
       expect(run.exitCode, run.out).toBe(0);
       expect(embeddingCalls, run.out).toEqual([]);
+      expect(chatCalls, run.out).toEqual([]);
       expect(run.out).toContain('Not re-embedding without your consent');
       if (tty) expect(run.out).toContain('Re-embed now? [y/N]');
       const ledger = readFileSync(join(home, '.gbrain', 'migrations', 'completed.jsonl'), 'utf8');
@@ -135,6 +182,17 @@ describe('post-upgrade with a configured embedding provider', () => {
       } finally {
         await engine.disconnect();
       }
+      const timeline = await runCli(home, ['extract', 'timeline', '--source', 'db']);
+      expect(timeline.exitCode, timeline.out).toBe(0);
+      const sync = await runCli(home, ['sync', '--source', 'default', '--no-pull', '--no-embed', '--no-extract', '--json']);
+      expect(sync.exitCode, sync.out).toBe(0);
+      const after = await spendSnapshot(home);
+      expect(embeddingCalls, `${run.out}\n${timeline.out}\n${sync.out}`).toEqual([]);
+      expect(chatCalls, `${run.out}\n${timeline.out}\n${sync.out}`).toEqual([]);
+      expect(after.ledger).toEqual(before.ledger);
+      expect(after.paidJobs).toEqual([]);
+      console.log(JSON.stringify({ kind: 'paid-provider-guard', before, after,
+        delta: { paid_embedding_calls: embeddingCalls.length, paid_llm_calls: chatCalls.length, subscription_cli_calls: 0 } }));
     }, 180_000);
   }
 });
