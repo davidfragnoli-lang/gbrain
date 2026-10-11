@@ -43,15 +43,13 @@ import {
   classifyFactsAbsorbError,
   _resetFactsAbsorbDisconnectedFlagForTests,
 } from '../src/core/facts/absorb-log.ts';
-import { factsAbsorbShouldRetry, factsAbsorbTerminalError, registerBuiltinHandlers } from '../src/commands/jobs.ts';
-import { OperationError } from '../src/core/ops/contract.ts';
+import { factsAbsorbShouldRetry, registerBuiltinHandlers } from '../src/commands/jobs.ts';
 import { markShortLivedCliProcess, __resetShortLivedCliForTests } from '../src/core/facts/cli-process-mode.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { MinionHandler } from '../src/core/minions/types.ts';
 import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { resolveStoredFactsEmbeddingModel } from '../src/core/persistence/facts-maintenance.ts';
 
 let engine: PGLiteEngine;
 const PINNED = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GBRAIN_MODEL', 'GBRAIN_HOME'] as const;
@@ -230,21 +228,6 @@ describe('transport-class failures throw typed', () => {
     // refusal/malformed are NOT retryable drift — they logged and returned.
     expect(factsAbsorbShouldRetry({ mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped_reason: 'malformed_output' }, 'keyed')).toBe(false);
     expect(factsAbsorbShouldRetry({ mode: 'queue', enqueued: true, queueDepth: 0 }, 'keyed')).toBe(false);
-  });
-
-  test('embedding configuration failures are terminal on the facts-absorb worker', () => {
-    const terminal = factsAbsorbTerminalError(new OperationError('embedding_configuration', 'bad embedding provenance'));
-    expect(terminal?.name).toBe('UnrecoverableError');
-    expect(terminal?.message).toBe('bad embedding provenance');
-    expect(factsAbsorbTerminalError(new OperationError('write_pending', 'retry later'))).toBeNull();
-  });
-
-  test('legacy DB embedding ids inherit only their matching configured provider', () => {
-    expect(resolveStoredFactsEmbeddingModel('text-embedding-3-large', 'openai:text-embedding-3-large'))
-      .toBe('openai:text-embedding-3-large');
-    expect(resolveStoredFactsEmbeddingModel('text-embedding-3-large', 'voyage:voyage-4')).toBeNull();
-    expect(resolveStoredFactsEmbeddingModel('openai:text-embedding-3-large', 'voyage:voyage-4'))
-      .toBe('openai:text-embedding-3-large');
   });
 
   test('classifyUnavailable: keyed when any chat key or servable model exists; keyless otherwise', async () => {

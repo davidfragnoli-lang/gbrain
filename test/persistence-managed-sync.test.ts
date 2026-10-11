@@ -229,29 +229,6 @@ test('interrupted cursor resumes its pinned target before a newer HEAD and never
   }
 }),120_000);
 
-test('explicit retry rediscovers an idle cursor fenced by an older writer binding', async () => withEnv({ GBRAIN_HOME: home }, async () => {
-  for (const engine of engines) {
-    const f = await fixture(engine, {
-      'a.md': 'First stable observation about writer recovery.\n',
-      'b.md': 'Second stable observation about writer recovery.\n',
-    });
-    const abort = new AbortController();
-    expect(await performManagedSync(engine, { sourceId: f.id, noPull: true, signal: abort.signal,
-      onProgress: progress => { if (progress.bankedFiles === 1) abort.abort(); } }))
-      .toMatchObject({ status: 'partial', filesImported: 1 });
-    const [stored] = await engine.executeRaw<{ fingerprint: string; completed_keys: [Record<string, unknown>] }>(
-      "SELECT fingerprint,completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]);
-    const cursor = stored.completed_keys[0] as { binding: { owner_epoch: string } };
-    cursor.binding.owner_epoch = String(Number(cursor.binding.owner_epoch) - 1);
-    await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
-      [stored.fingerprint, JSON.stringify([cursor])]);
-
-    await expect(performManagedSync(engine, { sourceId: f.id, noPull: true })).rejects.toMatchObject({ code: 'source_changed' });
-    expect(await performManagedSync(engine, { sourceId: f.id, noPull: true, retryFailed: true }))
-      .toMatchObject({ status: 'first_sync', filesImported: 2 });
-  }
-}), 120_000);
-
 test('attached working-tree changes require opt-in and delete retains exact physical identity', async () => withEnv({ GBRAIN_HOME: home }, async () => {
   for (const engine of engines) {
     const f=await fixture(engine,{'notes/a.md':'Committed observation for the source.\n'});

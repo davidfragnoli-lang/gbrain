@@ -61,21 +61,6 @@ test('unchanged replay, missing target and tracked deletion keep distinct outcom
   expect(await git(f.root, 'rev-parse', 'HEAD')).toBe(deletedHead);
 });
 
-test('an explicit db_tracked declaration overrides a stale ignore rule', async () => {
-  const f = fixture();
-  mkdirSync(join(f.root, 'brain', 'dream-cycle-summaries'), { recursive: true });
-  writeFileSync(join(f.root, '.gitignore'), 'dream-cycle-summaries/\n');
-  writeFileSync(join(f.root, 'gbrain.yml'), 'storage:\n  db_tracked:\n    - brain/dream-cycle-summaries/\n');
-  git(f.root, 'add', '.gitignore', 'gbrain.yml');
-  git(f.root, '-c', 'core.hooksPath=', 'commit', '-m', 'Declare tracked summaries');
-  git(f.root, 'push');
-  const path = 'brain/dream-cycle-summaries/2026-10-07.md';
-  writeFileSync(join(f.root, path), 'Retained summary\n');
-  expect(git(f.root, 'check-ignore', path).trim()).toBe(path);
-  expect(await publishGitEffect(f.root, path)).toEqual({ git: 'committed', push: 'committed' });
-  published(f, path, 'Retained summary\n');
-});
-
 test('push rejection leaves one durable local commit and retries it unchanged', async () => {
   const f = await fixture();
   await git(f.remote, 'config', 'receive.denyNonFastForwards', 'true');

@@ -55,7 +55,7 @@ import type { JobsCommandContext } from './jobs/shared.ts';
 
 // Moved to src/core/minions/handlers/ (refactor wave 1); re-exported so importers keep this path.
 export { resolveJobPull } from '../core/minions/handlers/job-pull.ts';
-export { factsAbsorbShouldRetry, factsAbsorbTerminalError, factsAbsorbUnavailable } from '../core/minions/handlers/facts-absorb.ts';
+export { factsAbsorbShouldRetry, factsAbsorbUnavailable } from '../core/minions/handlers/facts-absorb.ts';
 // Subcommand helpers moved to src/commands/jobs/ (refactor wave 1); re-exported for the same reason.
 export {
   formatJobDetail,

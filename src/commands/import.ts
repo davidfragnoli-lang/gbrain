@@ -1116,7 +1116,7 @@ export async function runImport(
   // that silently dropped files isn't "clean" for freshness purposes even
   // with zero recorded failures.
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
-  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark && !managedImport) {
     try {
       const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
         `SELECT local_path, config FROM sources WHERE id = $1`,
@@ -1159,12 +1159,7 @@ export async function runImport(
       }
       if (row?.local_path && coversRegisteredRoot && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
         throwIfInterrupted();
-        if (managedImport) {
-          const { stampManagedImportFreshness } = await import('../core/persistence/import-mutations.ts');
-          await stampManagedImportFreshness(engine, sourceId, dir);
-        } else {
-          await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
-        }
+        await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
     } catch (error) {
       if (error instanceof ImportAbortError) throw error;
