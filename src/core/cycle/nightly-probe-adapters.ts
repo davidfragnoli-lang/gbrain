@@ -100,7 +100,11 @@ export function buildLongMemEvalProbeCall(args: LongMemEvalProbeArgs): { argv: s
   // This gate scores terse factual answers for directness. The notes reader
   // intentionally emits evidence/reasoning scaffolding, so use the direct
   // protocol for the nightly quality gate and keep notes for diagnostics.
-  const argv = [args.fixturePath, '--output', args.outputPath, '--keyword-only', '--no-embed-cache', '--reader-mode', 'direct'];
+  // The production brain's configured embedding model can be a paid provider.
+  // Keep the nightly gate on the keyword arm, but retain subscription-CLI
+  // query expansion: strict single-query FTS misses natural-language variants
+  // in the compact fixture and previously produced a stable false 3/10.
+  const argv = [args.fixturePath, '--output', args.outputPath, '--mode', 'keyword', '--expansion', '--no-embed-cache', '--reader-mode', 'direct'];
   const runOpts: RunOpts = { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false };
   if (args.modelRoutes) {
     argv.push('--model', args.modelRoutes.reader.model);
