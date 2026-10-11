@@ -18,6 +18,7 @@ import { reservedTransactions, type ReservedTransactions } from './postgres-engi
 import { traceSqlOptions } from './sql-trace.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
 import { runBoundedStatement } from './postgres-engine/bounded-statement.ts';
+import { schemaDiagnosticConnection, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
 export { hasPostgresCancellationCapability } from './postgres-engine/cancellation.ts';
 import type {
   BrainEngine,
@@ -125,6 +126,7 @@ import * as takesImpl from './engine-sql/takes.ts';
 import * as codeEdgesImpl from './engine-sql/code-edges.ts';
 import * as salienceImpl from './engine-sql/salience.ts';
 import * as healthImpl from './engine-sql/health.ts';
+import { resolveEntityTypes } from './schema-pack/entity-types.ts';
 import * as pagesImpl from './engine-sql/pages.ts';
 import * as tagsImpl from './engine-sql/tags.ts';
 import * as linksImpl from './engine-sql/links.ts';
@@ -570,7 +572,7 @@ export class PostgresEngine implements BrainEngine {
         // transaction pooler. Codex P1 finding from v0.36 dreamy-thompson wave.
         await this.applyForwardReferenceBootstrap(conn);
 
-        await conn.unsafe(sqlText);
+        await withSchemaLockTimeout(conn, () => conn.unsafe(sqlText), { step: 'replay', diagnostic: schemaDiagnosticConnection(this._savedConfig?.database_url) }); // #5227: bounded wait, typed schema_lock_blocked
 
         // Run any pending migrations automatically
         const { applied } = await (await import('./migrate.ts')).runMigrations(this); // engine-dynamic-import-ok: initSchema only, keeps the ~220 migration modules off every connect
@@ -728,7 +730,7 @@ export class PostgresEngine implements BrainEngine {
   /** #5801: observe connection acquisition (see CheckoutGauge.onCheckout). Duck-typed like getPoolDiagnostics. */
   onCheckout(listener: () => void): () => void { return this.checkoutGauge.onCheckout(listener); }
 
-  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number; stuckDiscards: number; buildFailures: number; pool: DriverPoolStats | null; prepare: boolean | null } | null {
+  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number; stuckDiscards: number; buildFailures: number; desyncDiscards: number; pool: DriverPoolStats | null; prepare: boolean | null } | null {
     try {
       const max = (this.sql as unknown as { options?: { max?: number } }).options?.max;
       return {
@@ -737,6 +739,7 @@ export class PostgresEngine implements BrainEngine {
         poisonedDiscards: this.poisonedDiscards?.count ?? 0,
         stuckDiscards: this.poolIncidents?.stuckCount ?? 0,
         buildFailures: this.poolIncidents?.buildFailureCount ?? 0,
+        desyncDiscards: this.poolIncidents?.desyncCount ?? 0,
         pool: driverPoolStats(this.sql),
         prepare: (this.sql as unknown as { options?: { prepare?: boolean } }).options?.prepare ?? null,
       };
@@ -2232,7 +2235,7 @@ export class PostgresEngine implements BrainEngine {
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: import('./engine.ts').FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: import('./engine.ts').FactAttribution | null },
   ): Promise<FactRow[]> {
     return factsImpl.findCandidateDuplicates(unscopedExecutor(this.engineSql, 'facts: unscoped on master (EO4 inventory)'), source_id, entitySlug, factText, opts);
   }
@@ -2476,6 +2479,7 @@ export class PostgresEngine implements BrainEngine {
       embeddingColumn: async () => (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name,
       countStalePagesForExtraction: (o) => this.countStalePagesForExtraction(o),
       getConfig: (key) => this.getConfig(key),
+      entityTypes: (scope) => resolveEntityTypes(this, scope),
     });
   }
 

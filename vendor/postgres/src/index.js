@@ -62,7 +62,7 @@ function Postgres(a, b) {
       , full = Queue()
       , queues = { connecting, reserved, closed, ended, open, busy, full }
 
-  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
 
   const sql = Sql(handler)
 
@@ -575,6 +575,15 @@ function Postgres(a, b) {
     } catch (_) {}
   }
 
+  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
+  function ondesync(c, info) {
+    c.queue !== ended && move(c, ended)
+    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
+    try {
+      options.ondesync && options.ondesync(info)
+    } catch (_) {}
+  }
+
   function poisoned(c) {
     if (c.queue === ended)
       return
@@ -672,6 +681,7 @@ function parseOptions(a, b) {
     onpoisoned      : o.onpoisoned,
     onstuck         : o.onstuck,
     onbuilderror    : o.onbuilderror,
+    ondesync        : o.ondesync,
     shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
     onparameter     : o.onparameter,
     socket          : o.socket,

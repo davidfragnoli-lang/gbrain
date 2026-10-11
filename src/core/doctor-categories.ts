@@ -74,6 +74,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
+  'foreign_ownership_marker',
   'safe_index_pending',
   'self_capture',
   'brain_score',
@@ -157,12 +158,16 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'source_routing_health',
   'stale_mentions',
   'stub_guard_24h',
+  // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
+  'supersession_calibration',
   'sync_failures',
   // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
   'managed_sync_backlog',
   'sync_freshness',
   // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
   'git_convergence',
+  // #5186: an ownership marker committed to a source checkout's Git index.
+  'tracked_ownership_marker',
   'takes_count',
   'takes_weight_grid',
   // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).

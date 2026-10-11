@@ -51,17 +51,19 @@ export interface PoolHealthSnapshot extends DriverPoolStats {
   poisoned_discards: number;
   stuck_discards: number;
   build_failures: number;
+  desync_discards: number;
 }
 
 export function poolHealthSnapshot(engine: unknown): PoolHealthSnapshot | null {
   try {
-    const diagnostics = (engine as { getPoolDiagnostics?: () => { pool?: DriverPoolStats | null; poisonedDiscards?: number; stuckDiscards?: number; buildFailures?: number } | null } | null)?.getPoolDiagnostics?.();
+    const diagnostics = (engine as { getPoolDiagnostics?: () => { pool?: DriverPoolStats | null; poisonedDiscards?: number; stuckDiscards?: number; buildFailures?: number; desyncDiscards?: number } | null } | null)?.getPoolDiagnostics?.();
     if (!diagnostics?.pool) return null;
     return {
       ...diagnostics.pool,
       poisoned_discards: diagnostics.poisonedDiscards ?? 0,
       stuck_discards: diagnostics.stuckDiscards ?? 0,
       build_failures: diagnostics.buildFailures ?? 0,
+      desync_discards: diagnostics.desyncDiscards ?? 0,
     };
   } catch {
     return null;

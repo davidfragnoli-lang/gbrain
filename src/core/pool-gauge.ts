@@ -103,6 +103,7 @@ export function formatPoisonedDiscardWarning(pool: 'read' | 'direct', status: st
 export class PoolIncidentCounter {
   private stuck = 0;
   private buildFailures = 0;
+  private desyncs = 0;
 
   get stuckCount(): number {
     return this.stuck;
@@ -112,14 +113,23 @@ export class PoolIncidentCounter {
     return this.buildFailures;
   }
 
+  get desyncCount(): number {
+    return this.desyncs;
+  }
+
   /** The driver hooks of one pool, bound to this counter (what an engine passes as `PoolHealthHooks`). */
-  hooks(pool: 'read' | 'direct'): { onstuck: (info: { age_ms: number; queued: number; statement: string }) => void; onbuilderror: (code: string, statement: string) => void } {
-    return { onstuck: (info) => this.recordStuck(pool, info), onbuilderror: (code, statement) => this.recordBuildFailure(pool, code, statement) };
+  hooks(pool: 'read' | 'direct'): { onstuck: (info: { age_ms: number; queued: number; statement: string }) => void; onbuilderror: (code: string, statement: string) => void; ondesync: (info: { message: string; connection: number; statement: string }) => void } {
+    return { onstuck: (info) => this.recordStuck(pool, info), onbuilderror: (code, statement) => this.recordBuildFailure(pool, code, statement), ondesync: (info) => this.recordDesync(pool, info) };
   }
 
   recordStuck(pool: 'read' | 'direct', info: { age_ms: number; queued: number; statement: string }): void {
     this.stuck += 1;
     try { console.warn(formatStuckConnectionWarning(pool, info)); } catch { /* best-effort */ }
+  }
+
+  recordDesync(pool: 'read' | 'direct', info: { message: string; connection: number; statement: string }): void {
+    this.desyncs += 1;
+    try { console.warn(formatDesyncWarning(pool, info)); } catch { /* best-effort */ }
   }
 
   recordBuildFailure(pool: 'read' | 'direct', code: string, statement: string): void {
@@ -132,6 +142,13 @@ export function formatStuckConnectionWarning(pool: 'read' | 'direct', info: { ag
   return `[gbrain] warn code=pg_connection_stuck pool=${pool} age_ms=${Math.max(0, Math.round(info.age_ms))} queued=${Math.max(0, info.queued | 0)} sql=${sqlLabel(info.statement).replaceAll(' ', '_')}` +
     ` cause="a statement waited past statement_timeout with nothing coming back from the server; the connection was retired and its queued statements failed with CONNECTION_STUCK"` +
     ` fix="gbrain doctor --json" docs=docs/ENGINES.md#pg-connection-stuck`;
+}
+
+export function formatDesyncWarning(pool: 'read' | 'direct', info: { message: string; connection: number; statement: string }): string {
+  const message = /^[A-Za-z0-9]$/.test(info.message) ? info.message : '?';
+  return `[gbrain] warn code=pg_connection_desync pool=${pool} message=${message} connection=${Math.max(0, info.connection | 0)} sql=${sqlLabel(info.statement).replaceAll(' ', '_')}` +
+    ` cause="a statement answer arrived on a connection with no statement waiting for it; the connection was retired and its queued statements failed with a connection error"` +
+    ` fix="gbrain doctor --json" docs=docs/ENGINES.md#pg-connection-desync`;
 }
 
 export function formatBuildFailureWarning(pool: 'read' | 'direct', code: string, statement: string): string {

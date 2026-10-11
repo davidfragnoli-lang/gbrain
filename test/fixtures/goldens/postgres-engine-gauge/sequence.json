@@ -3,6 +3,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -20,6 +21,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -37,6 +39,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -54,6 +57,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -71,6 +75,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -88,6 +93,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -105,6 +111,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -122,6 +129,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -139,6 +147,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -156,6 +165,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -173,6 +183,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -190,6 +201,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -207,6 +219,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -224,6 +237,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -241,6 +255,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -258,6 +273,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -275,6 +291,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,
@@ -292,6 +309,7 @@
     {
       "diagnostics": {
         "buildFailures": 0,
+        "desyncDiscards": 0,
         "poisonedDiscards": 0,
         "pool": null,
         "poolMax": 10,

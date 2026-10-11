@@ -19,6 +19,8 @@ import { digest, requireUuid, sha256, stableJson } from './digest.ts';
 import { reconcileCanonical, strictReconcileKeys, validateReconcileJson, type ReconcileConflict, type ReconcileDecision } from './reconcile-merge.ts';
 import type { ParsedPage } from '../import-file.ts';
 import type { AutoDecision } from './reconcile-additive.ts';
+import { publishesDatabaseOnly } from './page-prepare.ts';
+import { isMirrorOnlyPage } from './mirror-read-only.ts';
 
 export interface ReconcilePins {
   brain_id: string; source_id: string; source_incarnation: string; slug: string; page_id: number;
@@ -127,7 +129,13 @@ async function assertSoleFileClaim(engine: BrainEngine, target: { sourceId: stri
     afterId = Number(candidates[candidates.length - 1]!.id);
   }
 }
-export async function readReconcileState(engine: BrainEngine, sourceId: string, slug: string, assessmentAt = new Date().toISOString()): Promise<ReconcileState> {
+/**
+ * #6394: `adoptSlugPath` lets a live page with no recorded origin and no database-only marker reconcile against the file
+ * at its slug path (mode-aware, as discovery names it). A page that publishes database-only by design (a declared db_only
+ * slug, a never-filed derive-phase page) or a mirror-only page never adopts one.
+ */
+export async function readReconcileState(engine: BrainEngine, sourceId: string, slug: string, assessmentAt = new Date().toISOString(),
+  opts: { adoptSlugPath?: boolean } = {}): Promise<ReconcileState> {
   const binding = await getWorktreeBinding(engine, sourceId);
   if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active') {
     throw new OperationError('owner_unavailable', 'Reconciliation requires the existing active owner on this host.', 'Run repair on the current owner; repair never claims or activates a source.');
@@ -144,12 +152,16 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   const recorded = recordedPathFromFileUri(snapshot.page.source_uri, root);
   const mode = await scannerSlugRootMode(engine, sourceId, root);
   const recordedPath = recordedReconcilePath(root, snapshot.page, mode);
-  const derived = !recordedPath && isDatabaseOnlyPage({ ...snapshot.page,
-    database_only_reason: await isUnboundSourcePage(engine, sourceId, slug) ? 'unbound_source' : null }) ? slugDerivedOrigin(root, slug, mode) : null;
+  const marked = !recordedPath && isDatabaseOnlyPage({ ...snapshot.page,
+    database_only_reason: await isUnboundSourcePage(engine, sourceId, slug) ? 'unbound_source' : null });
+  const adoptable = !recordedPath && !marked && opts.adoptSlugPath === true && !snapshot.page.source_uri
+    && !publishesDatabaseOnly(root, slug, snapshot) && !await isMirrorOnlyPage(engine, sourceId, slug);
+  const derived = marked || adoptable ? slugDerivedOrigin(root, slug, mode) : null;
   const origin = derived ? 'slug_derived' : 'recorded';
   const path = recordedPath ?? derived?.path ?? null;
   if (!path || !isWriteTargetContained(path, root)) throw opError('source_changed', 'The page has no unambiguous confined recorded Markdown origin.',
-    `Page ${slug} in '${sourceId}' records no Markdown file inside the source checkout, so there is nothing to reconcile it against; nothing changed. Check its recorded source path with the command in fix.`,
+    `Page ${slug} in '${sourceId}' records no Markdown file inside the source checkout, so there is nothing to reconcile it against; nothing changed. ${!recordedPath && !marked && !snapshot.page.source_uri && opts.adoptSlugPath !== true
+      ? `If the file at its slug path is this page's canonical file, preview again with --adopt-slug-path (gbrain sources reconcile ${sourceId} ${slug} --preview --adopt-slug-path) to adopt it; otherwise check its recorded source path with the command in fix.` : 'Check its recorded source path with the command in fix.'}`,
     { fix: readFix('Shows the page and its recorded source path.', { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] }) });
   let size: number;
   try {
@@ -180,6 +192,13 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
   // Preserve a terminal .md in the page key while parsing the canonical Markdown.
   const parsed = parseMarkdown(text, `${slug}.md`, { validate: true, expectedSlug: slug });
   const errors = parsed.errors?.filter(e => !['MISSING_OPEN', 'MISSING_CLOSE', 'EMPTY_FRONTMATTER'].includes(e.code)) ?? [];
+  if (!errors.length && !parsed.errors?.some(e => e.code === 'MISSING_CLOSE') && parsed.slug !== slug) {
+    // #5966 (W14 P1.7): a well-formed file whose path derives another slug is a legacy render of a slug the
+    // path cannot derive, written before renders stamped `slug:`; the frontmatter repair proposes the stamp.
+    throw opError('source_changed', 'The canonical file carries no slug stamp, so its path derives a different slug.',
+      `Nothing changed. The file of ${slug} in '${sourceId}' reads as ${parsed.slug} from its path. Preview the stamp with gbrain repair frontmatter --source ${sourceId} --only ${relative(root, path)} (a safe repair), apply it, then preview the page again.`,
+      { detail: 'slug_rule_mismatch' });
+  }
   if (errors.length || parsed.errors?.some(e => e.code === 'MISSING_CLOSE') || parsed.slug !== slug) {
     throw opError('invalid_params', 'Canonical file metadata cannot be parsed losslessly; repair its syntax before previewing.',
       `Nothing changed. Fix the frontmatter of the canonical file of ${slug} in '${sourceId}' (close the --- block, keep its slug), then preview the page again.`);
@@ -189,6 +208,11 @@ export async function readReconcileState(engine: BrainEngine, sourceId: string, 
     revision: snapshot.revision, raw_file_hash: sha256(raw), relative_path: relative(root, path),
     policy_digest: await reconcilePolicyDigest(engine, sourceId), withdrawals_digest: digest({ withdrawals: snapshot.withdrawals, global_purges: snapshot.globalPurges ?? null }), assessment_at: assessmentAt };
   return { binding, root, path, raw, snapshot, storedPage, file: reconcileCanonical(parsed, parsed.tags), pins, origin, originSourcePath: derived?.sourcePath ?? null };
+}
+/** #6394: a preview made with --adopt-slug-path recorded a page with no origin; apply and publication adopt the same pinned file. */
+export function reconcilePreviewAdopts(artifact: Pick<ReconcileArtifact, 'preimages'>): boolean {
+  const stored = (artifact.preimages as { stored_page?: { source_path?: unknown; source_uri?: unknown } | null } | null)?.stored_page;
+  return stored != null && stored.source_path == null && stored.source_uri == null;
 }
 export function assertReconcilePins(expected: ReconcilePins, actual: ReconcilePins): void {
   for (const key of Object.keys(expected) as Array<keyof ReconcilePins>) if (expected[key] !== actual[key]) staleReconcile(key);

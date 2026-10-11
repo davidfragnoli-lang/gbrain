@@ -195,8 +195,11 @@ export interface TrustProposalHandler {
 }
 
 const handlers = new Map<TrustProposalAction, TrustProposalHandler>();
-export function registerTrustProposalHandler(action: TrustProposalAction, handler: TrustProposalHandler): void {
+/** Registers the handler for an action; returns the call that puts the previous registration back (a test stub must restore it: the registry is process-global). */
+export function registerTrustProposalHandler(action: TrustProposalAction, handler: TrustProposalHandler): () => void {
+  const previous = handlers.get(action);
   handlers.set(action, handler);
+  return () => { if (previous) handlers.set(action, previous); else handlers.delete(action); };
 }
 
 /**

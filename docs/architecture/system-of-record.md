@@ -216,7 +216,7 @@ or a physical projection that leaves attribution untouched):
 - `src/commands/extract-timeline-db.ts` (2): `gbrain extract timeline --source db` commits one `maintenanceTransaction` per 100-row batch on unmanaged brains; managed brains publish per page through a maintenance request.
 - `src/commands/migrate-engine.ts` (5): engine copy keeps the source rows' attribution values verbatim.
 - `src/commands/sync/holds.ts` (1): a full sync's move of a held rename (`updateSlug` and its `source_path`) runs in one `maintenanceTransaction`; managed sources publish renames through the sync request preparer.
-- `src/commands/sync/renames.ts` (1): the legacy sync rename (`updateSlug`) runs in `maintenanceTransaction`; managed sources publish renames through the sync request preparer.
+- `src/commands/sync/rename-collision.ts` (2): the legacy sync rename (`updateSlug`, and the tombstone re-key when the destination slug is a soft-deleted row, #5431) runs with its `source_path` repair in one `maintenanceTransaction`; managed sources publish renames through the sync request preparer.
 - `src/core/calibration/undo-wave.ts` (1): the calibration wave undo of take resolutions runs in `maintenanceTransaction`.
 - `src/core/chronicle/publish.ts` (3): Life Chronicle event generations: maintenance requests on managed brains; the unmanaged event write, retirement soft delete and retired stamp run in `maintenanceTransaction`.
 - `src/core/company-brain/profile.ts` (1): legacy sync soft deletes (`softDeleteSyncPages`) run in `maintenanceTransaction`, inside the company-brain source check when one is active.
@@ -228,7 +228,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/cycle/extract-facts.ts` (7): the unmanaged page reconcile and the expiry of fence facts whose page was soft-deleted run in `maintenanceTransaction`; managed brains publish `managed_maintenance_fence_facts` and `managed_maintenance_deleted_page_facts_expire` requests whose preparers write inside the coordinator publication. Both reconcile paths write at the page's tier and gate new rows.
 - `src/core/cycle/extract-takes.ts` (1): one projected-takes writer stamps each page's tier and runs the write gate: inside a receipted `managed_maintenance_takes_reextract` request per changed page on managed brains, one `maintenanceTransaction` per page tier for the unmanaged batch upsert.
 - `src/core/enrichment-service.ts` (2): the enrichment stub fallback write and its auto-timeline entry run in `maintenanceTransaction` at the source page's derived tier (the stub import is lowered to it afterwards).
-- `src/core/extract-timeline-from-meetings.ts` (1): each meeting timeline batch runs in `maintenanceTransaction`, one meeting tier per batch.
+- `src/core/extract-timeline-from-meetings.ts` (2): on an unmanaged brain each meeting timeline batch runs in `maintenanceTransaction`, one meeting tier per batch; a managed brain publishes receipted `managed_maintenance_meeting_timeline` requests instead, whose preparer (`prepareMeetingTimeline`) inserts the rows inside the coordinated publication (#6273).
 - `src/core/cycle/grade-takes.ts` (1): unmanaged take auto-resolution runs in `maintenanceTransaction`; managed brains publish a `takes_resolve` request.
 - `src/core/cycle/phantom-redirect.ts` (3): the unmanaged phantom fact move, canonical body refresh and phantom soft delete run in `maintenanceTransaction`; the managed redirect moves facts inside its coordinated write.
 - `src/core/cycle/phases/consolidate.ts` (4): unmanaged consolidation's take insert or re-promotion, consolidation marks and valid_until writeback run in one `derivedMaintenanceTransaction` per cluster at the cluster's derived tier; managed brains submit a maintenance consolidation request.
@@ -252,7 +252,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/ops/extraction.ts` (2): extraction review promote (frontmatter) and reject (soft delete) each run in `maintenanceTransaction`.
 - `src/core/output/writer.ts` (4): `BrainWriter.transaction` is a `maintenanceTransaction`, so its pages and timeline rows carry the maintenance principal.
 - `src/core/page-state/materialize.ts` (1): coordinated maintenance.
-- `src/core/page-state/rename-alias.ts` (2): the fact slug rewrite runs inside its caller's `updateSlug` transaction, and every caller is attributed.
+- `src/core/page-state/rename-alias.ts` (5): the fact slug rewrite runs inside its caller's `updateSlug` transaction, and `movePageIdReferences` (#5431: page_versions, timeline_entries and links moved to the row that materialized under a fallback rename) runs inside `carryRenameIdentity`'s `maintenanceTransaction`; every caller is attributed.
 - `src/core/page-state/versions.ts` (1): `createVersion` itself; the caller's scope supplies the actor.
 - `src/core/persistence/atom-maintenance.ts` (1): request preparer.
 - `src/core/persistence/canonical-projections.ts` (7): fence projection inside the request's publication.

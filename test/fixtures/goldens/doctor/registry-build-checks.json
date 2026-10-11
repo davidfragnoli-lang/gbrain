@@ -330,6 +330,10 @@
         "name": "embedding_migration_state"
       },
       {
+        "category": "brain",
+        "name": "supersession_calibration"
+      },
+      {
         "category": "ops",
         "name": "chat_fallback_chain"
       },
@@ -416,6 +420,10 @@
       {
         "category": "brain",
         "name": "orphan_persistence_bindings"
+      },
+      {
+        "category": "brain",
+        "name": "foreign_ownership_marker"
       },
       {
         "category": "brain",
@@ -656,6 +664,10 @@
       {
         "category": "brain",
         "name": "git_convergence"
+      },
+      {
+        "category": "brain",
+        "name": "tracked_ownership_marker"
       },
       {
         "category": "ops",

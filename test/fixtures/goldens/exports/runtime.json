@@ -597,6 +597,7 @@
       "./extract": [
         "STALE_TIME_BUDGET_MS",
         "buildSlugPathIndex",
+        "extractCompletionKey",
         "extractLinksForSlugs",
         "extractLinksFromFile",
         "extractMarkdownLinks",
@@ -704,6 +705,7 @@
         "resolveSourceLocalFilePath",
         "serializeMarkdown",
         "serializePageToMarkdown",
+        "slugStampedFrontmatter",
         "sourceGitScope",
         "splitBody",
         "yamlAliasesWithinLimit",
@@ -812,6 +814,7 @@
         "isConversationLabels",
         "locateChunks",
         "pageEvidenceText",
+        "pagePlanHits",
         "parseAutoPacking",
         "parseReturnUnit",
         "parseReturnWindow",

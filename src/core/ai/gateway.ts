@@ -62,7 +62,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
-import { isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
+import { fitMatryoshkaPrefix, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
@@ -413,20 +413,26 @@ export function applyOpenAICompatConfig(
  *
  * Returns undefined when the env provides no base URL, so the SDK's own default
  * (which already includes `/v1`) is preserved untouched — the happy path is not
- * altered. Google is intentionally NOT handled here: its native suffix is
- * unproven (Gemini's OpenAI-compat route is `/v1beta/openai`), so it's deferred
- * to a follow-up rather than risk a regression on a wrong assumption.
+ * altered.
+ *
+ * Google (`GOOGLE_GENERATIVE_AI_BASE_URL`, used by native-google chat,
+ * expansion and embedding): the SDK's default root is
+ * `https://generativelanguage.googleapis.com/v1beta` and it appends
+ * `/models/<id>:<method>`, so a URL with no version segment gets `/v1beta`
+ * (a pass-through proxy then forwards the real path); a URL that already
+ * names a version (`/v1`, `/v1beta`, `/v1alpha`) is kept as written.
  *
  * @internal exported for tests.
  */
 export function resolveNativeBaseUrl(
-  provider: 'anthropic' | 'openai',
+  provider: 'anthropic' | 'openai' | 'google',
   cfg: AIGatewayConfig,
 ): string | undefined {
-  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : 'OPENAI_BASE_URL';
+  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : provider === 'openai' ? 'OPENAI_BASE_URL' : 'GOOGLE_GENERATIVE_AI_BASE_URL';
   const raw = cfg.env[envKey];
   if (!raw || !raw.trim()) return undefined;
   const trimmed = raw.trim().replace(/\/+$/, '');
+  if (provider === 'google') return /\/v\d+[a-z]*$/i.test(trimmed) ? trimmed : `${trimmed}/v1beta`;
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
@@ -1435,7 +1441,8 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `Google embedding requires GOOGLE_GENERATIVE_AI_API_KEY.`,
         recipe.setup_hint,
       );
-      const client = createGoogleGenerativeAI({ apiKey });
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      const client = createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
       return (client as any).textEmbeddingModel
         ? (client as any).textEmbeddingModel(modelId)
         : (client as any).embedding(modelId);
@@ -1766,17 +1773,17 @@ async function embedSubBatch(
       );
     }
 
-    for (const embedding of result.embeddings) {
+    const embeddings: number[][] = result.embeddings.map((e: number[]) => fitMatryoshkaPrefix(recipe, modelId, e, expectedDims)); // PR #5921
+    for (const embedding of embeddings) {
       if (Array.isArray(embedding) && embedding.length !== expectedDims) {
-        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`,
-          { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
+        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`, { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
       }
     }
 
     recordSubBatchSuccess(recipe);
     const usageTokens = (result as { usage?: { tokens?: unknown } }).usage?.tokens;
     return {
-      embeddings: result.embeddings.map((e: number[]) => new Float32Array(e)),
+      embeddings: embeddings.map((e: number[]) => new Float32Array(e)),
       reportedTokens: typeof usageTokens === 'number' && Number.isFinite(usageTokens) && usageTokens > 0
         ? usageTokens
         : null,
@@ -2359,7 +2366,8 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google expansion requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -3292,7 +3300,8 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google chat requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;

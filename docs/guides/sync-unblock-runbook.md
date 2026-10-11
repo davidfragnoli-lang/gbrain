@@ -97,6 +97,7 @@ Every hold and error has three fields, from one table
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
+| `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
 | `sync_incomplete` | page | retry | no | never: an unfinished cursor resumes with the same command |
 | `connection_lost` | connection | retry | no | three reruns in a row end connection_lost (the database is unreachable from this host) |
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
@@ -178,6 +179,20 @@ failure still writes a ledger row.
 When HEAD moved past the pinned target while the run drained, the drain takes
 exactly one more pass (an incremental pin..HEAD discovery) so the invocation
 ends at HEAD; never a second one, so a live checkout cannot loop.
+
+## A cursor doctor reports that no sync can reach
+
+`sync_incomplete` in the table above resumes with the same command because the
+live writer reads its own cursor key. A cursor written under a key nothing
+current derives (an older writer identity such as a `legacy_token` principal,
+a revoked local writer, a cursor from before sync options were recorded) is
+still read by doctor, so `sync_failures` reports it after every green sync.
+That is not a page fault and no rerun clears it: preview
+`gbrain repair managed-sync-orphans --source <id>`, relay the listed classes
+(`no_cursor`, `principal_unadoptable`, `superseded`) and the kept rows, then
+apply with the printed `--apply --expect <hash>` once the user agrees. A cursor
+with a live pending request is kept; the loop above owns it
+([repair guide](repair.md#managed-sync-orphans)).
 
 ## See also
 

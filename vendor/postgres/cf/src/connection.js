@@ -52,7 +52,7 @@ const errorFields = {
   82  : 'routine'            // R
 }
 
-function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop } = {}) {
+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop, ondesync = noop } = {}) {
   const {
     sslnegotiation,
     ssl,
@@ -102,6 +102,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , rows = 0
     , serverSignature = null
     , nextWriteTimer = null
+    , lastWritten = null
+    , lastExecuted = null
+    , deferredRetries = []
     , terminated = false
     , incomings = null
     , results = null
@@ -181,6 +184,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         : (query = q, query.active = true, armInflight())
 
       build(q)
+      lastWritten = q
+      lastExecuted = q
       const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
       return write(toBuffer(q))
         && !q.describeFirst
@@ -453,6 +458,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     errored(err)
     while (sent.length)
       queryError(sent.shift(), err)
+    while (deferredRetries.length)
+      queryError(deferredRetries.shift(), err)
   }
 
   function errored(err) {
@@ -548,6 +555,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
   /* Handlers */
   function handle(xs, x = xs[0]) {
+    if (!query && !initial && !stream && answersStatement(xs, x)) {
+      desynced(x)
+      return
+    }
     (
       x === 68 ? DataRow :                   // D
       x === 100 ? CopyData :                 // d
@@ -576,6 +587,36 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       /* c8 ignore next */
       UnknownMessage
     )(xs)
+  }
+
+  // GBrain: a message that answers a statement (its columns, rows, completion, parse/bind acknowledgements or a
+  // statement error) arriving when no statement is waiting for one means the client and the server no longer
+  // agree on which answer belongs to which statement: every later answer on this connection would be read for
+  // the wrong query. The connection is retired and everything queued on it fails with CONNECTION_DESYNC.
+  // Notices, parameter changes, notifications, ReadyForQuery and a FATAL/PANIC error legitimately arrive
+  // without a statement and pass through.
+  function answersStatement(xs, x) {
+    if (x === 84 || x === 68 || x === 67 || x === 73 || x === 49 || x === 50 || x === 116 || x === 110)
+      return true
+    if (x !== 69)
+      return false
+    const fields = parseError(xs)
+    const severity = fields.severity || fields.severity_local
+    return severity !== 'FATAL' && severity !== 'PANIC'
+  }
+
+  function desynced(x) {
+    const s = socket
+    const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
+    error(Errors.connection('CONNECTION_DESYNC', options, socket))
+    query = null
+    connection.inflightSince = 0
+    ondesync(connection, info)
+    terminate()
+    if (s && !s.destroyed) {
+      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
+      t.unref && t.unref()
+    }
   }
 
   function DataRow(x) {
@@ -623,6 +664,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
   function ReadyForQuery(x) {
     connection.status = x[5]
+    query && query === lastWritten && (lastWritten = null)
     connection.inflightSince = 0
     if (query) {
       options.shared.completed++
@@ -631,9 +673,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         query.sharedTypes && options.shared_types.delete(query.typesKey)
         query.retried
           ? errored(query.retried)
-          : query.prepared && retryRoutines.has(errorResponse.routine)
+          : query.prepared && retryRoutines.has(errorResponse.routine) && !query.cancelled
             ? retry(query, errorResponse)
             : errored(errorResponse)
+      } else if (query.cancelled) {
+        // GBrain: a query cancelled while it waited behind another one on this connection still gets the
+        // server's answer to it; that answer is consumed here and the query rejects as cancelled.
+        query.reject(Errors.generic('57014', 'canceling statement due to user request'))
       } else {
         query.resolve(results || result)
       }
@@ -667,8 +713,19 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         return
     }
 
-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+    // GBrain: the stock loop skipped a query cancelled while it waited behind another one, so the answer the
+    // server still sent for it was read for the next query (the next query resolved with another statement's
+    // rows, and the cancelled one never settled). The cancelled query stays current and absorbs its own answer.
+    // A server cancel targets the backend, not a statement, so it is only sent when nothing is pipelined behind.
+    if (sent.length) {
+      query = sent.shift()
+      query.active = true
+      query.cancelled && (sent.length
+        ? query.cancelled.resolve()
+        : Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject))
+    }
+
+    flushRetries()
 
     if (query)
       return armInflight() // Consider opening if able and sent.length < 50
@@ -731,6 +788,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     query.typesKey && query.statement.types.every(t => t > 0 && t < 16384)
       && options.shared_types.set(query.typesKey, query.statement.types.slice())
     query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
+    flushRetries()
   }
 
   function RowDescription(x) {
@@ -928,7 +986,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function retry(q, error) {
     delete statements[q.signature]
     q.retried = error
-    execute(q)
+    deferredRetries.push(q)
+    flushRetries()
+  }
+
+  // GBrain: a describe-first or cursor query writes its next messages only when the server answers its first
+  // ones. A retry written in that gap lands between them on the wire, and every later response is then read
+  // for the wrong query (rows built with another statement's columns). Retries wait for that query.
+  function flushRetries() {
+    while (deferredRetries.length && !(lastWritten && (lastWritten.describeFirst || lastWritten.cursorFn)))
+      execute(deferredRetries.shift())
   }
 
   function NotificationResponse(x) {

@@ -139,6 +139,11 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    */
   onbuilderror: (code: string, statement: string) => void;
   /**
+   * GBrain: called once per connection retired because a statement's answer arrived with no statement
+   * waiting for it; `statement` is the last statement written on it, with `$n` placeholders.
+   */
+  ondesync: (desync: { message: string; connection: number; statement: string }) => void;
+  /**
    * GBrain: share the parameter types of a described statement across this pool's
    * connections, so a connection running it for the first time skips the describe
    * round trip and keeps pipelining. Only built-in types are shared.

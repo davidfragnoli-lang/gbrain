@@ -177,7 +177,7 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
     { fix: reimportFix(p.inputPath, row.source_id) });
   const source = { sourceId: row.source_id };
   const snapshot = screen ? screen.snapshot : await engine.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
-  assertPageRevision(snapshot, p.expected_revision ? { expectedRevision: p.expected_revision } : {});
+  assertPageRevision(snapshot, { expectedRevision: p.expected_revision ?? null }); // null: admitted against an absent page; still a revision_conflict if one appeared (#5385)
   if ((snapshot?.page.id ?? null) !== row.page_id || snapshot?.page.source_path && snapshot.page.source_path !== p.sourcePath) {
     throw opError('page_identity_changed', 'The imported path no longer names the accepted page.',
       `Page ${row.slug} in source ${row.source_id} was replaced, removed, or now maps to a different file than ${p.sourcePath}, so import request ${row.request_id} published nothing. Read the page before importing the file again.`,
@@ -208,7 +208,7 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
     { fix: receiptFix(row) });
   const tags = [...new Set([...(snapshot?.tags ?? []), ...(ready.parsedPage?.tags ?? [])])].sort();
   const rendered = imageBytes ?? (code ? p.content : serializePageToMarkdown({
-    ...(snapshot?.page ?? { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage,
+    ...(snapshot?.page ?? { id: 0, slug: row.slug, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage,
   } as Page, tags));
   const project = code || image ? undefined : await prepareCanonicalProjections(engine, ready.parsedPage!, row.slug, row.source_id, snapshot, 'file');
   const mutation: PreparedMutation = { observedRevision: ready.observedRevision, noop: ready.noop && p.targetHash === sha256(rendered),

@@ -1766,49 +1766,28 @@ CREATE TRIGGER minion_job_notify AFTER INSERT OR UPDATE OF status ON minion_jobs
 DO $$
 DECLARE
   has_bypass BOOLEAN;
+  target TEXT;
 BEGIN
   -- #1385: recognize superuser + inherited-role BYPASSRLS, not just the role's
   -- own rolbypassrls (alias `pr` avoids any plpgsql record-variable collision).
   SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
   IF has_bypass THEN
-    ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE content_chunks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE wanted_links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE raw_data ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE timeline_entries ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE page_versions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE ingest_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE config ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE files ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_jobs ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE sources ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE file_migration_ledger ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_inbox ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_attachments ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_messages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_tool_executions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_rate_leases ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE gbrain_cycle_locks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_takes_quality_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.32.6 contradiction probe tables
-    ALTER TABLE eval_contradictions_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_contradictions_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.36.1.0 Hindsight calibration wave tables
-    ALTER TABLE calibration_profiles ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_proposals ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_grade_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_nudge_log ENABLE ROW LEVEL SECURITY;
-    -- v0.26 OAuth 2.1 tables
-    ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+    -- #5227 (W14 P1.6): conditional enables. ALTER TABLE ... ENABLE ROW LEVEL SECURITY takes an
+    -- ACCESS EXCLUSIVE lock even when RLS is already on, so re-running this block on a live brain
+    -- queued behind every open transaction; a table whose relrowsecurity is already set is skipped.
+    FOREACH target IN ARRAY ARRAY[
+      'pages','content_chunks','links','wanted_links','tags','raw_data','timeline_entries',
+      'page_versions','ingest_log','config','files','minion_jobs','sources','file_migration_ledger',
+      'access_tokens','mcp_request_log','minion_inbox','minion_attachments','subagent_messages',
+      'subagent_tool_executions','subagent_rate_leases','gbrain_cycle_locks','dream_verdicts',
+      'eval_candidates','eval_capture_failures','eval_takes_quality_runs','eval_contradictions_cache',
+      'eval_contradictions_runs','calibration_profiles','take_proposals','take_grade_cache',
+      'take_nudge_log','oauth_clients','oauth_tokens','oauth_codes'] LOOP
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = current_schema() AND c.relname = target AND c.relrowsecurity) THEN
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', target);
+      END IF;
+    END LOOP;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
@@ -1998,6 +1977,7 @@ CREATE TABLE IF NOT EXISTS persistence_host_bindings (
     host_id uuid NOT NULL,
     local_path text NOT NULL,
     coordination_path text NOT NULL,
+    git_durability text CHECK (git_durability IN ('enabled','disabled')),
     PRIMARY KEY(worktree_id,host_id)
   );
 CREATE TABLE IF NOT EXISTS persistence_local_writers (
@@ -2979,3 +2959,67 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_checked_at TIMESTAMPTZ;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_commit TEXT;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_behind INTEGER;
 
+-- Pinned questions (C4): answers and their evidence pointers live outside pages.
+-- BEGIN GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS pinned_questions (
+  id                        BIGSERIAL PRIMARY KEY,
+  source_id                 TEXT NOT NULL,
+  slug                      TEXT NOT NULL,
+  question                  TEXT NOT NULL,
+  scope_slug_prefix         TEXT,
+  scope_entity              TEXT,
+  state                     TEXT NOT NULL DEFAULT 'active',
+  inactive_reason           TEXT,
+  publish_mode              TEXT NOT NULL DEFAULT 'publish',
+  model                     TEXT,
+  cooldown_days             REAL,
+  origin                    TEXT NOT NULL DEFAULT 'pin',
+  created_by                TEXT NOT NULL,
+  revision                  BIGINT NOT NULL DEFAULT 1,
+  answer_revision           INTEGER NOT NULL DEFAULT 0,
+  answer                    TEXT,
+  answer_model              TEXT,
+  last_refresh_at           TIMESTAMPTZ,
+  last_attempt_at           TIMESTAMPTZ,
+  last_error                TEXT,
+  watermark_generation      BIGINT,
+  watermark_fact_id         BIGINT,
+  watermark_at              TIMESTAMPTZ,
+  lease_token               TEXT,
+  lease_owner               TEXT,
+  lease_expires_at          TIMESTAMPTZ,
+  refresh_attempts          INTEGER NOT NULL DEFAULT 0,
+  spend_usd                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  archived_at               TIMESTAMPTZ,
+  CONSTRAINT pinned_questions_source_slug_key UNIQUE (source_id, slug)
+);
+CREATE INDEX IF NOT EXISTS pinned_questions_state_idx ON pinned_questions (state, source_id);
+CREATE TABLE IF NOT EXISTS question_evidence (
+  id                        BIGSERIAL PRIMARY KEY,
+  question_id               BIGINT NOT NULL,
+  answer_revision           INTEGER NOT NULL,
+  sentence_id               TEXT NOT NULL,
+  kind                      TEXT NOT NULL,
+  source_id                 TEXT NOT NULL,
+  page_id                   INTEGER,
+  page_slug                 TEXT,
+  page_generation           BIGINT,
+  page_revision             TEXT,
+  item_id                   BIGINT,
+  content_hash              TEXT,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS question_evidence_question_idx ON question_evidence (question_id, answer_revision);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE pinned_questions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE question_evidence ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL)

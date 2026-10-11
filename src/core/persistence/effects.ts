@@ -2,7 +2,7 @@ import { withAIAttribution } from '../ai/invocation-guard.ts';
 import { randomUUID } from 'node:crypto';
 import { targetedWithdrawalEffect, upgradeWithdrawalEffect } from './effect-targets.ts';
 import { existsSync, statSync } from 'node:fs';
-import { basename, join, relative, sep } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -32,16 +32,17 @@ import { isSourceDbOnlySlug } from './source-storage.ts';
 import { advanceEffectCursor, claimCoalescedGitEffects, claimPersistenceEffect, completeEffect, failEffect, parkEffect, renewPersistenceEffectClaim, requeueEffect, retryEffect, singleFileGitEffect } from './effect-journal.ts';
 import { guardEffectSource, recoverEffectPublication, reserveEffectRecovery } from './effect-recovery.ts';
 import { commitGitTargets, DURABILITY_NOT_ENABLED, publishGitEffect, pushGitRoot } from './effect-git.ts';
-import { isDurabilityHardenedAsync } from '../brain-repo-durability.ts';
+import { gitDurabilityPolicy } from './git-durability-policy.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
 import { dispatchFactsBackstopEffect } from './effect-facts.ts';
 import { runLinksEffect } from './effect-links.ts';
 import { PARK_AFTER_FAILURES, type EffectRecovery, type GitCommitNote, type PersistenceEffect, type SkippedTarget } from './effect-model.ts';
-import { SYNC_SKIP_FILES } from '../sync.ts';
+import { isSyncMetafile } from '../sync.ts';
 import { recoveryStagingFile } from './staging.ts';
 import { selectEffectRecoveries } from './effect-recovery-scan.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 import { sourceMirrorReadOnly } from './mirror-read-only.ts';
+import { isLockOpenFailure } from './native-lock.ts';
 
 const effectStatusFix = (effect: Pick<PersistenceEffect, 'source_id'>): Action => readFix(
   `Shows source ${effect.source_id}'s canonical owner with its blocking, retrying and parked effects, read-only.`,
@@ -144,7 +145,7 @@ async function recordSkippedTarget(engine: BrainEngine, effect: PersistenceEffec
  * so its legacy page and file diverge; a scan never publishes either one to the other.
  */
 function isMetafilePage(snapshot: PageSnapshot): boolean {
-  return !!snapshot.page.source_path && (SYNC_SKIP_FILES as readonly string[]).includes(basename(snapshot.page.source_path));
+  return !!snapshot.page.source_path && isSyncMetafile(snapshot.page.source_path);
 }
 
 function isFileDatabaseDrift(error: unknown): boolean {
@@ -413,7 +414,7 @@ function embeddingStorageFailure(error: unknown): unknown {
 }
 
 async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, error: unknown, signal?: AbortSignal, target?: string): Promise<void> {
-  const code = error instanceof OperationError ? error.code : 'effect_unavailable';
+  const code = error instanceof OperationError ? error.code : isLockOpenFailure(error) ? error.code : 'effect_unavailable';
   // Source replacement is final only without recovery. Unknown physical bytes
   // retain their record and continue to block this root for explicit repair.
   if (code === 'source_changed' && !effect.recovery) {
@@ -463,7 +464,8 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
 
 /** Waits that say nothing about the target never count toward parking. */
 const CONTENTION_CODES = ['projection_pending', 'revision_conflict', 'writer_busy', 'writer_pool_capacity', 'git_index_locked'];
-const DEPENDENCY_CODES = ['recovery_required', 'owner_unavailable', 'write_claim_lost', 'queue_capacity'];
+// #6305: writer_lock_unavailable is this process failing to open the lock file, not the effect failing; it never parks the effect.
+const DEPENDENCY_CODES = ['recovery_required', 'owner_unavailable', 'write_claim_lost', 'queue_capacity', 'writer_lock_unavailable'];
 
 /**
  * A scan sets its failing target aside and moves on; a single-target effect,
@@ -683,7 +685,8 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       } catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
       if (effect.kind === 'git' && binding?.local_path) {
         const root = binding.local_path;
-        if (!probes.has(root)) probes.set(root, isDurabilityHardenedAsync(root).then(durable => ({ durable }), error => ({ error })));
+        // #5182: the binding's recorded setting decides; the legacy hook probe only when nothing is recorded (fail-closed).
+        if (!probes.has(root)) probes.set(root, gitDurabilityPolicy(binding, root).then(policy => ({ durable: policy.durable }), error => ({ error })));
         const group = singleFileGitEffect(effect) && effect.worktree_id
           ? [effect, ...await claimCoalescedGitEffects(engine, opts.hostId, effect.worktree_id, GIT_GROUP_SIZE - 1)] : [effect];
         deferred.push({ effects: group, binding, hardened: probes.get(root)! });

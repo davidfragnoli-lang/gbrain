@@ -348,7 +348,7 @@ and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
 
 **Say to your agent:** *"Upgrade my brain to Postgres. Show me the plan first."*
 
-The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`).
+The legacy copier handles every other direction: `gbrain migrate --to pglite`, PGLite to Postgres when `gbrain config set migrate.graduation false` opts out of graduation, and history-free brains on Windows. It re-creates pages through `putPage` (chunks, embeddings, links, tags, timeline, facts) and copies config rows minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. It forwards the full page row (origin path, kind, provenance, `ingested_at`, aliases, chunk code metadata). Pages the source had sealed are rebuilt on the target before the config flip, without an embedding key, keeping chunk ids and vectors whose input matches. A failed rebuild blocks the flip: the run exits 1 with no error code, prints `The active engine was NOT switched` and the failing pages, and leaves the source engine active; fix them (`gbrain projections drain` on the target) and re-run `gbrain migrate` to resume. Pages the source had not sealed arrive queued, with their verbatim chunks. It does not carry request IDs, withdrawals, attribution or ownership, so it refuses a managed brain and any brain with durable write history, fact withdrawals or canonical worktree ownership (rows in `persistence_requests`, `fact_withdrawals` or `persistence_worktrees`).
 
 <a id="engine-migration-refused"></a>**Engine migration refused (`writer_coordinator_required`).** The legacy copier's refusal is an agent-contract envelope whose `fix` names the refusing side; every branch verifies with the read-only `gbrain doctor --no-migrate --json`, and nothing has changed in either datastore:
 
@@ -697,6 +697,33 @@ the operations that preceded them. A pool created with `max: 1` keeps the
 driver's documented single-connection idiom (`BEGIN` as an ordinary query)
 for unreserved statements.
 
+<a id="schema-lock-blocked"></a>**`schema_lock_blocked`** (error, retryable).
+A schema step waited its `lock_timeout` for a table lock another session holds
+and stopped instead of hanging (#5227). `gbrain init` and `upgrade` replay
+`schema.sql` on the reserved DDL backend; every `ALTER TABLE` there takes an
+ACCESS EXCLUSIVE lock even as a no-op, so one open transaction in another
+client (idle in transaction, a stuck job) used to park the whole command in
+`wait_event_type=Lock` with no output. The replay runs under a session-level
+`lock_timeout` on that backend (`GBRAIN_SCHEMA_LOCK_TIMEOUT_SECONDS`, default
+60; the value found before is restored on release, so a pooled backend never
+leaks it), a transaction-wrapped migration binds the same wait with
+`SET LOCAL lock_timeout`, and a `transaction: false` migration sets and
+restores it on its own reserved backend. Handler migrations and the
+post-migration `verifySchema` run outside the bound: they issue their own
+statements (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) and stay
+as they were. While the wait is active a separate one-backend connection
+samples `pg_blocking_pids()` of the waiting backend once, so the refusal names
+the blocking sessions by pid, `application_name`, state and transaction age;
+after the cancel the blocker may already be gone, and the message says when the
+sample came late. Query text is never read or shown. `detail` names the step
+(`replay`, `migration v<N>`). The RLS block skips tables whose
+`relrowsecurity` is already set, so a re-run on a live brain no longer takes
+ACCESS EXCLUSIVE on them. `init` retries a blocked step a few times with a
+short backoff (`init-schema-retry.ts`); a lock that never clears is a bounded
+failure, not a hang. Fix: let the named session finish or, with the user's
+agreement, end it on the database host with `SELECT pg_terminate_backend(<pid>)`,
+then rerun the same command. Test: `test/e2e/init-schema-lock-blocked.test.ts`.
+
 <a id="pg-connection-stuck"></a>**`pg_connection_stuck`** (warn). A pooled
 statement waited past the pool's `statement_timeout` plus a grace with nothing
 coming back from the server, so the vendored driver retired that connection:
@@ -719,6 +746,20 @@ text or parameters. `getPoolDiagnostics().stuckDiscards` counts retirements per
 engine; `/health?deep=1` reports them as `stuck_discards`. Retry the failed
 call; if the line repeats, run `gbrain doctor --json` and report the warn lines
 with the operations that preceded them.
+
+<a id="pg-connection-desync"></a>**`pg_connection_desync`** (warn). A statement's
+answer (columns, rows, a completion, a parse or bind acknowledgement, or a
+statement error) arrived on a pooled connection with no statement waiting for
+it, so the client and the server no longer agreed on which answer belonged to
+which statement. The vendored driver retired that connection, statements
+queued on it failed with a connection error, and the pool reconnected on its
+own. The line names the pool, the message type, the driver's connection id and
+the last statement written on it by first keyword and table, never its text or
+parameters. Notices, notifications and parameter changes never trigger it.
+`getPoolDiagnostics().desyncDiscards` counts retirements per engine;
+`/health?deep=1` reports them as `desync_discards`.
+Retry the failed call; if the line repeats, run `gbrain doctor --json` and
+report the warn lines.
 
 <a id="pg-statement-build-failed"></a>**`pg_statement_build_failed`** (warn). A
 statement could not be built from its parameters (`error=UNDEFINED_VALUE`: a
@@ -758,7 +799,7 @@ probe does not return in time, when `inflight_oldest_ms` is past the read
 pool's in-flight budget, or when an earlier deep probe is still pending (one
 deep probe per engine at a time). Its body carries the pool block:
 `{ checked_out, max, waiters, inflight_oldest_ms, completed, poisoned_discards,
-stuck_discards, build_failures }`. It is cheap enough for a two-minute cron. The
+stuck_discards, build_failures, desync_discards }`. It is cheap enough for a two-minute cron. The
 same pool numbers ride the persistence consumer's heartbeat row, so
 `gbrain sources writer status --json` shows `pool.inflight_oldest_ms` for the
 owner process.

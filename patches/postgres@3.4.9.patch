@@ -1,5 +1,5 @@
 diff --git a/cjs/src/connection.js b/vendor/postgres/cjs/src/connection.js
-index 07f67167..472ac81e 100644
+index 07f67167..1d6ea0a5 100644
 --- a/cjs/src/connection.js
 +++ b/vendor/postgres/cjs/src/connection.js
 @@ -20,6 +20,7 @@ const Sync = b().S().end()
@@ -15,7 +15,7 @@ index 07f67167..472ac81e 100644
  }
  
 -function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
-+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop } = {}) {
++function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop, ondesync = noop } = {}) {
    const {
      sslnegotiation,
      ssl,
@@ -33,7 +33,17 @@ index 07f67167..472ac81e 100644
      , errorResponse = null
      , result = new Result()
      , incoming = Buffer.alloc(0)
-@@ -105,11 +110,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -95,6 +100,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     , rows = 0
+     , serverSignature = null
+     , nextWriteTimer = null
++    , lastWritten = null
++    , lastExecuted = null
++    , deferredRetries = []
+     , terminated = false
+     , incomings = null
+     , results = null
+@@ -105,11 +113,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      , ended = null
      , nonce = null
      , query = null
@@ -47,7 +57,7 @@ index 07f67167..472ac81e 100644
      connect(query) {
        initial = query
        reconnect()
-@@ -143,11 +150,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -143,11 +153,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function cancel({ pid, secret }, resolve, reject) {
@@ -63,7 +73,7 @@ index 07f67167..472ac81e 100644
      } catch (error) {
        reject(error)
      }
-@@ -167,21 +176,70 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -167,21 +179,72 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        q.state = backend
        query
          ? sent.push(q)
@@ -71,6 +81,8 @@ index 07f67167..472ac81e 100644
 +        : (query = q, query.active = true, armInflight())
  
        build(q)
++      lastWritten = q
++      lastExecuted = q
 +      const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
        return write(toBuffer(q))
          && !q.describeFirst
@@ -138,7 +150,7 @@ index 07f67167..472ac81e 100644
    function toBuffer(q) {
      if (q.parameters.length >= 65534)
        throw Errors.generic('MAX_PARAMETERS_EXCEEDED', 'Max number of parameters (65534) exceeded')
-@@ -235,10 +293,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -235,10 +298,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      q.onlyDescribe && (delete statements[q.signature])
      q.parameters = q.parameters || parameters
      q.prepared = q.prepare && q.signature in statements
@@ -156,7 +168,7 @@ index 07f67167..472ac81e 100644
  
      typeof options.debug === 'function' && options.debug(id, string, parameters, types)
    }
-@@ -295,10 +358,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -295,10 +363,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
    /* c8 ignore next 3 */
    function drain() {
@@ -169,7 +181,7 @@ index 07f67167..472ac81e 100644
      if (incomings) {
        incomings.push(x)
        remaining -= x.length
-@@ -379,6 +443,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -379,15 +448,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function error(err) {
@@ -178,7 +190,11 @@ index 07f67167..472ac81e 100644
      if (connection.queue === queues.connecting && options.host[retries + 1])
        return
  
-@@ -388,6 +454,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     errored(err)
+     while (sent.length)
+       queryError(sent.shift(), err)
++    while (deferredRetries.length)
++      queryError(deferredRetries.shift(), err)
    }
  
    function errored(err) {
@@ -187,7 +203,7 @@ index 07f67167..472ac81e 100644
      stream && (stream.destroy(err), stream = null)
      query && queryError(query, err)
      initial && (queryError(initial, err), initial = null)
-@@ -438,19 +506,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -438,19 +513,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      remaining = 0
      incomings = null
      clearImmediate(nextWriteTimer)
@@ -227,11 +243,60 @@ index 07f67167..472ac81e 100644
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -533,8 +620,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -459,6 +553,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+   /* Handlers */
+   function handle(xs, x = xs[0]) {
++    if (!query && !initial && !stream && answersStatement(xs, x)) {
++      desynced(x)
++      return
++    }
+     (
+       x === 68 ? DataRow :                   // D
+       x === 100 ? CopyData :                 // d
+@@ -489,6 +587,36 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     )(xs)
+   }
+ 
++  // GBrain: a message that answers a statement (its columns, rows, completion, parse/bind acknowledgements or a
++  // statement error) arriving when no statement is waiting for one means the client and the server no longer
++  // agree on which answer belongs to which statement: every later answer on this connection would be read for
++  // the wrong query. The connection is retired and everything queued on it fails with CONNECTION_DESYNC.
++  // Notices, parameter changes, notifications, ReadyForQuery and a FATAL/PANIC error legitimately arrive
++  // without a statement and pass through.
++  function answersStatement(xs, x) {
++    if (x === 84 || x === 68 || x === 67 || x === 73 || x === 49 || x === 50 || x === 116 || x === 110)
++      return true
++    if (x !== 69)
++      return false
++    const fields = parseError(xs)
++    const severity = fields.severity || fields.severity_local
++    return severity !== 'FATAL' && severity !== 'PANIC'
++  }
++
++  function desynced(x) {
++    const s = socket
++    const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
++    error(Errors.connection('CONNECTION_DESYNC', options, socket))
++    query = null
++    connection.inflightSince = 0
++    ondesync(connection, info)
++    terminate()
++    if (s && !s.destroyed) {
++      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
++      t.unref && t.unref()
++    }
++  }
++
+   function DataRow(x) {
+     let index = 7
+     let length
+@@ -533,13 +661,23 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function ReadyForQuery(x) {
 +    connection.status = x[5]
++    query && query === lastWritten && (lastWritten = null)
 +    connection.inflightSince = 0
      if (query) {
 +      options.shared.completed++
@@ -240,8 +305,18 @@ index 07f67167..472ac81e 100644
 +        query.sharedTypes && options.shared_types.delete(query.typesKey)
          query.retried
            ? errored(query.retried)
-           : query.prepared && retryRoutines.has(errorResponse.routine)
-@@ -550,6 +642,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+-          : query.prepared && retryRoutines.has(errorResponse.routine)
++          : query.prepared && retryRoutines.has(errorResponse.routine) && !query.cancelled
+             ? retry(query, errorResponse)
+             : errored(errorResponse)
++      } else if (query.cancelled) {
++        // GBrain: a query cancelled while it waited behind another one on this connection still gets the
++        // server's answer to it; that answer is consumed here and the query rejects as cancelled.
++        query.reject(Errors.generic('57014', 'canceling statement due to user request'))
+       } else {
+         query.resolve(results || result)
+       }
+@@ -550,6 +688,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      query = results = errorResponse = null
      result = new Result()
      connectTimer.cancel()
@@ -249,7 +324,7 @@ index 07f67167..472ac81e 100644
  
      if (initial) {
        if (target_session_attrs) {
-@@ -564,23 +657,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -564,23 +703,36 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          return fetchArrayTypes()
        }
  
@@ -263,8 +338,21 @@ index 07f67167..472ac81e 100644
 +        return
      }
  
-     while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
+-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
++    // GBrain: the stock loop skipped a query cancelled while it waited behind another one, so the answer the
++    // server still sent for it was read for the next query (the next query resolved with another statement's
++    // rows, and the cancelled one never settled). The cancelled query stays current and absorbs its own answer.
++    // A server cancel targets the backend, not a statement, so it is only sent when nothing is pipelined behind.
++    if (sent.length) {
++      query = sent.shift()
++      query.active = true
++      query.cancelled && (sent.length
++        ? query.cancelled.resolve()
++        : Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject))
++    }
++
++    flushRetries()
  
      if (query)
 -      return // Consider opening if able and sent.length < 50
@@ -279,7 +367,7 @@ index 07f67167..472ac81e 100644
          : connection.reserved()
        : ending
          ? terminate()
-@@ -630,6 +725,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -630,7 +782,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !query.statement.types[i] && (query.statement.types[i] = x.readUInt32BE(7 + i * 4))
  
      query.prepare && (statements[query.signature] = query.statement)
@@ -287,9 +375,11 @@ index 07f67167..472ac81e 100644
 +    query.typesKey && query.statement.types.every(t => t > 0 && t < 16384)
 +      && options.shared_types.set(query.typesKey, query.statement.types.slice())
      query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
++    flushRetries()
    }
  
-@@ -767,14 +865,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function RowDescription(x) {
+@@ -767,14 +923,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
    async function fetchArrayTypes() {
      needsTypes = false
@@ -319,8 +409,26 @@ index 07f67167..472ac81e 100644
      types.forEach(({ oid, typarray }) => addArrayType(oid, typarray))
    }
  
+@@ -821,7 +984,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function retry(q, error) {
+     delete statements[q.signature]
+     q.retried = error
+-    execute(q)
++    deferredRetries.push(q)
++    flushRetries()
++  }
++
++  // GBrain: a describe-first or cursor query writes its next messages only when the server answers its first
++  // ones. A retry written in that gap lands between them on the wire, and every later response is then read
++  // for the wrong query (rows built with another statement's columns). Retries wait for that query.
++  function flushRetries() {
++    while (deferredRetries.length && !(lastWritten && (lastWritten.describeFirst || lastWritten.cursorFn)))
++      execute(deferredRetries.shift())
+   }
+ 
+   function NotificationResponse(x) {
 diff --git a/cjs/src/index.js b/vendor/postgres/cjs/src/index.js
-index f09c61c7..abb4a158 100644
+index f09c61c7..dc7e234d 100644
 --- a/cjs/src/index.js
 +++ b/vendor/postgres/cjs/src/index.js
 @@ -62,10 +62,34 @@ function Postgres(a, b) {
@@ -328,7 +436,7 @@ index f09c61c7..abb4a158 100644
        , queues = { connecting, reserved, closed, ended, open, busy, full }
  
 -  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose }))
-+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
++  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
  
    const sql = Sql(handler)
  
@@ -610,7 +718,7 @@ index f09c61c7..abb4a158 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +566,41 @@ function Postgres(a, b) {
+@@ -418,12 +566,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -620,6 +728,15 @@ index f09c61c7..abb4a158 100644
 +    c.queue !== ended && move(c, ended)
 +    try {
 +      options.onstuck && options.onstuck(info)
++    } catch (_) {}
++  }
++
++  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
++  function ondesync(c, info) {
++    c.queue !== ended && move(c, ended)
++    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
++    try {
++      options.ondesync && options.ondesync(info)
 +    } catch (_) {}
 +  }
 +
@@ -653,7 +770,7 @@ index f09c61c7..abb4a158 100644
    }
  }
  
-@@ -444,7 +621,7 @@ function parseOptions(a, b) {
+@@ -444,7 +630,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -662,7 +779,7 @@ index f09c61c7..abb4a158 100644
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +630,7 @@ function parseOptions(a, b) {
+@@ -453,6 +639,7 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
@@ -670,13 +787,14 @@ index f09c61c7..abb4a158 100644
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +669,15 @@ function parseOptions(a, b) {
+@@ -491,11 +678,16 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
 +    onpoisoned      : o.onpoisoned,
 +    onstuck         : o.onstuck,
 +    onbuilderror    : o.onbuilderror,
++    ondesync        : o.ondesync,
 +    shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
      onparameter     : o.onparameter,
      socket          : o.socket,
@@ -744,7 +862,7 @@ index 8438f5da..c444310f 100644
        const out = xs[index++]
  
 diff --git a/src/connection.js b/vendor/postgres/src/connection.js
-index 1b1cccde..a178b3b6 100644
+index 1b1cccde..37824bf4 100644
 --- a/src/connection.js
 +++ b/vendor/postgres/src/connection.js
 @@ -20,6 +20,7 @@ const Sync = b().S().end()
@@ -760,7 +878,7 @@ index 1b1cccde..a178b3b6 100644
  }
  
 -function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop } = {}) {
-+function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop } = {}) {
++function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose = noop, onstuck = noop, ondesync = noop } = {}) {
    const {
      sslnegotiation,
      ssl,
@@ -778,7 +896,17 @@ index 1b1cccde..a178b3b6 100644
      , errorResponse = null
      , result = new Result()
      , incoming = Buffer.alloc(0)
-@@ -105,11 +110,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -95,6 +100,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     , rows = 0
+     , serverSignature = null
+     , nextWriteTimer = null
++    , lastWritten = null
++    , lastExecuted = null
++    , deferredRetries = []
+     , terminated = false
+     , incomings = null
+     , results = null
+@@ -105,11 +113,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      , ended = null
      , nonce = null
      , query = null
@@ -792,7 +920,7 @@ index 1b1cccde..a178b3b6 100644
      connect(query) {
        initial = query
        reconnect()
-@@ -143,11 +150,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -143,11 +153,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function cancel({ pid, secret }, resolve, reject) {
@@ -808,7 +936,7 @@ index 1b1cccde..a178b3b6 100644
      } catch (error) {
        reject(error)
      }
-@@ -167,21 +176,70 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -167,21 +179,72 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        q.state = backend
        query
          ? sent.push(q)
@@ -816,6 +944,8 @@ index 1b1cccde..a178b3b6 100644
 +        : (query = q, query.active = true, armInflight())
  
        build(q)
++      lastWritten = q
++      lastExecuted = q
 +      const mayPipeline = !q.options.onexecute || q.options.onexecute(connection)
        return write(toBuffer(q))
          && !q.describeFirst
@@ -883,7 +1013,7 @@ index 1b1cccde..a178b3b6 100644
    function toBuffer(q) {
      if (q.parameters.length >= 65534)
        throw Errors.generic('MAX_PARAMETERS_EXCEEDED', 'Max number of parameters (65534) exceeded')
-@@ -235,10 +293,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -235,10 +298,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      q.onlyDescribe && (delete statements[q.signature])
      q.parameters = q.parameters || parameters
      q.prepared = q.prepare && q.signature in statements
@@ -901,7 +1031,7 @@ index 1b1cccde..a178b3b6 100644
  
      typeof options.debug === 'function' && options.debug(id, string, parameters, types)
    }
-@@ -295,10 +358,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -295,10 +363,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
    /* c8 ignore next 3 */
    function drain() {
@@ -914,7 +1044,7 @@ index 1b1cccde..a178b3b6 100644
      if (incomings) {
        incomings.push(x)
        remaining -= x.length
-@@ -379,6 +443,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -379,15 +448,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function error(err) {
@@ -923,7 +1053,11 @@ index 1b1cccde..a178b3b6 100644
      if (connection.queue === queues.connecting && options.host[retries + 1])
        return
  
-@@ -388,6 +454,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     errored(err)
+     while (sent.length)
+       queryError(sent.shift(), err)
++    while (deferredRetries.length)
++      queryError(deferredRetries.shift(), err)
    }
  
    function errored(err) {
@@ -932,7 +1066,7 @@ index 1b1cccde..a178b3b6 100644
      stream && (stream.destroy(err), stream = null)
      query && queryError(query, err)
      initial && (queryError(initial, err), initial = null)
-@@ -438,19 +506,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -438,19 +513,38 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      remaining = 0
      incomings = null
      clearImmediate(nextWriteTimer)
@@ -972,11 +1106,60 @@ index 1b1cccde..a178b3b6 100644
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -533,8 +620,13 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -459,6 +553,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+   /* Handlers */
+   function handle(xs, x = xs[0]) {
++    if (!query && !initial && !stream && answersStatement(xs, x)) {
++      desynced(x)
++      return
++    }
+     (
+       x === 68 ? DataRow :                   // D
+       x === 100 ? CopyData :                 // d
+@@ -489,6 +587,36 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     )(xs)
+   }
+ 
++  // GBrain: a message that answers a statement (its columns, rows, completion, parse/bind acknowledgements or a
++  // statement error) arriving when no statement is waiting for one means the client and the server no longer
++  // agree on which answer belongs to which statement: every later answer on this connection would be read for
++  // the wrong query. The connection is retired and everything queued on it fails with CONNECTION_DESYNC.
++  // Notices, parameter changes, notifications, ReadyForQuery and a FATAL/PANIC error legitimately arrive
++  // without a statement and pass through.
++  function answersStatement(xs, x) {
++    if (x === 84 || x === 68 || x === 67 || x === 73 || x === 49 || x === 50 || x === 116 || x === 110)
++      return true
++    if (x !== 69)
++      return false
++    const fields = parseError(xs)
++    const severity = fields.severity || fields.severity_local
++    return severity !== 'FATAL' && severity !== 'PANIC'
++  }
++
++  function desynced(x) {
++    const s = socket
++    const info = { message: String.fromCharCode(x), connection: id, statement: lastExecuted ? statementText(lastExecuted) : '' }
++    error(Errors.connection('CONNECTION_DESYNC', options, socket))
++    query = null
++    connection.inflightSince = 0
++    ondesync(connection, info)
++    terminate()
++    if (s && !s.destroyed) {
++      const t = setTimeout(() => s.destroyed || s.destroy(), 1000)
++      t.unref && t.unref()
++    }
++  }
++
+   function DataRow(x) {
+     let index = 7
+     let length
+@@ -533,13 +661,23 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function ReadyForQuery(x) {
 +    connection.status = x[5]
++    query && query === lastWritten && (lastWritten = null)
 +    connection.inflightSince = 0
      if (query) {
 +      options.shared.completed++
@@ -985,8 +1168,18 @@ index 1b1cccde..a178b3b6 100644
 +        query.sharedTypes && options.shared_types.delete(query.typesKey)
          query.retried
            ? errored(query.retried)
-           : query.prepared && retryRoutines.has(errorResponse.routine)
-@@ -550,6 +642,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+-          : query.prepared && retryRoutines.has(errorResponse.routine)
++          : query.prepared && retryRoutines.has(errorResponse.routine) && !query.cancelled
+             ? retry(query, errorResponse)
+             : errored(errorResponse)
++      } else if (query.cancelled) {
++        // GBrain: a query cancelled while it waited behind another one on this connection still gets the
++        // server's answer to it; that answer is consumed here and the query rejects as cancelled.
++        query.reject(Errors.generic('57014', 'canceling statement due to user request'))
+       } else {
+         query.resolve(results || result)
+       }
+@@ -550,6 +688,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      query = results = errorResponse = null
      result = new Result()
      connectTimer.cancel()
@@ -994,7 +1187,7 @@ index 1b1cccde..a178b3b6 100644
  
      if (initial) {
        if (target_session_attrs) {
-@@ -564,23 +657,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -564,23 +703,36 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          return fetchArrayTypes()
        }
  
@@ -1008,8 +1201,21 @@ index 1b1cccde..a178b3b6 100644
 +        return
      }
  
-     while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-       Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
+-    while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
+-      Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject)
++    // GBrain: the stock loop skipped a query cancelled while it waited behind another one, so the answer the
++    // server still sent for it was read for the next query (the next query resolved with another statement's
++    // rows, and the cancelled one never settled). The cancelled query stays current and absorbs its own answer.
++    // A server cancel targets the backend, not a statement, so it is only sent when nothing is pipelined behind.
++    if (sent.length) {
++      query = sent.shift()
++      query.active = true
++      query.cancelled && (sent.length
++        ? query.cancelled.resolve()
++        : Connection(options).cancel(query.state, query.cancelled.resolve, query.cancelled.reject))
++    }
++
++    flushRetries()
  
      if (query)
 -      return // Consider opening if able and sent.length < 50
@@ -1024,7 +1230,7 @@ index 1b1cccde..a178b3b6 100644
          : connection.reserved()
        : ending
          ? terminate()
-@@ -630,6 +725,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -630,7 +782,11 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !query.statement.types[i] && (query.statement.types[i] = x.readUInt32BE(7 + i * 4))
  
      query.prepare && (statements[query.signature] = query.statement)
@@ -1032,9 +1238,11 @@ index 1b1cccde..a178b3b6 100644
 +    query.typesKey && query.statement.types.every(t => t > 0 && t < 16384)
 +      && options.shared_types.set(query.typesKey, query.statement.types.slice())
      query.describeFirst && !query.onlyDescribe && (write(prepared(query)), query.describeFirst = false)
++    flushRetries()
    }
  
-@@ -767,14 +865,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function RowDescription(x) {
+@@ -767,14 +923,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
    async function fetchArrayTypes() {
      needsTypes = false
@@ -1064,8 +1272,26 @@ index 1b1cccde..a178b3b6 100644
      types.forEach(({ oid, typarray }) => addArrayType(oid, typarray))
    }
  
+@@ -821,7 +984,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   function retry(q, error) {
+     delete statements[q.signature]
+     q.retried = error
+-    execute(q)
++    deferredRetries.push(q)
++    flushRetries()
++  }
++
++  // GBrain: a describe-first or cursor query writes its next messages only when the server answers its first
++  // ones. A retry written in that gap lands between them on the wire, and every later response is then read
++  // for the wrong query (rows built with another statement's columns). Retries wait for that query.
++  function flushRetries() {
++    while (deferredRetries.length && !(lastWritten && (lastWritten.describeFirst || lastWritten.cursorFn)))
++      execute(deferredRetries.shift())
+   }
+ 
+   function NotificationResponse(x) {
 diff --git a/src/index.js b/vendor/postgres/src/index.js
-index c7fba3da..32efd8bf 100644
+index c7fba3da..6718a17d 100644
 --- a/src/index.js
 +++ b/vendor/postgres/src/index.js
 @@ -62,10 +62,34 @@ function Postgres(a, b) {
@@ -1073,7 +1299,7 @@ index c7fba3da..32efd8bf 100644
        , queues = { connecting, reserved, closed, ended, open, busy, full }
  
 -  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose }))
-+  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck }))
++  const connections = [...Array(options.max)].map(() => Connection(options, queues, { onopen, onend, onclose, onstuck, ondesync }))
  
    const sql = Sql(handler)
  
@@ -1355,7 +1581,7 @@ index c7fba3da..32efd8bf 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +566,41 @@ function Postgres(a, b) {
+@@ -418,12 +566,50 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -1365,6 +1591,15 @@ index c7fba3da..32efd8bf 100644
 +    c.queue !== ended && move(c, ended)
 +    try {
 +      options.onstuck && options.onstuck(info)
++    } catch (_) {}
++  }
++
++  // GBrain: a connection whose answers no longer match its statements leaves rotation before its socket closes.
++  function ondesync(c, info) {
++    c.queue !== ended && move(c, ended)
++    c.reserved && c.reserved.reject && c.reserved.reject(Errors.generic('CONNECTION_DESYNC', 'The connection was retired: an answer arrived for no statement'))
++    try {
++      options.ondesync && options.ondesync(info)
 +    } catch (_) {}
 +  }
 +
@@ -1398,7 +1633,7 @@ index c7fba3da..32efd8bf 100644
    }
  }
  
-@@ -444,7 +621,7 @@ function parseOptions(a, b) {
+@@ -444,7 +630,7 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -1407,7 +1642,7 @@ index c7fba3da..32efd8bf 100644
    const defaults = {
      max             : globalThis.Cloudflare ? 3 : 10,
      ssl             : false,
-@@ -453,6 +630,7 @@ function parseOptions(a, b) {
+@@ -453,6 +639,7 @@ function parseOptions(a, b) {
      connect_timeout : 30,
      max_lifetime    : max_lifetime,
      max_pipeline    : 100,
@@ -1415,13 +1650,14 @@ index c7fba3da..32efd8bf 100644
      backoff         : backoff,
      keep_alive      : 60,
      prepare         : true,
-@@ -491,11 +669,15 @@ function parseOptions(a, b) {
+@@ -491,11 +678,16 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
 +    onpoisoned      : o.onpoisoned,
 +    onstuck         : o.onstuck,
 +    onbuilderror    : o.onbuilderror,
++    ondesync        : o.ondesync,
 +    shared_types    : o.shared_types === false ? null : o.shared_types instanceof Map ? o.shared_types : new Map(),
      onparameter     : o.onparameter,
      socket          : o.socket,
@@ -1489,10 +1725,10 @@ index c4ef9716..8fba891b 100644
        const out = xs[index++]
  
 diff --git a/types/index.d.ts b/vendor/postgres/types/index.d.ts
-index 13c3432f..36233121 100644
+index 13c3432f..53127d62 100644
 --- a/types/index.d.ts
 +++ b/vendor/postgres/types/index.d.ts
-@@ -119,6 +119,32 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
+@@ -119,6 +119,37 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
     */
    publications: string
    onclose: (connId: number) => void;
@@ -1516,6 +1752,11 @@ index 13c3432f..36233121 100644
 +   */
 +  onbuilderror: (code: string, statement: string) => void;
 +  /**
++   * GBrain: called once per connection retired because a statement's answer arrived with no statement
++   * waiting for it; `statement` is the last statement written on it, with `$n` placeholders.
++   */
++  ondesync: (desync: { message: string; connection: number; statement: string }) => void;
++  /**
 +   * GBrain: share the parameter types of a described statement across this pool's
 +   * connections, so a connection running it for the first time skips the describe
 +   * round trip and keeps pipelining. Only built-in types are shared.
@@ -1525,7 +1766,7 @@ index 13c3432f..36233121 100644
    backoff: boolean | ((attemptNum: number) => number);
    max_lifetime: number | null;
    keep_alive: number | null;
-@@ -605,7 +631,7 @@ declare namespace postgres {
+@@ -605,7 +636,7 @@ declare namespace postgres {
      writable(): Promise<Writable>;
  
      execute(): this;
@@ -1534,7 +1775,7 @@ index 13c3432f..36233121 100644
  
      /**
       * @deprecated `.stream` has been renamed to `.forEach`
-@@ -659,6 +685,7 @@ declare namespace postgres {
+@@ -659,6 +690,7 @@ declare namespace postgres {
    | Fragment[]
  
    interface UnsafeQueryOptions {
@@ -1542,7 +1783,7 @@ index 13c3432f..36233121 100644
      /**
       * When executes query as prepared statement.
       * @default false
-@@ -705,6 +732,8 @@ declare namespace postgres {
+@@ -705,6 +737,8 @@ declare namespace postgres {
  
      options: ParsedOptions<TTypes>;
      parameters: ConnectionParameters;
@@ -1551,7 +1792,7 @@ index 13c3432f..36233121 100644
  
      end(options?: { timeout?: number | undefined } | undefined): Promise<void>;
  
-@@ -717,10 +746,11 @@ declare namespace postgres {
+@@ -717,10 +751,11 @@ declare namespace postgres {
      begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
@@ -1564,7 +1805,7 @@ index 13c3432f..36233121 100644
      savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
-@@ -728,6 +758,7 @@ declare namespace postgres {
+@@ -728,6 +763,7 @@ declare namespace postgres {
    }
  
    interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
