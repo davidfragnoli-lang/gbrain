@@ -557,6 +557,18 @@ interface QuestionOutcome {
   expansionFailed: boolean;
 }
 
+/**
+ * Paid-free probe retrieval keeps the natural-language and expanded queries,
+ * then adds stable hyphenated entity identifiers from the question. FTS can
+ * otherwise interpret `alice-example` inside a sentence as punctuation/NOT
+ * syntax; the exact identifier query is both gold-independent and sufficient
+ * to recover the session set for the reader.
+ */
+export function keywordExpansionQueries(question: string, variants: readonly string[]): string[] {
+  const entityIds = question.match(/\b[\p{L}\p{N}_]+(?:-[\p{L}\p{N}_]+)+\b/gu) ?? [];
+  return [...new Set([question, ...variants, ...entityIds])];
+}
+
 /** Resolve the pins for this run from flags + the injected snapshot (no engine read). */
 function resolvePins(opts: ParsedArgs, runOpts: RunOpts, trajectoryEnabled: boolean, decide: decideLane.DecideEvalRun | null): { pins: RetrievalPins; knobs: ResolvedSearchKnobs } {
   // Generic --search-pin entries ride the same override plane as the injected snapshot (explicit pins win),
@@ -1426,14 +1438,14 @@ async function runOneQuestion(
       if (!expandFn) return engine.searchKeyword(q.question, { limit: opts.topK });
       const variants = await expandFn(q.question);
       const merged = new Map<string, SearchResult>();
-      for (const query of [q.question, ...variants]) {
+      for (const query of keywordExpansionQueries(q.question, variants)) {
         for (const result of await engine.searchKeyword(query, { limit: opts.topK })) {
           const key = `${result.page_id}:${result.chunk_id}`;
           const prior = merged.get(key);
           if (!prior || result.score > prior.score) merged.set(key, result);
         }
       }
-      meta = { vector_enabled: false, expansion_applied: variants.length > 0, degraded: [] } as HybridSearchMeta;
+      meta = { vector_enabled: false, detail_resolved: null, expansion_applied: variants.length > 0, degraded: [] } as HybridSearchMeta;
       return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, opts.topK);
     }
     const searchOpts: HybridSearchOpts = {

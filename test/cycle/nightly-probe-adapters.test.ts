@@ -22,6 +22,7 @@ import {
   buildLongMemEvalProbeCall,
   runCrossModalBatchForProbe,
 } from '../../src/core/cycle/nightly-probe-adapters.ts';
+import { keywordExpansionQueries } from '../../src/commands/eval-longmemeval.ts';
 import type { NightlyProbeModelRoutes } from '../../src/core/cycle/nightly-probe-routes.ts';
 import type { QualityProbeFailure } from '../../src/core/audit-quality-probe.ts';
 import {
@@ -249,6 +250,17 @@ describe('nightly-probe-adapters: model routes reach the eval commands', () => {
       expect(written.slots[1]).toEqual({ id: 'B', model: 'claude-cli:claude-fable-5' });
     });
   });
+});
+
+test('paid-free keyword expansion includes stable entity identifiers without gold-answer terms', () => {
+  expect(keywordExpansionQueries(
+    'Where did alice-example say she lived last year?',
+    ['alice-example residence location previous year'],
+  )).toEqual([
+    'Where did alice-example say she lived last year?',
+    'alice-example residence location previous year',
+    'alice-example',
+  ]);
 });
 
 describe('nightly-probe-adapters: contract regression', () => {
