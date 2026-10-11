@@ -6,6 +6,7 @@ import { parseTimelineEntries } from '../src/core/link-extraction.ts';
 import { extractTimelineFromContent, hasExtractorDetail, retractRemovedTimelineEntries } from '../src/core/timeline-extract.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { renderMaterializedBullet } from '../src/core/persistence/canonical-projections.ts';
+import { timelineExtractRequestId } from '../src/commands/extract-timeline-db.ts';
 
 describe('#6184 inline-citation timeline parsing', () => {
   test('a comment-only line after a citation is a paragraph boundary, not the summary', () => {
@@ -120,6 +121,20 @@ describe('#6226 multi-source citations and emphasis', () => {
     expect(hasExtractorDetail({ source: 'call', detail: '' })).toBe(true);
     expect(hasExtractorDetail({ source: 'call', detail: 'Source: call' })).toBe(true);
     expect(hasExtractorDetail({ source: 'call', detail: 'confirmed by phone' })).toBe(false);
+  });
+});
+
+describe('#6226 managed timeline request identity', () => {
+  test('an unchanged page gets a new request when a parser upgrade changes its projection', () => {
+    const base = { removed: 0, entries: [{ date: '2026-09-23', source: 'old', summary: 'Observed pipeline:** intake' }] };
+    const corrected = { removed: 1, entries: [
+      { date: '2026-09-23', source: '`review.md`', summary: 'Observed pipeline: intake' },
+      { date: '2026-09-23', source: '`release.json`', summary: 'Observed pipeline: intake' },
+    ] };
+    const oldId = timelineExtractRequestId('default', 'concepts/operator', 'same-revision', base, 0);
+    const correctedId = timelineExtractRequestId('default', 'concepts/operator', 'same-revision', corrected, 0);
+    expect(correctedId).not.toBe(oldId);
+    expect(timelineExtractRequestId('default', 'concepts/operator', 'same-revision', corrected, 0)).toBe(correctedId);
   });
 });
 

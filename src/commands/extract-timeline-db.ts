@@ -43,6 +43,18 @@ const BATCH_SIZE = 100;
 export const TIMELINE_EXTRACT_INTENT = 'managed_maintenance_timeline_extract';
 export const TIMELINE_REFUSAL_DOCS = 'docs/guides/write-refusals.md#extract-timeline-refused';
 
+/**
+ * A maintenance request is idempotent for the projection it carries, not only
+ * for the page revision. Parser upgrades can derive a different canonical
+ * timeline from unchanged page bytes; binding the plan prevents an older
+ * committed receipt from making that new projection look complete.
+ */
+export function timelineExtractRequestId(sourceId: string, slug: string, revision: string,
+  plan: { removed: number; entries: ReadonlyArray<{ date: string; source?: string; summary: string; detail?: string }> }, attempt: number): string {
+  const h = digest(['extract-timeline-db-v2', sourceId, slug, revision, plan.removed, plan.entries, attempt]);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
 export interface TimelineDbResult {
   created: number;
   pages: number;
@@ -305,8 +317,7 @@ async function publishPageTimeline(engine: BrainEngine, authority: MaintenanceAu
   const plan = await plannedTimeline(engine, snapshot.page, slug, sourceId, opts.inferDates === true, read?.stored);
   if (!plan.removed && !plan.entries.length) return 0;
   for (let attempt = 0; ; attempt++) {
-    const h = digest(['extract-timeline-db-v1', sourceId, slug, snapshot.revision, attempt]);
-    const requestId = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    const requestId = timelineExtractRequestId(sourceId, slug, snapshot.revision, plan, attempt);
     const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
     if (prior && isTerminal(prior) && prior.state !== 'committed') continue;
     try {
