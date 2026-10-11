@@ -32,6 +32,13 @@ import {
 } from '../../src/core/ai/gateway.ts';
 import { emptyHome, withEnv } from '../helpers/with-env.ts';
 
+test('nightly temporal questions carry their fixture reference date', () => {
+  const fixture = readFileSync(join(import.meta.dir, '..', 'fixtures', 'longmemeval-nightly.jsonl'), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line) as { question_id: string; question_date?: string });
+  expect(fixture).toHaveLength(10);
+  expect(fixture.every(row => /^\d{4}-\d{2}-\d{2}$/.test(row.question_date ?? ''))).toBe(true);
+});
+
 // We can't easily mock the actual CLI functions without `mock.module`
 // (which would force this file to `*.serial.test.ts`). Instead, we test
 // the adapter's pure file-handling logic by mocking the imported function
@@ -127,7 +134,7 @@ describe('nightly-probe-adapters: argv shape regression (codex round-2 #1)', () 
     const fs = require('node:fs');
     const source = fs.readFileSync(path, 'utf-8');
     // longmemeval adapter: first positional arg is fixturePath, then --output outputPath.
-    expect(source).toContain("[args.fixturePath, '--output', args.outputPath, '--no-embed-cache']");
+    expect(source).toContain("[args.fixturePath, '--output', args.outputPath, '--no-embed-cache', '--reader-mode', 'direct']");
   });
 
   test('runLongMemEvalForProbe passes the live search config snapshot via RunOpts', () => {
@@ -161,12 +168,12 @@ describe('nightly-probe-adapters: model routes reach the eval commands', () => {
     {
       name: 'with routes: --model carries the reader, RunOpts.extractorModel the extractor',
       modelRoutes: ROUTES,
-      argv: ['/f.jsonl', '--output', '/w/lme.jsonl', '--no-embed-cache', '--model', 'claude-cli:claude-opus-5-5'],
+      argv: ['/f.jsonl', '--output', '/w/lme.jsonl', '--no-embed-cache', '--reader-mode', 'direct', '--model', 'claude-cli:claude-opus-5-5'],
       runOpts: { searchConfigSnapshot: SNAPSHOT, exitOnError: false, extractorModel: 'claude-cli:claude-sonnet-5' },
     },
     {
       name: 'no routes: the pre-#5872 call (embed cache off, C-N5)',
-      argv: ['/f.jsonl', '--output', '/w/lme.jsonl', '--no-embed-cache'],
+      argv: ['/f.jsonl', '--output', '/w/lme.jsonl', '--no-embed-cache', '--reader-mode', 'direct'],
       runOpts: { searchConfigSnapshot: SNAPSHOT, exitOnError: false },
     },
   ];

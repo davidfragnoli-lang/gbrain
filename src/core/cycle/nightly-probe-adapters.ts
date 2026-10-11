@@ -97,7 +97,10 @@ export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promis
  * the run, which inside the daemon would also catch every other embed call.
  */
 export function buildLongMemEvalProbeCall(args: LongMemEvalProbeArgs): { argv: string[]; runOpts: RunOpts } {
-  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache'];
+  // This gate scores terse factual answers for directness. The notes reader
+  // intentionally emits evidence/reasoning scaffolding, so use the direct
+  // protocol for the nightly quality gate and keep notes for diagnostics.
+  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache', '--reader-mode', 'direct'];
   const runOpts: RunOpts = { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false };
   if (args.modelRoutes) {
     argv.push('--model', args.modelRoutes.reader.model);
