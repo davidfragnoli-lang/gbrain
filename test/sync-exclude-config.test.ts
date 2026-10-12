@@ -341,6 +341,18 @@ describe('sync.exclude — multi-pattern value, conservative posture, getConfig 
   }, 60_000);
 
   test('a formerly tracked page moved to declared db_only survives an advancing full reconcile', async () => {
+    // Model the managed rename shape: canonical slug already moved under the
+    // db_only prefix, while source_path retains an old, committed path that is
+    // subsequently removed from Git.
+    writeFileSync(join(mpRepoPath, 'notes/moved.md'), '# Moved\n\nlegacy tracked path\n');
+    mpCommitAll('add managed-rename source');
+    await performSync(mpEngine, mpOpts());
+    await mpEngine.executeRaw(
+      `UPDATE pages SET slug = 'raw/moved' WHERE slug = 'notes/moved' AND source_id = $1`,
+      [MP_SOURCE_ID],
+    );
+    rmSync(join(mpRepoPath, 'notes/moved.md'));
+
     // raw/pre was committed and imported before it became db_only. The storage
     // transition removes it from Git and ignores the local cache, exactly like
     // a production db_only migration; a later full reconcile must preserve the
@@ -371,6 +383,7 @@ describe('sync.exclude — multi-pattern value, conservative posture, getConfig 
     );
     expect(tombstone).toHaveLength(1);
     expect(tombstone[0]!.deleted_at).toBeNull();
+    expect(await mpPageExists('raw/moved')).toBe(true);
     expect(await mpPageExists('notes/after-tiering')).toBe(true);
   }, 60_000);
 });

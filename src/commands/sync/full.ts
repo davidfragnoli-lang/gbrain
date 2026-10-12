@@ -405,10 +405,16 @@ async function reconcileFullSyncDeletes(
     // #5988 (E13): the old page of a held rename keeps its origin until the
     // renamed file imports; its file being gone does not make it stale.
     const heldOrigins = await heldRenameOrigins(engine, sid);
+    // A managed rename changes the canonical slug while retaining the former
+    // tracked source_path for provenance. Tiering must therefore inspect both
+    // identities: checking only source_path would retire `library/*` pages
+    // whose former `brain/*/documents/*` path was intentionally untracked.
+    const storageConfig = loadStorageConfig(gitContextRoot);
     const rows = (await engine.executeRaw<{ slug: string; source_path: string | null }>(
       `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
       [sid],
-    )).filter(row => !heldOrigins.has(row.source_path!));
+    )).filter(row => !heldOrigins.has(row.source_path!) &&
+      !isDeclaredDbOnlySlug(row.slug.toLowerCase(), storageConfig));
     // #774: a scoped full sync is authoritative ONLY for its scope — pages
     // whose source_path lives outside the subpath (e.g. from an earlier
     // root-level sync of this source) are out of this walk's sight and must
@@ -419,7 +425,6 @@ async function reconcileFullSyncDeletes(
     // absence is storage policy — not evidence that the page was deleted.
     // Keep the rule in reconcile eligibility so it protects explicit --full,
     // missing-anchor recovery, and company-manifest full reconciliation alike.
-    const storageConfig = loadStorageConfig(gitContextRoot);
     // 'malformed-path' rows ARE reconcile-eligible: junk filenames (bracket /
     // control-char paths minted by misbehaving producers) can never be
     // re-imported, so their rows are permanent search pollution unless the
