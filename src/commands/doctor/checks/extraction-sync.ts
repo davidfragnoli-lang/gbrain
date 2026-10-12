@@ -450,7 +450,7 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
       const mode = await scannerSlugRootMode(engine, src.id, src.local_path!);
       const gitScope = sourceGitScope(src.local_path!);
       for (const { slug, source_path: sourcePath } of rows) {
-        if (dbOnlyDirs.some(dir => slug.startsWith(dir))) continue;
+        if (dbOnlyDirs.some(dir => slug === dir.slice(0, -1) || slug.startsWith(dir))) continue;
         if (sourcePath) {
           const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug, mode, gitScope);
           if (filePath && existsSync(filePath)) continue;
