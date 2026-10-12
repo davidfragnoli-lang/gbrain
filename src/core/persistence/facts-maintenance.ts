@@ -71,6 +71,16 @@ export interface ManagedFactsSession {
   derivation?: DerivationDeclaration;
 }
 
+export function resolveStoredFactsEmbeddingModel(stored: string | undefined, configured: string | undefined): string | null {
+  if (!stored) return null;
+  if (/^[^\s:]+:[^\s]+$/.test(stored)) return stored;
+  // Legacy Postgres brains can retain the bare provider model id while the
+  // selected brain config carries the canonical provider:model identity.
+  // Accept only an exact model-tail match; another provider/model still
+  // requires the explicit migration path below.
+  return configured?.endsWith(`:${stored}`) ? configured : null;
+}
+
 /** #6048: follow-up batches one input-keyed extraction may admit for file-check refusals. */
 const MAX_FILE_REFUSAL_RETRIES = 3;
 
@@ -120,19 +130,21 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
       { fix: readFix('Shows the stored embedding_disabled value and the plane it comes from, read-only.', { argv: ['gbrain', 'config', 'get', 'embedding_disabled'] }) });
   }
   if (config.embedding_disabled || values.embedding_disabled === 'true') return null;
-  const model = values.embedding_model;
-  if (!model) return null;
+  const storedModel = values.embedding_model;
+  if (!storedModel) return null;
+  const model = resolveStoredFactsEmbeddingModel(storedModel, config.embedding_model);
   const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
-  if (!/[:/]/.test(model) && /^[^\s]+$/.test(model) && dimensions) {
+  if (!model && !/[:/]/.test(storedModel) && /^[^\s]+$/.test(storedModel) && dimensions) {
     // #6113: a legacy row stores the model without its provider. Name the one supported rewrite (a preview first).
     const signature = currentEmbeddingSignature();
     const gateway = signature ? signature.slice(0, signature.lastIndexOf(':')) : null;
-    const target = gateway?.endsWith(`:${model}`) ? gateway : null;
+    const target = gateway?.endsWith(`:${storedModel}`) ? gateway : null;
     throw opError('embedding_configuration', 'The selected brain records its embedding model without a provider, so facts cannot be embedded.',
-      `The brain's embedding_model row is ${JSON.stringify(model)} with no provider prefix (a row from an older install), so fact extraction stopped before admission; gbrain config set cannot change it. `
-      + `Preview the supported rewrite with gbrain migrate embeddings --to ${target ?? `<provider>:${model}`} --dry-run and show the user its cost: it re-embeds active facts, so applying it needs the user's paid authorization.`,
+      `The brain's embedding_model row is ${JSON.stringify(storedModel)} with no provider prefix (a row from an older install), so fact extraction stopped before admission; gbrain config set cannot change it. `
+      + `Preview the supported rewrite with gbrain migrate embeddings --to ${target ?? `<provider>:${storedModel}`} --dry-run and show the user its cost: it re-embeds active facts, so applying it needs the user's paid authorization.`,
       { fix: target ? readFix(`Previews rewriting the brain's embedding identity to ${target}, read-only.`, { argv: ['gbrain', 'migrate', 'embeddings', '--to', target, '--dry-run'] }) : embeddingsFix() });
   }
+  if (!model) return null;
   if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
     throw opError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.',
       `The brain's embedding_model (${JSON.stringify(model)}) is not provider:model or embedding_dimensions is not a positive integer, so fact extraction stopped before admission. Check embedding readiness; correcting the configuration is the user's decision.`,

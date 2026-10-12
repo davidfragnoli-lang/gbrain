@@ -8,7 +8,7 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
-import { resolveManagedFactsEmbedding } from '../src/core/persistence/facts-maintenance.ts';
+import { resolveManagedFactsEmbedding, resolveStoredFactsEmbeddingModel } from '../src/core/persistence/facts-maintenance.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
 let engine: PGLiteEngine;
@@ -26,6 +26,16 @@ test('a bare DB model refuses with the migrate preview for the gateway provider'
   expect(error.suggestion).toContain('"text-embedding-3-small" with no provider prefix');
   expect(error.suggestion).toContain('gbrain migrate embeddings --to openai:text-embedding-3-small --dry-run');
   expect(error.fix).toMatchObject({ argv: ['gbrain', 'migrate', 'embeddings', '--to', 'openai:text-embedding-3-small', '--dry-run'], actor: 'agent' });
+});
+
+test('a bare DB model resolves only through the selected brain exact provider-qualified model', async () => {
+  expect(resolveStoredFactsEmbeddingModel('text-embedding-3-small', 'openai:text-embedding-3-small'))
+    .toBe('openai:text-embedding-3-small');
+  expect(resolveStoredFactsEmbeddingModel('text-embedding-3-small', 'openai:text-embedding-3-large')).toBeNull();
+  expect(resolveStoredFactsEmbeddingModel('text-embedding-3-small', undefined)).toBeNull();
+  await expect(resolveManagedFactsEmbedding(engine, {
+    engine: 'pglite', embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536,
+  } as GBrainConfig)).resolves.toEqual({ model: 'openai:text-embedding-3-small', dimensions: 1536 });
 });
 
 test('a gateway on another model names no provider and falls back to the read-only readiness report', async () => {
