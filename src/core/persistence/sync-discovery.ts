@@ -24,6 +24,7 @@ import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds } from './sync-holds.ts';
 import { readBlobContents, readTreeBlobs } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { isDeclaredDbOnlySlug, loadStorageConfig } from '../storage-config.ts';
 
 /** The page an import takes over from its previous origin: a Git rename, or a file that replaced a vanished origin at the same slug. */
 export interface SyncRename { sourcePath: string; slug: string; pageId: number; revision: string; }
@@ -212,6 +213,13 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     slugPrefix: probe.slice(0, -2), dryRun: true }) : 'git-root';
   const sourcePath = (path: string) => slugMode === 'source-root' && scope ? path.slice(scope.length + 1) : path;
   const originScope: SyncOriginScope = { sourceId, root, scope, slugMode };
+  const storageConfig = loadStorageConfig(gitRoot);
+  // Managed renames deliberately retain their former tracked source_path for
+  // provenance. Storage tiering follows the canonical slug first, while also
+  // protecting pages whose origin itself is under a db_only prefix.
+  const declaredDbOnly = (page: { slug: string; source_path: string | null }) =>
+    isDeclaredDbOnlySlug(page.slug.toLowerCase(), storageConfig) ||
+    page.source_path !== null && isDeclaredDbOnlySlug(page.source_path.toLowerCase(), storageConfig);
   const exclude = await syncExcludePatterns(engine, opts.exclude);
   const includeHidden = [...new Set([...(opts.includeHidden ?? []), ...(await engine.getConfig('sync.include_hidden') ?? '')
     .split(/[\n,]/).map(v => v.trim()).filter(Boolean)].map(v => v.endsWith('/') ? `${v}**` : v))];
@@ -284,7 +292,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     const gitPathOf = (origin: string) => slugMode === 'source-root' && scope ? `${scope}/${origin}` : origin;
     const listedSet = new Set(listed);
     for (const page of livePages) if (!storable(page) && !listedSet.has(gitPathOf(page.source_path))) refuse(gitPathOf(page.source_path), 'delete');
-    const pages = livePages.filter(storable);
+    const pages = livePages.filter(page => storable(page) && !declaredDbOnly(page));
     assertDistinctSyncOrigins([...present, ...pages.map(page => page.source_path)]);
     for (const page of pages) {
       const origin = syncOriginPath(page.source_path);
@@ -337,9 +345,9 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     const included = company.plan.manifest.filter(entry => entry.disposition === 'included');
     const present = new Set(included.map(entry => syncOriginPath(entry.path)));
     for (const entry of included) entries.set(entry.path, { path: entry.path, sourcePath: entry.path, action: 'import', working: false, slug: entry.page!.slug });
-    const pages = await engine.executeRaw<{ source_path: string }>('SELECT source_path FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND source_path IS NOT NULL', [sourceId]);
+    const pages = await engine.executeRaw<{ slug: string; source_path: string }>('SELECT slug,source_path FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND source_path IS NOT NULL', [sourceId]);
     assertDistinctSyncOrigins([...present, ...pages.map(page => page.source_path)]);
-    for (const page of pages) {
+    for (const page of pages.filter(page => !declaredDbOnly(page))) {
       const origin = syncOriginPath(page.source_path);
       if (!present.has(origin)) entries.set(origin, { path: origin, sourcePath: origin, action: 'delete', working: false });
     }

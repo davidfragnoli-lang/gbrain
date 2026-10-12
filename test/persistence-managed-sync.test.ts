@@ -312,6 +312,23 @@ test('managed discovery unions persisted hidden-path waivers with explicit patte
   }
 }),120_000);
 
+test('managed full discovery preserves a tiered rename whose source_path is the retired tracked path', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'legacy/doc.md': '---\ntitle: Tiered document\n---\nDurable document card.\n' });
+    expect((await performManagedSync(engine, { sourceId: f.id, noPull: true })).status).toBe('first_sync');
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw(
+      `UPDATE pages SET slug='library/doc' WHERE source_id=$1 AND slug='legacy/doc'`, [f.id],
+    ), TEST_WRITE_ATTRIBUTION));
+    writeFileSync(join(f.root, 'gbrain.yml'), 'storage:\n  db_tracked:\n    - notes/\n  db_only:\n    - library/\n');
+    rmSync(join(f.root, 'legacy/doc.md'));
+    commit(f.root, 'tier managed rename to db_only');
+    const discovery = await discoverManagedSync(engine, { sourceId: f.id, noPull: true, full: true });
+    expect(discovery.entries.some(entry => entry.action === 'delete' && entry.sourcePath === 'legacy/doc.md')).toBe(false);
+    expect((await performManagedSync(engine, { sourceId: f.id, noPull: true, full: true })).deleted).toBe(0);
+    expect((await engine.getPage('library/doc', { sourceId: f.id }))?.deleted_at).toBeNull();
+  }
+}), 120_000);
+
 test('subpath exclusions and unsupported code/pull paths refuse before canonical writes', async () => withEnv({GBRAIN_HOME:home},async()=>{
   for(const engine of engines){
     const f=await fixture(engine,{'wiki/a.md':'Included source observation.\n','wiki/private/b.md':'Excluded source observation.\n','outside.md':'Another source observation.\n'},'wiki');
