@@ -460,7 +460,20 @@ function assertCursorProcessingOptions(cursor: Cursor, processingOptions: SyncPr
 async function managedDryRun(engine: BrainEngine, value: Cursor, base: Cursor, run: { company: boolean; processingOptions: SyncProcessingOptions;
   syncOptions: SyncCursorOptions; repoPath?: string; remote: boolean }): Promise<SyncResult> {
   const screen = run.company ? null : await loadSyncScreenRun(engine, value.sourceId, value.processingOptions ?? run.processingOptions, run.remote);
-  return { ...result(base, 'dry_run'), ...await dryRunScreen(engine, value, screen,
+  // A newly discovered dry run has not advanced its cursor, so its persisted
+  // counters are necessarily zero. Report the read-only manifest workload,
+  // not the completed cursor passed as `base`; otherwise a 9k-file migration
+  // misleadingly prints "0 entries" even though dryRunScreen inspected them.
+  const previewCounts = value.entries.reduce((counts, entry) => {
+    if (entry.action === 'delete') counts.deleted++;
+    else if (entry.renameFrom) counts.renamed++;
+    else if (entry.pageId == null) counts.added++;
+    else counts.modified++;
+    return counts;
+  }, { added: 0, modified: 0, deleted: 0, renamed: 0 });
+  const preview: Cursor = { ...value, index: value.entries.length,
+    counts: { ...value.counts, ...previewCounts } };
+  return { ...result(preview, 'dry_run'), ...await dryRunScreen(engine, value, screen,
     checkpointRetryCommand({ sourceId: value.sourceId, processingOptions: value.processingOptions, syncOptions: value.syncOptions ?? run.syncOptions, repoPath: run.repoPath })) };
 }
 
