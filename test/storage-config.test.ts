@@ -73,7 +73,7 @@ describe('Storage Configuration', () => {
     });
 
     test('handles prefix edge cases', () => {
-      expect(isGitTracked('people', testConfig)).toBe(false);
+      expect(isGitTracked('people', testConfig)).toBe(true);
       expect(isGitTracked('people/', testConfig)).toBe(true);
       expect(isGitTracked('peoplex/test', testConfig)).toBe(false);
       expect(isSupabaseOnly('mediax/test', testConfig)).toBe(false);
@@ -118,6 +118,7 @@ describe('Storage Configuration', () => {
         db_only: ['media/x/'], // canonical, with trailing slash
       };
       expect(isSupabaseOnly('media/xerox/something', collisionConfig)).toBe(false);
+      expect(isSupabaseOnly('media/x', collisionConfig)).toBe(true);
       expect(isSupabaseOnly('media/x/tweet-1', collisionConfig)).toBe(true);
 
       // Non-canonical input (no trailing slash) is refused by the matcher.

@@ -341,11 +341,10 @@ export function normalizeAndValidateStorageConfig(input: StorageConfig): Storage
  */
 function matchesTierDir(slug: string, dir: string): boolean {
   if (!dir.endsWith('/')) return false; // not normalized — matcher refuses
-  // slug must equal dir's bare prefix OR start with the trailing-slash form.
-  // Example: dir = 'media/x/' matches 'media/x/anything' but not 'media/x'
-  // or 'media/xerox'. (A slug that exactly equals 'media/x' is a directory-
-  // level entry the brain doesn't write.)
-  return slug.startsWith(dir);
+  // A legacy page may occupy the bare directory slug (for example `schema` or
+  // `brain/readme`). Treat it as part of the tier without weakening the
+  // path-segment boundary: `media/x/` still never matches `media/xerox`.
+  return slug === dir.slice(0, -1) || slug.startsWith(dir);
 }
 
 export function isDbTracked(slug: string, config: StorageConfig): boolean {
