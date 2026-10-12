@@ -300,14 +300,8 @@ export async function runRemediation(
   // authorization on every provider-calling job so a resident worker sees
   // the same approved basis after the submitting process has exited.
   const { paidJobNames } = await import('../../commands/jobs/shared.ts');
-  const remediationSpend = maxUsd !== undefined && maxUsd > 0
-    ? (await import('../minions/spend-authorization.ts')).jobSpendAuthorization({
-        consented_effects: ['paid'], cap_usd: maxUsd,
-        cap_source: opts.capSource ?? 'user', via: 'max_usd',
-      }, {
-        command: 'doctor --remediate', argv: ['gbrain', 'doctor', '--remediate'],
-      })
-    : undefined;
+  let remediationSpend: import('../minions/spend-record.ts').SpendAuthorization | undefined;
+  let durableJobCap: number | undefined;
 
   // A4 amended: install a BudgetTracker scope around the plan-step loop so
   // any gateway.chat / embed / rerank inside a Minion handler (synthesize,
@@ -432,9 +426,16 @@ export async function runRemediation(
 
       hooks.onStepStart?.(stepCount, totalSteps, step);
       try {
+        const isPaid = (await paidJobNames([step.job])).length > 0;
+        // A scoped recheck can discover a paid step that was not in the
+        // initial list. Never let it bypass a remainder already at zero.
+        if (isPaid && durableJobCap === 0) {
+          hooks.onBudgetRefused?.(step.est_usd_cost ?? 0, 0);
+          jobsBudgetRefused = true;
+          break;
+        }
         const impact = await openStepImpact(engine, step);
         const isProtected = !!step.protected;
-        const isPaid = (await paidJobNames([step.job])).length > 0;
         const submitWith = (key: string) =>
           queue.add(
             step.job,
@@ -527,11 +528,26 @@ export async function runRemediation(
     catch (err) { if (!(err instanceof BudgetExhausted)) throw err; }
     // Job estimates are rechecked against what the repairs left, including reserved effect estimates.
     const afterRepairs = remainingUsd();
-    if (recs.length && afterRepairs !== undefined && (trackerExhausted || estJobUsd > afterRepairs)) {
+    durableJobCap = afterRepairs;
+    const paidRecs = new Set(await paidJobNames(recs.map(step => step.job)));
+    // A provider-calling job with a zero estimate is still paid. At zero
+    // remainder it must not reach a resident worker with no ambient tracker.
+    const paidAtZeroRemainder = afterRepairs === 0 && recs.some(step => paidRecs.has(step.job));
+    if (recs.length && afterRepairs !== undefined && (trackerExhausted || estJobUsd > afterRepairs || paidAtZeroRemainder)) {
       hooks.onBudgetRefused?.(estJobUsd, afterRepairs);
       jobsBudgetRefused = true;
       recs = [];
     }
+    // Derive the durable worker fence only now: checkpoint spend and repair
+    // spend are cumulative and have already reduced `afterRepairs`.
+    remediationSpend = afterRepairs !== undefined && afterRepairs > 0
+      ? (await import('../minions/spend-authorization.ts')).jobSpendAuthorization({
+          consented_effects: ['paid'], cap_usd: afterRepairs,
+          cap_source: opts.capSource ?? 'user', via: 'max_usd',
+        }, {
+          command: 'doctor --remediate', argv: ['gbrain', 'doctor', '--remediate'],
+        })
+      : undefined;
     jobTracker = new BudgetTracker({ label: 'remediation.run', maxCostUsd: afterRepairs, capSource: opts.capSource });
     watch(jobTracker);
     await withBudgetTracker(jobTracker, runLoop);
