@@ -167,6 +167,34 @@ test('#6042 control: a rewrite that changes compiled_truth still queues extracti
   expect(await rewrite(`${content}A further substantive sentence about the project schedule.\n`)).toEqual({ status: { queued: true }, effectQueued: true });
 }));
 
+test('document-library metadata-only rewrites skip extraction when source bytes are unchanged', () => fixture(async () => {
+  await publish();
+  await finishExtractions();
+  const libraryContent = content.replace(
+    'title: Field notes',
+    'title: Field notes\ndocument_id: doc-0123456789abcdefabcd\nsha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  ) + '\nDocument-specific context annotation.\n';
+  expect((await rewrite(libraryContent)).status).toEqual({ queued: true });
+  await finishExtractions();
+  const relinked = `${libraryContent}\n\n[Open document in OneDrive](https://example.test/new-link)\n`;
+  expect(await rewrite(relinked)).toEqual({ status: { skipped: 'body_unchanged' }, effectQueued: false });
+}));
+
+test('document-library rewrites still queue when source bytes change', () => fixture(async () => {
+  await publish();
+  await finishExtractions();
+  const libraryContent = content.replace(
+    'title: Field notes',
+    'title: Field notes\ndocument_id: doc-0123456789abcdefabcd\nsha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  ) + '\nDocument-specific context annotation.\n';
+  expect((await rewrite(libraryContent)).status).toEqual({ queued: true });
+  await finishExtractions();
+  const changedSource = libraryContent
+    .replace(/a{64}/, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+    .concat('\nNew evidence from the changed source document.\n');
+  expect((await rewrite(changedSource)).status).toEqual({ queued: true });
+}));
+
 test('#6042: an extraction still in the outbox is superseded by the rewrite, so the rewrite queues in its place', () => fixture(async () => {
   await publish();
   expect(await rewrite(retitled('Renamed before extraction'))).toEqual({ status: { queued: true }, effectQueued: true });

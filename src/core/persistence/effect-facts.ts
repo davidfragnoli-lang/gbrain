@@ -77,8 +77,23 @@ async function extractionCompletedForPage(engine: BrainEngine, pageId: number): 
  */
 async function bodyAlreadyOffered(engine: BrainEngine, slug: string, page: ParsedPage, before: PageSnapshot | null): Promise<boolean> {
   const live = before && !before.page.deleted_at ? before.page : null;
-  if (!live || live.compiled_truth !== page.compiled_truth) return false;
+  if (!live) return false;
+  const priorFrontmatter = (live.frontmatter ?? {}) as Record<string, unknown>;
+  const nextFrontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
+  const sameDocumentSource =
+    typeof priorFrontmatter.document_id === 'string' &&
+    priorFrontmatter.document_id === nextFrontmatter.document_id &&
+    typeof priorFrontmatter.sha256 === 'string' &&
+    priorFrontmatter.sha256 === nextFrontmatter.sha256;
+  // A document-library card's extractable evidence is the versioned source
+  // document, identified by document_id + sha256. Refiling the same bytes can
+  // legitimately rewrite the card's slug, links, generated paths and
+  // frontmatter without creating new facts. Do not charge another model call
+  // for that metadata-only rewrite. A still-pending extraction remains debt:
+  // the old revision will be superseded, so the new revision must replace it.
+  if (live.compiled_truth !== page.compiled_truth && !sameDocumentSource) return false;
   if (!isFactsBackstopEligible(slug, live).ok) return false;
+  if (sameDocumentSource) return !(await extractionPendingForPage(engine, live.id));
   if (!(await extractionCompletedForPage(engine, live.id))) return false;
   return !(await extractionPendingForPage(engine, live.id));
 }
