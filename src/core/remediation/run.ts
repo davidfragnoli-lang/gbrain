@@ -295,6 +295,20 @@ export async function runRemediation(
   const queue = new MinionQueue(engine);
   const waitStep = stepWaiter(engine, queue, opts.inlineJobs === true);
 
+  // The remediation cap is the operator's submit-time authorization, not
+  // merely an ambient tracker around an inline worker. Persist one shared
+  // authorization on every provider-calling job so a resident worker sees
+  // the same approved basis after the submitting process has exited.
+  const { paidJobNames } = await import('../../commands/jobs/shared.ts');
+  const remediationSpend = maxUsd !== undefined && maxUsd > 0
+    ? (await import('../minions/spend-authorization.ts')).jobSpendAuthorization({
+        consented_effects: ['paid'], cap_usd: maxUsd,
+        cap_source: opts.capSource ?? 'user', via: 'max_usd',
+      }, {
+        command: 'doctor --remediate', argv: ['gbrain', 'doctor', '--remediate'],
+      })
+    : undefined;
+
   // A4 amended: install a BudgetTracker scope around the plan-step loop so
   // any gateway.chat / embed / rerank inside a Minion handler (synthesize,
   // patterns, consolidate) or a repair step auto-enforces the cap. On
@@ -420,6 +434,7 @@ export async function runRemediation(
       try {
         const impact = await openStepImpact(engine, step);
         const isProtected = !!step.protected;
+        const isPaid = (await paidJobNames([step.job])).length > 0;
         const submitWith = (key: string) =>
           queue.add(
             step.job,
@@ -430,7 +445,12 @@ export async function runRemediation(
               max_attempts: 2,
               maxWaiting: 1,
             },
-            isProtected ? { allowProtectedSubmit: true } : undefined,
+            isProtected || (remediationSpend && isPaid)
+              ? {
+                  ...(isProtected ? { allowProtectedSubmit: true } : {}),
+                  ...(remediationSpend && isPaid ? { spendAuthorization: remediationSpend } : {}),
+                }
+              : undefined,
           );
         let job = await submitWith(step.idempotency_key);
         let dedupedJobId: number | undefined;
