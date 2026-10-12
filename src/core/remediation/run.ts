@@ -341,8 +341,8 @@ export async function runRemediation(
       budget_snapshot: exhaustionSnapshot
         ? { spent: exhaustionSnapshot.spent, cap: exhaustionSnapshot.cap, reason: exhaustionSnapshot.reason, model_id: exhaustionSnapshot.model_id }
         : undefined,
-      ...(repairs ? {
-        brain_id: brainId, max_usd: maxUsd ?? null, include_repairs: includeRepairs,
+      ...(repairs || manifest ? {
+        brain_id: brainId ?? cp?.brain_id, max_usd: maxUsd ?? null, include_repairs: includeRepairs,
         spent_usd: settledUsd(), manifest: originalManifest,
         ...(pendingEmbedSources.length ? { pending_embed_sources: pendingEmbedSources } : {}),
       } : {}),

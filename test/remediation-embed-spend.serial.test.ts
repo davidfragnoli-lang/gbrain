@@ -17,7 +17,7 @@ const { PGLiteEngine } = await import('../src/core/pglite-engine.ts');
 const { MinionQueue } = await import('../src/core/minions/queue.ts');
 const { makeRemediationStep } = await import('../src/core/remediation-step.ts');
 const { runRemediation } = await import('../src/core/remediation/run.ts');
-const { computePlanHash, saveRemediationCheckpoint } = await import('../src/core/remediation-checkpoint.ts');
+const { computePlanHash, loadRemediationCheckpoint, saveRemediationCheckpoint } = await import('../src/core/remediation-checkpoint.ts');
 const { getCurrentBudgetTracker } = await import('../src/core/ai/gateway.ts');
 
 let engine: InstanceType<typeof PGLiteEngine>;
@@ -134,14 +134,31 @@ describe('remediation queued embedding spend', () => {
 
   test('zero cumulative remainder refuses a paid zero-estimate job before queue insertion', async () => {
     const step = catchUp('zero-remainder');
+    const planHash = checkpoint(step, 0.75);
     const before = await engine.executeRaw<{ count: string }>('SELECT count(*)::text AS count FROM minion_jobs');
     const result = await runRemediation(engine, {
       targetScore: 0, inlineJobs: true, maxJobs: 1, resume: true,
-      resumePlanHash: checkpoint(step, 0.75), extraRemediations: [step],
+      resumePlanHash: planHash, extraRemediations: [step],
     });
     const after = await engine.executeRaw<{ count: string }>('SELECT count(*)::text AS count FROM minion_jobs');
     expect(result.submitted).toEqual([]);
     expect(result.budget_exhausted).toMatchObject({ cap: 0.75, spent: 0.75, reason: 'max_usd' });
     expect(after[0]?.count).toBe(before[0]?.count);
+
+    // Refusal rewrites the checkpoint. It must retain the cumulative contract
+    // instead of degrading to a legacy checkpoint that forgets prior spend.
+    expect(loadRemediationCheckpoint(planHash)).toMatchObject({
+      max_usd: 0.75, spent_usd: 0.75,
+      manifest: { job_ids: [step.id], repair_kinds: [] },
+    });
+
+    // Raising the cumulative cap to $1 authorizes only the incremental $0.25.
+    const resumed = await runRemediation(engine, {
+      targetScore: 0, inlineJobs: true, maxJobs: 1, resume: true,
+      resumePlanHash: planHash, maxUsd: 1, extraRemediations: [step],
+    });
+    const { stored } = await storedJob(resumed);
+    expect(stored?.spend_authorization).toMatchObject({ cap_usd: 0.25, command: 'doctor --remediate' });
+    expect(stored?.result).toMatchObject({ usage: { spend_basis: { authorization: { cap_usd: 0.25 } } } });
   }, 120_000);
 });
