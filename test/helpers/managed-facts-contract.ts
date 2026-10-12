@@ -8,7 +8,7 @@ import type { BrainEngine } from '../../src/core/engine.ts';
 import type { OperationContext } from '../../src/core/ops/contract.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import { operationsByName } from '../../src/core/operations.ts';
-import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { disposePersistenceConsumer, startPersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { localHostId, registerLocalWriter } from '../../src/core/persistence/identity.ts';
 import { claimPersistenceEffect } from '../../src/core/persistence/effect-journal.ts';
@@ -57,7 +57,8 @@ export async function exerciseManagedFacts(engine: BrainEngine, scenario: Case):
       const clientId = `client-${sourceId}`;
       await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_secret_hash,client_name,scope,source_id,bound_slug_prefixes)
         VALUES($1,'fixture-hash','example-client','read write',$2,$3::text[])`, [clientId, sourceId, scenario === 'confined' ? ['people/'] : null]);
-      const ctx: OperationContext = { engine, config: { engine: engine.kind }, remote: true, sourceId, dryRun: false, logger: console,
+      const ctx: OperationContext = { engine, config: { engine: engine.kind,
+        embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536 }, remote: true, sourceId, dryRun: false, logger: console,
         auth: { token: 'fixture', clientId, principal: { kind: 'oauth_client', id: clientId }, scopes: ['read', 'write'], sourceId,
           ...(scenario === 'confined' ? { boundSlugPrefixes: ['people/'] } : {}) } };
       await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
@@ -99,6 +100,14 @@ export async function exerciseManagedFacts(engine: BrainEngine, scenario: Case):
         return;
       }
       if (scenario === 'worker' || scenario === 'worker_revoked' || scenario === 'worker_narrowed') {
+        // FRA-25673: reproduce the production divergence through the actual
+        // registered facts-absorb handler. The selected worker/consumer config
+        // has the provider-qualified identity while the legacy DB row is bare.
+        // Ambient GBRAIN_HOME deliberately has no config file. Before the fix,
+        // the handler reloaded that empty ambient plane and refused before the
+        // mocked (free) provider path; the foreground consumer config succeeded.
+        await engine.setConfig('embedding_model', 'text-embedding-3-large');
+        await engine.setConfig('embedding_dimensions', '1536');
         const content = `---\ntype: meeting\ntitle: Example meeting\n---\n\n${params.turn_text.repeat(4)}`;
         const put = await operationsByName.put_page.handler(ctx, { slug: 'meetings/example', content, request_id: randomUUID() }) as { request_id: string };
         await disposePersistenceConsumer(engine);
@@ -111,6 +120,7 @@ export async function exerciseManagedFacts(engine: BrainEngine, scenario: Case):
         expect(effect.source_id).toBe(sourceId);
         await dispatchFactsBackstopEffect(engine, effect, localHostId());
         await dispatchFactsBackstopEffect(engine, effect, localHostId());
+        startPersistenceConsumer(engine, ctx.config);
         const jobs = await engine.executeRaw<{ id: number; data: Record<string, unknown> }>("SELECT id,data FROM minion_jobs WHERE name='facts-absorb' AND data->>'sourceId'=$1", [sourceId]);
         expect(jobs).toHaveLength(1);
         expect(jobs[0].data.persistence_request_id).toBeDefined();

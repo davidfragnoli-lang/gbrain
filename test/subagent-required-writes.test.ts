@@ -2,6 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { SubagentResult } from '../src/core/minions/types.ts';
 import { finalizeWriteAccounting } from '../src/core/minions/handlers/subagent-persistence.ts';
+import { REQUIRED_WRITE_SYSTEM } from '../src/core/minions/handlers/subagent.ts';
+import { runEmbedJobWithAccounting } from '../src/core/minions/handlers/embed.ts';
+import { invokeAI } from '../src/core/ai/invocation-guard.ts';
+import type { MinionJobContext } from '../src/core/minions/types.ts';
 
 const result: SubagentResult = {
   result: 'I will call brain_put_page now.',
@@ -20,6 +24,12 @@ function ledger(
 }
 
 describe('required-write postcondition (#5098)', () => {
+  test('required-write prompt forbids the prose-only completion seen on claude-cli', () => {
+    expect(REQUIRED_WRITE_SYSTEM).toContain('call brain_put_page successfully');
+    expect(REQUIRED_WRITE_SYSTEM).toContain('Do not\nfinish with a prose answer');
+    expect(REQUIRED_WRITE_SYSTEM).toContain('prose alone\nnever satisfies this job');
+  });
+
   test('an explicit oneshot skip is a legitimate zero-write completion (#5590)', async () => {
     const skipped: SubagentResult = { ...result, synth_mode_used: 'oneshot', oneshot_skipped: true, written_refs: [] };
     const actual = await finalizeWriteAccounting(ledger([]), 1, skipped, { requireWrites: true });
@@ -132,4 +142,26 @@ describe('required-write postcondition (#5098)', () => {
     expect(actual.pages_written).toBe(1);
     expect(actual.pages_failed).toBe(1);
   });
+});
+
+test('embedding accounting keeps job identity, provider usage, and submit-time basis in the result', async () => {
+  const progress: unknown[] = [];
+  const tokens: unknown[] = [];
+  const job = {
+    id: 4242, name: 'embed-catch-up', data: {}, attempts_made: 0,
+    signal: new AbortController().signal, shutdownSignal: new AbortController().signal,
+    deadlineAtMs: null, updateProgress: async (v: unknown) => { progress.push(v); },
+    updateTokens: async (v: unknown) => { tokens.push(v); }, log: async () => {},
+    isActive: async () => true, readInbox: async () => [],
+  } as MinionJobContext;
+  const accounted = await runEmbedJobWithAccounting(job, 'embed-catch-up', () => invokeAI(
+    { operation: 'gateway.embed', model: 'fixture:free-embed', kind: 'embedding' },
+    async () => ({ ok: true }),
+    async () => ({ inputTokens: 17, outputTokens: 0 }),
+  ));
+  expect(accounted.value).toEqual({ ok: true });
+  expect(accounted.usage).toMatchObject({ job_id: 4242, calls: 1, input_tokens: 17, output_tokens: 0,
+    cost_usd: 0, spend_basis: { basis: 'unrecorded', authorization: null } });
+  expect(tokens).toEqual([{ input: 17, output: 0, cache_read: 0 }]);
+  expect(progress).toEqual([{ phase: 'embed.usage', usage: accounted.usage }]);
 });

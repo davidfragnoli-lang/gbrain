@@ -4,6 +4,7 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { assertEmbedNotStalled } from '../../embed-stall.ts';
+import { runEmbedJobWithAccounting } from './embed.ts';
 
 /**
  * v0.41.18.0 (A13): embed-catch-up handler for the gbrain onboard
@@ -20,7 +21,7 @@ export function makeEmbedCatchUpHandler(engine: BrainEngine): MinionHandler {
       priority?: 'recent';
       includeNullSignature?: boolean;
     };
-    const catchUpResult = await runEmbedCore(engine, {
+    const accounted = await runEmbedJobWithAccounting(job, 'embed-catch-up', () => runEmbedCore(engine, {
       stale: true,
       catchUp: true,
       batchSize: data.batchSize,
@@ -29,9 +30,10 @@ export function makeEmbedCatchUpHandler(engine: BrainEngine): MinionHandler {
       // D7/D12: submitters that detected a NULL-signature cohort thread the
       // widening through; absent = grandfather clause stays (unchanged).
       includeNullSignature: !!data.includeNullSignature,
-    });
+    }));
+    const catchUpResult = accounted.value;
     // #4599 (X6): stall abort → failed job (throw), same as the embed handler.
     assertEmbedNotStalled(catchUpResult);
-    return catchUpResult;
+    return { ...catchUpResult, usage: accounted.usage };
   };
 }

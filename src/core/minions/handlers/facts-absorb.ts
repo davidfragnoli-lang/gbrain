@@ -8,6 +8,7 @@ import { loadConfig, loadConfigWithEngine } from '../../config.ts';
 import type { FactsBackstopResult } from '../../facts/backstop.ts';
 import { JobDeferredError, UnrecoverableError } from '../errors.ts';
 import { ERROR_CATALOGUE } from '../../error-catalogue.ts';
+import { persistenceConsumerConfig } from '../../persistence/service.ts';
 
 /** Shared predicate: an inline result reporting execution-time unavailability. */
 export function factsAbsorbUnavailable(result: FactsBackstopResult): boolean {
@@ -88,7 +89,17 @@ export function makeFactsAbsorbHandler(engine: BrainEngine): MinionHandler {
         frontmatter: (page.frontmatter ?? {}) as Record<string, unknown>,
       },
       {
-        engine, config: await loadConfigWithEngine(engine, loadConfig() ?? { engine: engine.kind }) ?? { engine: engine.kind },
+        // The resident worker already selected a brain and started its
+        // persistence consumer with that brain's effective file/env config.
+        // Re-loading ambient disk config here can resolve another/default
+        // GBRAIN_HOME and lose the provider-qualified embedding identity.
+        // That made the handler diverge from foreground maintenance: a legacy
+        // bare DB model was refused even though the selected brain config
+        // qualified the exact same model. Prefer the worker-owned snapshot;
+        // isolated handler tests and non-resident callers retain the loader.
+        engine, config: persistenceConsumerConfig(engine)
+          ?? await loadConfigWithEngine(engine, loadConfig() ?? { engine: engine.kind })
+          ?? { engine: engine.kind },
         sourceId,
         sessionId: typeof job.data.sessionId === 'string' ? job.data.sessionId : null,
         persistenceRequestId: typeof job.data.persistence_request_id === 'string' ? job.data.persistence_request_id : undefined,

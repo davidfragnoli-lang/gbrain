@@ -5,6 +5,64 @@ import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
 import { assertEmbedNotStalled } from '../../embed-stall.ts';
 import type { PaceKeyOverrides } from '../../pace-mode.ts';
+import { BudgetTracker } from '../../budget/budget-tracker.ts';
+import { getCurrentBudgetTracker, withBudgetTracker } from '../../ai/gateway.ts';
+import { observeAIInvocations, withAIAttribution } from '../../ai/invocation-guard.ts';
+import { spendBasis, type SpendAuthorization } from '../spend-record.ts';
+import type { MinionJobContext } from '../types.ts';
+
+export interface EmbedJobUsage {
+  job_id: number;
+  calls: number;
+  calls_with_unknown_usage: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+  spend_basis: ReturnType<typeof spendBasis> & { authorization: SpendAuthorization | null };
+}
+
+/** Job-bound embedding usage persisted in result/progress without a provider call of its own. */
+export async function runEmbedJobWithAccounting<T>(
+  job: MinionJobContext,
+  operation: 'embed' | 'embed-catch-up',
+  run: () => Promise<T>,
+): Promise<{ value: T; usage: EmbedJobUsage }> {
+  const usage = {
+    job_id: job.id, calls: 0, calls_with_unknown_usage: 0, input_tokens: 0, output_tokens: 0,
+    cache_read_tokens: 0, cache_write_tokens: 0,
+  };
+  const tracker = getCurrentBudgetTracker() ?? new BudgetTracker({ label: `${operation}:job:${job.id}` });
+  const spentBefore = tracker.totalSpent;
+  let value!: T;
+  let thrown: unknown;
+  let failed = false;
+  const dispose = observeAIInvocations(event => {
+    if (String(event.attribution?.job_id) !== String(job.id) || event.call.kind !== 'embedding') return;
+    usage.calls += 1;
+    if (!event.usage) { usage.calls_with_unknown_usage += 1; return; }
+    usage.input_tokens += event.usage.inputTokens;
+    usage.output_tokens += event.usage.outputTokens;
+    usage.cache_read_tokens += event.usage.cacheReadTokens ?? 0;
+    usage.cache_write_tokens += event.usage.cacheWriteTokens ?? 0;
+  });
+  try {
+    value = await withAIAttribution({ job_id: job.id, job_name: job.name, effect: operation },
+      () => getCurrentBudgetTracker() ? run() : withBudgetTracker(tracker, run));
+  } catch (error) {
+    failed = true;
+    thrown = error;
+  }
+  dispose();
+  const basis = spendBasis({ spend_authorization: job.spend?.record ?? null });
+  const record: EmbedJobUsage = { ...usage, cost_usd: Math.max(0, tracker.totalSpent - spentBefore),
+    spend_basis: { ...basis, authorization: job.spend?.record ?? null } };
+  await job.updateTokens?.({ input: record.input_tokens, output: record.output_tokens, cache_read: record.cache_read_tokens });
+  await job.updateProgress?.({ phase: 'embed.usage', usage: record });
+  if (failed) throw thrown;
+  return { value, usage: record };
+}
 
 export function makeEmbedHandler(engine: BrainEngine): MinionHandler {
   return async (job) => {
@@ -13,7 +71,7 @@ export function makeEmbedHandler(engine: BrainEngine): MinionHandler {
     // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
-    const embedResult = await runEmbedCore(engine, {
+    const accounted = await runEmbedJobWithAccounting(job, 'embed', () => runEmbedCore(engine, {
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
@@ -49,7 +107,8 @@ export function makeEmbedHandler(engine: BrainEngine): MinionHandler {
         // block the worker loop.
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
-    });
+    }));
+    const embedResult = accounted.value;
     // #4599 (X6): a stall-watchdog abort is an error RESULT from core; the
     // handler layer converts it to a FAILED JOB (throw) — never process.exit.
     assertEmbedNotStalled(embedResult);
@@ -62,6 +121,7 @@ export function makeEmbedHandler(engine: BrainEngine): MinionHandler {
       dry_run: !!embedResult.dryRun,
       would_embed: embedResult.would_embed,
       failures: embedResult.failures,
+      usage: accounted.usage,
     };
   };
 }

@@ -139,6 +139,14 @@ const DEFAULT_LEASE_TTL_MS = 120_000;
 // a re-export alias here for back-compat with any external importer.
 const DEFAULT_SYSTEM = DEFAULT_SUBAGENT_SYSTEM;
 
+export const REQUIRED_WRITE_SYSTEM = `## Required write contract
+
+This job is not complete until you call brain_put_page successfully. Do not
+finish with a prose answer, a proposed draft, or a promise to write later.
+Use the available tools now. If the task allows a genuine no-write outcome,
+you must still call at least one evidence tool before finishing; prose alone
+never satisfies this job.`;
+
 // ── Injectable surfaces (for tests) ─────────────────────────
 
 /**
@@ -484,7 +492,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // v0.41 Approach C: render the final system prompt now that toolDefs
     // is known. Splices a deterministic tool-usage preamble listing each
     // tool's usage_hint. Caller can opt out via data.system_no_tool_preamble.
-    const systemPrompt = buildSystemPrompt(toolDefs, data.system, {
+    const systemPrompt = buildSystemPrompt(toolDefs,
+      [data.system, data.require_writes === true ? REQUIRED_WRITE_SYSTEM : null].filter(Boolean).join('\n\n'), {
       no_tool_preamble: data.system_no_tool_preamble,
     });
 
