@@ -44,6 +44,7 @@ import {
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import { heldRenameOrigins, holdRefusedImport, moveHeldRenames, noteScreenedImport, settleFullSyncHolds, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
+import { isDeclaredDbOnlySlug, loadStorageConfig } from '../../core/storage-config.ts';
 
 export async function performFullSync(
   engine: BrainEngine,
@@ -413,6 +414,12 @@ async function reconcileFullSyncDeletes(
     // root-level sync of this source) are out of this walk's sight and must
     // not be treated as stale.
     const scopePrefix = slugRoot ? gitRelativePath(gitContextRoot, syncScopeRoot) + '/' : '';
+    // A declared db_only prefix is intentionally absent from Git/current-file
+    // enumeration. Once a previously tracked page transitions to db_only, that
+    // absence is storage policy — not evidence that the page was deleted.
+    // Keep the rule in reconcile eligibility so it protects explicit --full,
+    // missing-anchor recovery, and company-manifest full reconciliation alike.
+    const storageConfig = loadStorageConfig(gitContextRoot);
     // 'malformed-path' rows ARE reconcile-eligible: junk filenames (bracket /
     // control-char paths minted by misbehaving producers) can never be
     // re-imported, so their rows are permanent search pollution unless the
@@ -421,11 +428,12 @@ async function reconcileFullSyncDeletes(
     // 'strategy', never 'malformed-path', so a markdown sync still can't
     // delete code pages. The #1433 metafile protection is likewise untouched.
     const reconcileEligible = (p: string): boolean =>
+      !isDeclaredDbOnlySlug(p.toLowerCase(), storageConfig) && (
       isSyncable(p, reconcileSyncOpts) ||
       // Only the poison signature is sweepable; bare-bracket markdown rows
       // from pre-gate releases survive reconcile (their file still exists —
       // deleting the row would be silent data loss; cross-model finding).
-      (unsyncableReason(p, reconcileSyncOpts) === 'malformed-path' && isPoisonedPath(p));
+      (unsyncableReason(p, reconcileSyncOpts) === 'malformed-path' && isPoisonedPath(p)));
     const plan = planReconcileDeletes(
       rows,
       currentFiles,

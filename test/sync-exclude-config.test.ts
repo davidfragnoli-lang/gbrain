@@ -339,4 +339,38 @@ describe('sync.exclude — multi-pattern value, conservative posture, getConfig 
       mpEngine.getConfig = originalGetConfig;
     }
   }, 60_000);
+
+  test('a formerly tracked page moved to declared db_only survives an advancing full reconcile', async () => {
+    // raw/pre was committed and imported before it became db_only. The storage
+    // transition removes it from Git and ignores the local cache, exactly like
+    // a production db_only migration; a later full reconcile must preserve the
+    // page without relying on the mass-delete threshold.
+    writeFileSync(join(mpRepoPath, 'gbrain.yml'), [
+      'storage:',
+      '  db_tracked:',
+      '    - notes/',
+      '  db_only:',
+      '    - raw/',
+      '',
+    ].join('\n'));
+    writeFileSync(join(mpRepoPath, '.gitignore'), '/raw/\n');
+    execSync('git rm -r --cached raw', { cwd: mpRepoPath, stdio: 'pipe' });
+    mpCommitAll('move formerly tracked raw pages to db_only');
+
+    // Advance HEAD after the storage transition so this exercises an advancing
+    // full sync, not the up-to-date shortcut.
+    writeFileSync(join(mpRepoPath, 'notes/after-tiering.md'), '# After tiering\n\nadvance full cursor\n');
+    mpCommitAll('advance after db_only transition');
+
+    const full = await performSync(mpEngine, { ...mpOpts(), full: true });
+    expect(['synced', 'up_to_date', 'first_sync']).toContain(full.status);
+    expect(await mpPageExists('raw/pre')).toBe(true);
+    const tombstone = await mpEngine.executeRaw<{ deleted_at: string | null }>(
+      `SELECT deleted_at FROM pages WHERE slug = 'raw/pre' AND source_id = $1`,
+      [MP_SOURCE_ID],
+    );
+    expect(tombstone).toHaveLength(1);
+    expect(tombstone[0]!.deleted_at).toBeNull();
+    expect(await mpPageExists('notes/after-tiering')).toBe(true);
+  }, 60_000);
 });
