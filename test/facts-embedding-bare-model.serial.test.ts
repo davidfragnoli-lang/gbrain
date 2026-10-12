@@ -19,6 +19,18 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { resetGateway(); await engine.disconnect(); });
 
+async function setStoredEmbedding(model: string | null, dimensions: string | null): Promise<void> {
+  await engine.executeRaw("DELETE FROM config WHERE key IN ('embedding_model','embedding_dimensions','embedding_disabled')");
+  if (model !== null) await engine.setConfig('embedding_model', model);
+  if (dimensions !== null) await engine.setConfig('embedding_dimensions', dimensions);
+}
+
+async function expectEmbeddingConfiguration(config: GBrainConfig): Promise<Error & { code: string; suggestion: string }> {
+  const error = await resolveManagedFactsEmbedding(engine, config).then(() => null, e => e);
+  expect(error).toMatchObject({ code: 'embedding_configuration' });
+  return error;
+}
+
 test('a bare DB model refuses with the migrate preview for the gateway provider', async () => {
   configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test-fake' } });
   const error = await resolveManagedFactsEmbedding(engine, { engine: 'pglite' } as GBrainConfig).then(() => null, e => e);
@@ -39,8 +51,53 @@ test('a bare DB model resolves only through the selected brain exact provider-qu
 });
 
 test('a gateway on another model names no provider and falls back to the read-only readiness report', async () => {
+  await setStoredEmbedding('text-embedding-3-small', '1536');
   configureGateway({ embedding_model: 'voyage:voyage-4', embedding_dimensions: 1024, env: { VOYAGE_API_KEY: 'test-fake' } });
   const error = await resolveManagedFactsEmbedding(engine, { engine: 'pglite' } as GBrainConfig).then(() => null, e => e);
   expect(error.suggestion).toContain('--to <provider>:text-embedding-3-small --dry-run');
   expect(error.fix.argv).toEqual(['gbrain', 'doctor', '--only', 'embeddings', '--json']);
+});
+
+test('only an absent stored model or explicit disable resolves to no managed embedding', async () => {
+  await setStoredEmbedding(null, null);
+  await expect(resolveManagedFactsEmbedding(engine, { engine: 'pglite' } as GBrainConfig)).resolves.toBeNull();
+
+  await setStoredEmbedding('openai:text-embedding-3-small', '1536');
+  await engine.setConfig('embedding_disabled', 'true');
+  await expect(resolveManagedFactsEmbedding(engine, { engine: 'pglite' } as GBrainConfig)).resolves.toBeNull();
+});
+
+test.each([
+  ['whitespace', '   '],
+  ['slash-only', '///'],
+])('a stored %s model identity refuses instead of disabling embeddings', async (_label, model) => {
+  await setStoredEmbedding(model, '1536');
+  const error = await expectEmbeddingConfiguration({ engine: 'pglite' } as GBrainConfig);
+  expect(error.suggestion).toContain(JSON.stringify(model));
+});
+
+test.each([
+  ['missing', null],
+  ['invalid', 'not-a-number'],
+  ['unsafe', '9007199254740992'],
+])('an unresolved bare model with %s dimensions refuses without migration guidance', async (_label, dimensions) => {
+  await setStoredEmbedding('text-embedding-3-small', dimensions);
+  const error = await expectEmbeddingConfiguration({ engine: 'pglite' } as GBrainConfig);
+  expect(error.suggestion).toContain('positive safe integer');
+  expect(error.suggestion).not.toContain('gbrain migrate embeddings');
+});
+
+test('a bare model mismatched with the selected brain refuses migration rather than resolving by model name alone', async () => {
+  await setStoredEmbedding('text-embedding-3-small', '1536');
+  const error = await expectEmbeddingConfiguration({
+    engine: 'pglite', embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536,
+  } as GBrainConfig);
+  expect(error.suggestion).toContain('gbrain migrate embeddings --to <provider>:text-embedding-3-small --dry-run');
+});
+
+test('a provider-qualified model refuses when its configured dimensions differ from the facts vector column', async () => {
+  await setStoredEmbedding('openai:text-embedding-3-small', '1024');
+  const error = await expectEmbeddingConfiguration({ engine: 'pglite' } as GBrainConfig);
+  expect(error.suggestion).toContain('configured for 1024');
+  expect(error.suggestion).toContain('1536-dimension vectors');
 });

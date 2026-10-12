@@ -134,7 +134,8 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
   if (!storedModel) return null;
   const model = resolveStoredFactsEmbeddingModel(storedModel, config.embedding_model);
   const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
-  if (!model && !/[:/]/.test(storedModel) && /^[^\s]+$/.test(storedModel) && dimensions) {
+  if (!model && !/[:/]/.test(storedModel) && /^[^\s]+$/.test(storedModel)
+    && dimensions !== null && Number.isSafeInteger(dimensions)) {
     // #6113: a legacy row stores the model without its provider. Name the one supported rewrite (a preview first).
     const signature = currentEmbeddingSignature();
     const gateway = signature ? signature.slice(0, signature.lastIndexOf(':')) : null;
@@ -144,10 +145,9 @@ export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: 
       + `Preview the supported rewrite with gbrain migrate embeddings --to ${target ?? `<provider>:${storedModel}`} --dry-run and show the user its cost: it re-embeds active facts, so applying it needs the user's paid authorization.`,
       { fix: target ? readFix(`Previews rewriting the brain's embedding identity to ${target}, read-only.`, { argv: ['gbrain', 'migrate', 'embeddings', '--to', target, '--dry-run'] }) : embeddingsFix() });
   }
-  if (!model) return null;
-  if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
+  if (!model || !/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
     throw opError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.',
-      `The brain's embedding_model (${JSON.stringify(model)}) is not provider:model or embedding_dimensions is not a positive integer, so fact extraction stopped before admission. Check embedding readiness; correcting the configuration is the user's decision.`,
+      `The brain's embedding_model (${JSON.stringify(storedModel)}) cannot be resolved to provider:model or embedding_dimensions is not a positive safe integer, so fact extraction stopped before admission. Check embedding readiness; correcting the configuration is the user's decision.`,
       { fix: embeddingsFix() });
   }
   const shape = await readFactsEmbeddingDim(engine);
