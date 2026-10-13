@@ -3136,13 +3136,11 @@ export interface ChatOpts {
    */
   cacheSystem?: boolean;
   /**
-   * JSON Schema the reply must conform to (#4863). Honored ONLY on
-   * openai-compatible recipes that declare `supports_structured_outputs` —
-   * backends that enforce `response_format: json_schema` server-side
-   * (Ollama's grammar-constrained decoding). Every other lane ignores the
-   * field, so native / claude-cli calls are byte-identical with or without
-   * it, and the reply still arrives as `text`: callers keep parsing and
-   * validating it themselves (see `jsonSchemaOutput`).
+   * JSON Schema the reply must conform to (#4863). Honored on recipes that
+   * declare `supports_structured_outputs` — native OpenAI and compatible
+   * backends that enforce `response_format: json_schema` server-side. Other
+   * lanes ignore the field, and the reply still arrives as `text`: callers
+   * keep parsing and validating it themselves (see `jsonSchemaOutput`).
    */
   responseSchema?: { name: string; description?: string; schema: Record<string, unknown> };
   /** Caller purpose (`skillopt.judge`, …) stamped on the BudgetTracker ledger row. */
@@ -3719,18 +3717,18 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
       }
     : opts.system;
 
-  // #4863: schema-constrained decoding for openai-compatible backends that
-  // honor json_schema. Gated on the recipe declaration so a backend that
+  // #4863: schema-constrained decoding for recipes that honor json_schema.
+  // Gated on the recipe declaration so a backend that
   // would reject the schema is never sent one; a declared backend that
   // ignores it just returns unconstrained text, which the caller's parse
-  // lane already handles. Native + claude-cli lanes never see the field.
+  // lane already handles. Recipes without the declaration (including
+  // claude-cli) never see the field.
   // A declared backend that REJECTS it at call time (older Ollama build,
   // strict proxy) gets one schemaless retry below and is remembered in
   // `_structuredOutputRejectedRecipes` — the same process-lifetime memory
   // expand() keeps — so the caller's own retry lanes don't re-pay the
   // rejection and turn every call into a permanent provider_error.
   const output = opts.responseSchema
-    && recipe.implementation === 'openai-compatible'
     && recipeSupportsStructuredOutputs(recipe)
     && !_structuredOutputRejectedRecipes.has(recipe.id)
     ? jsonSchemaOutput(opts.responseSchema)

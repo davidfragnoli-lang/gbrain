@@ -318,13 +318,12 @@ export interface ChatTouchpoint {
   thinking_by_default?: boolean | ((modelId: string) => boolean);
   /**
    * Backend honors OpenAI structured outputs (a strict `json_schema`
-   * response_format). Threaded into `createOpenAICompatible`'s
-   * `supportsStructuredOutputs` so query expansion's `generateObject` sends a
-   * real schema (strict validation) instead of degrading to schemaless JSON.
-   * Default false: an openai-compatible recipe may front arbitrary backends,
-   * most of which lack strict json_schema support, so `expand()` routes them
-   * through the schemaless text path. Opt in per recipe when the backend is
-   * known to honor it.
+   * response_format). For compatible providers this is also threaded into
+   * `createOpenAICompatible`'s `supportsStructuredOutputs`, so query
+   * expansion's `generateObject` sends a real schema instead of degrading to
+   * schemaless JSON. Default false because a compatible recipe may front an
+   * arbitrary backend; opt in per native or compatible recipe only when the
+   * backend is known to honor it.
    */
   supports_structured_outputs?: boolean;
   /** Per-model overrides for providers whose chat models have different context windows. */
