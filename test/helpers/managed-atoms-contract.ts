@@ -245,10 +245,11 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
       // #6325: a malformed batch is retried automatically (one strike per completed failure).
       expect(calls).toBe(scenario === 'malformed' ? 2 : 1);
       expect(replay.status).toBe(scenario === 'malformed' ? 'warn' : 'ok');
-      const atoms = await engine.executeRaw<{ slug: string; visibility: string }>("SELECT slug,frontmatter->>'visibility' AS visibility FROM pages WHERE source_id=$1 AND type='atom'", [sourceId]);
+      const atoms = await engine.executeRaw<{ slug: string; visibility: string; source_hash: string }>("SELECT slug,frontmatter->>'visibility' AS visibility,frontmatter->>'source_hash' AS source_hash FROM pages WHERE source_id=$1 AND type='atom'", [sourceId]);
       expect(atoms).toHaveLength(scenario === 'zero_yield' || scenario === 'malformed' ? 0 : 1);
       if (atoms.length) {
         expect(atoms[0].visibility).toBe('private');
+        expect(atoms[0].source_hash).toBe(page.content_hash!.slice(0, 16));
         expect(await engine.executeRaw('SELECT c.id FROM content_chunks c JOIN pages p ON p.id=c.page_id WHERE p.source_id=$1 AND p.slug=$2', [sourceId, atoms[0].slug])).not.toHaveLength(0);
         if (!transcript) expect(await engine.executeRaw('SELECT l.id FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id WHERE f.source_id=$1 AND t.source_id=$1 AND f.slug=$2 AND t.slug=$3', [sourceId, page.slug, atoms[0].slug])).toHaveLength(1);
         if (root) expect(readFileSync(join(root, `${atoms[0].slug}.md`), 'utf8')).toContain('visibility: private');
@@ -621,7 +622,11 @@ export async function exerciseManagedAtomBatch(engine: BrainEngine, scenario: ty
       expect(completionLocks).toContainEqual(expect.arrayContaining(slugs.map(slug => ({ sourceId, slug }))));
       const atoms = await engine.executeRaw<{ slug: string; source_hash: string }>("SELECT slug,frontmatter->>'source_hash' AS source_hash FROM pages WHERE source_id=$1 AND type='atom' ORDER BY slug", [sourceId]);
       expect(atoms).toHaveLength(scenario === 'partial_publication' || scenario === 'missing_after_provenance' ? 1 : 2);
-      for (const atom of atoms) expect(atom.source_hash).toBe(`pending:${page.content_hash!.slice(0, 16)}`);
+      // Managed publication is guarded by its batch checkpoint, rather than
+      // the unmanaged pending-hash flip. Even a partial batch therefore keeps
+      // canonical DB/file bytes aligned on the final content hash while the
+      // absent checkpoint leaves the origin retryable.
+      for (const atom of atoms) expect(atom.source_hash).toBe(page.content_hash!.slice(0, 16));
       expect(await engine.executeRaw('SELECT page_id FROM extract_atoms_page_state WHERE page_id=$1', [page.id])).toEqual([]);
       expect(await engine.executeRaw("SELECT fingerprint FROM op_checkpoints WHERE op='managed-atoms' AND completed_keys->0->>'sourceId'=$1", [sourceId])).toEqual([]);
       expect((await discoverExtractablePages(engine, sourceId)).map(item => item.slug)).toEqual([page.slug]);

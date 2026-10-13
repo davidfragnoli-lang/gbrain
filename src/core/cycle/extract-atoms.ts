@@ -1420,8 +1420,13 @@ export async function runPhaseExtractAtoms(
             {
               atom_type: atom.atom_type,
               ...originFrontmatter,
-              // Provisional until the whole item's atoms persist (see above).
-              source_hash: `pending:${hash16}`,
+              // Unmanaged writes need a provisional receipt because atom rows
+              // and completion are separate local mutations. Managed writes
+              // are instead gated by the durable managed-atoms checkpoint:
+              // their canonical page/file must carry the final hash at first
+              // publication because the batch-completion request is a DB-only
+              // receipt and cannot rewrite every published markdown file.
+              source_hash: managed ? hash16 : `pending:${hash16}`,
               visibility, ...(origin ? { managed_extraction: true } : {}),
               ...quoteFields,
               ...(atom.lesson && { lesson: atom.lesson }),
