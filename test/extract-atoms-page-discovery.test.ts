@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   discoverExtractablePages,
+  runPhaseExtractAtoms as runPartitionedPhase,
 } from '../src/core/cycle/extract-atoms.ts';
 import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
@@ -231,6 +232,37 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
 
     const discovered = await discoverExtractablePages(engine, 'default', ['meeting/a', 'meeting/c']);
     expect(discovered.map((d) => d.slug).sort()).toEqual(['meeting/a', 'meeting/c']);
+  });
+
+  test('stable page-id partitions are disjoint and cover the candidate set', async () => {
+    for (let i = 0; i < 20; i++) await seedPage({ slug: `meeting/partition-${i}`, type: 'meeting' });
+    const [all, left, right] = await Promise.all([
+      discoverExtractablePages(engine, 'default', undefined, 100),
+      discoverExtractablePages(engine, 'default', undefined, 100, { index: 0, total: 2 }),
+      discoverExtractablePages(engine, 'default', undefined, 100, { index: 1, total: 2 }),
+    ]);
+    const a = new Set(left.map(p => p.slug));
+    const b = new Set(right.map(p => p.slug));
+    expect([...a].filter(slug => b.has(slug))).toEqual([]);
+    expect([...a, ...b].sort()).toEqual(all.map(p => p.slug).sort());
+  });
+
+  test('two concurrent partitions produce one atom per page with no duplicates', async () => {
+    for (let i = 0; i < 8; i++) await seedPage({ slug: `meeting/concurrent-${i}`, type: 'meeting' });
+    let call = 0;
+    const chat = async (_opts: ChatOpts): Promise<ChatResult> => {
+      const title = `partition-atom-${++call}`;
+      const text = `[{"title":"${title}","atom_type":"insight","body":"bounded fact"}]`;
+      return { text, blocks: [{ type: 'text', text }], stopReason: 'end', usage: { input_tokens: 10, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 }, model: 'openai:gpt-4o-mini', providerId: 'openai' };
+    };
+    const [left, right] = await Promise.all([
+      runPartitionedPhase(engine, { sourceId: 'default', pagesOnly: true, partition: { index: 0, total: 2 }, pageLimit: 100, modelOverride: 'openai:gpt-4o-mini', maxCostUsd: 1, _chat: chat }),
+      runPartitionedPhase(engine, { sourceId: 'default', pagesOnly: true, partition: { index: 1, total: 2 }, pageLimit: 100, modelOverride: 'openai:gpt-4o-mini', maxCostUsd: 1, _chat: chat }),
+    ]);
+    const processed = Number(left.details?.pages_processed ?? 0) + Number(right.details?.pages_processed ?? 0);
+    const atoms = await engine.executeRaw<{ cnt: number }>(`SELECT COUNT(*)::int AS cnt FROM pages WHERE source_id='default' AND type='atom' AND deleted_at IS NULL`);
+    expect(processed).toBe(8);
+    expect(Number(atoms[0]?.cnt)).toBe(8);
   });
 
   test('executeRaw failure returns [] (fail-soft, transcript path proceeds)', async () => {

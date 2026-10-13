@@ -101,6 +101,10 @@ interface DreamArgs {
    * skillopt, drift) — a no-op for phases that always run when named directly.
    */
   once: boolean;
+  modelOverride: string | null;
+  maxCostUsd: number | null;
+  partition: { index: number; total: number } | null;
+  maxPages: number | null;
 }
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -256,6 +260,24 @@ function parseArgs(args: string[]): DreamArgs {
     }
   }
 
+  const modelIdx = args.indexOf('--model');
+  const modelOverride = modelIdx === -1 ? null : args[modelIdx + 1] ?? null;
+  if (modelIdx !== -1 && !modelOverride) dreamExit(usageError('--model requires provider:model', 'Example: --model openai:gpt-5-mini'), json);
+  const costIdx = args.indexOf('--max-cost-usd');
+  const maxCostUsd = costIdx === -1 ? null : Number(args[costIdx + 1]);
+  if (costIdx !== -1 && (!Number.isFinite(maxCostUsd) || maxCostUsd! <= 0)) dreamExit(usageError('--max-cost-usd must be a positive number', 'Example: --max-cost-usd 50'), json);
+  const partitionIdx = args.indexOf('--partition');
+  let partition: { index: number; total: number } | null = null;
+  if (partitionIdx !== -1) {
+    const match = /^(\d+)\/(\d+)$/.exec(args[partitionIdx + 1] ?? '');
+    if (!match || Number(match[2]) < 2 || Number(match[1]) >= Number(match[2])) dreamExit(usageError('--partition must be zero-based k/N with N >= 2 and k < N', 'Example: --partition 1/2'), json);
+    partition = { index: Number(match[1]), total: Number(match[2]) };
+  }
+  const maxPagesIdx = args.indexOf('--max-pages');
+  const maxPages = maxPagesIdx === -1 ? null : Number(args[maxPagesIdx + 1]);
+  if (maxPagesIdx !== -1 && (!Number.isInteger(maxPages) || maxPages! <= 0)) dreamExit(usageError('--max-pages must be a positive integer', 'Example: --max-pages 50'), json);
+  if ((modelOverride || maxCostUsd || partition || maxPages) && !drain) dreamExit(usageError('--model, --max-cost-usd, --partition and --max-pages require --drain', 'Example: gbrain dream --drain --partition 1/2 --model openai:gpt-5-mini --max-cost-usd 50'), json);
+
   // issue #2860: --once requires an EXPLICIT single --phase target (typed
   // by the user, not merely implied by --input/--drain — see
   // `phaseWasExplicit` above). Bare `--once` (full/default cycle) has no
@@ -309,6 +331,10 @@ function parseArgs(args: string[]): DreamArgs {
     drain,
     windowSeconds,
     once,
+    modelOverride,
+    maxCostUsd,
+    partition,
+    maxPages,
   };
 }
 
@@ -421,6 +447,10 @@ Options:
                       filesystem phases (lint, backlinks, sync, synthesize,
                       extract, patterns) are skipped (reason: no_brain_dir)
                       and the DB-only phases still run.
+  --model <route>     Per-drain extract_atoms model override; does not change config
+  --max-cost-usd <n>  Hard cost ceiling for this drain invocation
+  --partition <k/N>   Zero-based deterministic page-id partition (example: 1/2)
+  --max-pages <n>     Process at most n DB pages in one measured batch
 
   --source <id>       Scope the cycle to one source so doctor's
                       cycle_freshness check sees a fresh stamp on
@@ -625,6 +655,10 @@ async function runDrain(
       sourceId: resolvedSourceId,
       windowSeconds: opts.windowSeconds,
       brainDir: brainDir ?? undefined,
+      modelOverride: opts.modelOverride ?? undefined,
+      maxCostUsd: opts.maxCostUsd ?? undefined,
+      partition: opts.partition ?? undefined,
+      pageLimit: opts.maxPages ?? undefined,
       onBatch: opts.json ? undefined : ({ batch, extracted, remaining }) => {
         process.stderr.write(`[drain] batch ${batch}: +${extracted} atom(s), ~${remaining ?? '?'} remaining\n`);
       },
@@ -678,7 +712,7 @@ async function runDrain(
 }
 
 function drainCommand(opts: DreamArgs): string {
-  return `gbrain dream --drain --window ${opts.windowSeconds}${opts.source ? ` --source ${opts.source}` : ''}`;
+  return `gbrain dream --drain --window ${opts.windowSeconds}${opts.source ? ` --source ${opts.source}` : ''}${opts.modelOverride ? ` --model ${opts.modelOverride}` : ''}${opts.maxCostUsd ? ` --max-cost-usd ${opts.maxCostUsd}` : ''}${opts.partition ? ` --partition ${opts.partition.index}/${opts.partition.total}` : ''}${opts.maxPages ? ` --max-pages ${opts.maxPages}` : ''}`;
 }
 
 export async function runDream(engine: BrainEngine | null, args: string[]): Promise<CycleReport | void> {

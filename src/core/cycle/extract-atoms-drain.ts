@@ -139,6 +139,10 @@ export interface ExtractAtomsDrainOpts {
   signal?: AbortSignal;
   /** Absolute job deadline (epoch ms, `deadlineAtMs` clock); a hard stop at that instant. */
   deadlineAtMs?: number | null;
+  modelOverride?: string;
+  maxCostUsd?: number;
+  partition?: { index: number; total: number };
+  pageLimit?: number;
   /** Upper bound on one backlog count; the remaining deadline caps it further. Default 60 s. */
   countTimeoutMs?: number;
 }
@@ -482,7 +486,10 @@ export async function runExtractAtomsDrainForSource(
   const { MaintenanceWriteWait } = await import('../persistence/maintenance-wait.ts');
 
   const extractionSourceId = opts.sourceId ?? 'default';
-  const lockId = cycleLockIdFor(opts.sourceId);
+  const baseLockId = cycleLockIdFor(opts.sourceId);
+  const lockId = opts.partition
+    ? `${baseLockId}:extract-atoms:${opts.partition.index}-of-${opts.partition.total}`
+    : baseLockId;
   // #5856/#5854: one call is one attempt; its batches share one BudgetTracker
   // (the per-run cap holds for the whole attempt) and one publish wait.
   const attempt: NonNullable<ExtractAtomsOpts['attempt']> = { writeWait: new MaintenanceWriteWait(opts.deadlineAtMs ?? null) };
@@ -498,6 +505,11 @@ export async function runExtractAtomsDrainForSource(
           signal,
           stopSignal,
           attempt,
+          modelOverride: opts.modelOverride,
+          maxCostUsd: opts.maxCostUsd,
+          partition: opts.partition,
+          pageLimit: opts.pageLimit,
+          pagesOnly: opts.partition !== undefined || opts.pageLimit !== undefined,
         });
         const d = (r.details ?? {}) as Record<string, unknown>;
         // issue #3218: `r.status` collapses to 'warn' whether ONE item failed
@@ -535,13 +547,13 @@ export async function runExtractAtomsDrainForSource(
           budget: { spentUsd: Number(d.estimated_spend_usd ?? 0), capUsd: Number(d.budget_usd ?? 0) },
         };
       },
-      countRemaining: (signal) => countExtractAtomsBacklog(engine, extractionSourceId, { signal }),
+      countRemaining: (signal) => countExtractAtomsBacklog(engine, extractionSourceId, { signal, partition: opts.partition }),
       now: Date.now,
       onBatch: opts.onBatch,
     },
     {
       windowMs: opts.windowSeconds * 1000,
-      maxBatches: opts.maxBatches,
+      maxBatches: opts.pageLimit === undefined ? opts.maxBatches : 1,
       signal: opts.signal,
       deadlineAtMs: opts.deadlineAtMs,
     },

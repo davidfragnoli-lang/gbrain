@@ -194,6 +194,12 @@ export interface ExtractAtomsOpts {
   sourceId?: string;
   dryRun?: boolean;
   affectedSlugs?: string[];
+  /** Invocation-scoped controls; these never mutate global configuration. */
+  modelOverride?: string;
+  maxCostUsd?: number;
+  partition?: { index: number; total: number };
+  pageLimit?: number;
+  pagesOnly?: boolean;
   /** Test seam: alternative chat function (bypasses real LLM calls). */
   _chat?: typeof gatewayChat;
   /**
@@ -411,6 +417,7 @@ export async function discoverExtractablePages(
   sourceId: string,
   affectedSlugs?: string[],
   limit: number = PAGE_DISCOVERY_BUDGET,
+  partition?: { index: number; total: number },
 ): Promise<AtomPageInput[]> {
   const hasFilter = Array.isArray(affectedSlugs) && affectedSlugs.length > 0;
   const connectorExclusion = await connectorAtomExclusionSql(engine);
@@ -432,6 +439,7 @@ export async function discoverExtractablePages(
       ${MANAGED_ATOM_DISCOVERY_SQL}
       ${PAGE_SCAN_STATE_EXCLUSION_SQL}
       ${connectorExclusion}
+      ${partition ? `AND mod(('x' || substr(md5(p.id::text), 1, 8))::bit(32)::bigint, ${partition.total}) = ${partition.index}` : ''}
       ${hasFilter ? "AND p.slug = ANY($5::text[])" : ''}
       AND NOT EXISTS (
         SELECT 1
@@ -571,7 +579,7 @@ async function activeLibraryMutation(engine: BrainEngine): Promise<string | null
 export async function countExtractAtomsBacklog(
   engine: BrainEngine,
   sourceId?: string,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; partition?: { index: number; total: number } } = {},
 ): Promise<number | null> {
   try {
     // Two modes: scoped (the phase's per-source `remaining`) vs brain-wide
@@ -593,6 +601,7 @@ export async function countExtractAtomsBacklog(
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
            ${connectorExclusion}
+           ${opts.partition ? `AND mod(('x' || substr(md5(p.id::text), 1, 8))::bit(32)::bigint, ${opts.partition.total}) = ${opts.partition.index}` : ''}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
              WHERE atom.type = 'atom' AND atom.source_id = $1
@@ -796,6 +805,7 @@ export async function runPhaseExtractAtoms(
   // Configured transcript corpus paths are brain-global, so only default discovers them.
   if (
     sourceId === 'default'
+    && !opts.pagesOnly
     && transcripts.length === 0
     && opts.brainDir !== undefined
     && opts._transcripts === undefined
@@ -841,7 +851,8 @@ export async function runPhaseExtractAtoms(
       engine,
       sourceId,
       opts.affectedSlugs,
-      await resolvePageDiscoveryLimit(engine),
+      opts.pageLimit ?? await resolvePageDiscoveryLimit(engine),
+      opts.partition,
     );
   }
 
@@ -994,11 +1005,16 @@ export async function runPhaseExtractAtoms(
   let pacingMs = 0;
   let extractConcurrency = DEFAULT_EXTRACT_CONCURRENCY;
   try {
-    extractModel = await resolveExtractAtomsModel(engine);
+    extractModel = opts.modelOverride ?? await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
       const n = Number(configuredBudget);
       if (Number.isFinite(n) && n > 0) { budgetCap = n; explicitBudget = true; }
+    }
+    if (opts.maxCostUsd !== undefined) {
+      if (!Number.isFinite(opts.maxCostUsd) || opts.maxCostUsd <= 0) throw new Error('maxCostUsd must be positive');
+      budgetCap = opts.maxCostUsd;
+      explicitBudget = true;
     }
     // #4529: legacy input-cap key (its own floor of 500 chars, as landed).
     // Read FIRST so the newer #4540 max_input_chars key below wins when
