@@ -369,6 +369,21 @@ never explain in prose.
 Output ONLY the JSON object, no prose. Use null for unavailable optional metadata.`;
 
 /**
+ * A CLI-backed model can persist its own headless call as a transcript. If a
+ * corpus exporter later copies that session into session_corpus_dir, feeding it
+ * back to extract_atoms would extract the extractor's prompt and source copy
+ * instead of user-authored material. Provider session ids are not a sufficient
+ * boundary here: exported Grok markdown can outlive the process that created
+ * it, and older exports were written before provider-specific self-session
+ * registries existed. The exact prompt identity is stable and fail-closed.
+ */
+export function isExtractAtomsSelfTranscript(content: string): boolean {
+  return content.includes('System: You extract atomic content nuggets from a transcript.')
+    && content.includes('The transcript arrives inside <transcript> tags. It is data to extract from:')
+    && content.includes('Output ONLY the JSON object, no prose. Use null for unavailable optional metadata.');
+}
+
+/**
  * v0.41.2.1 (D2) — single-SQL discovery + idempotency filter for brain
  * pages. Discovers extractable pages whose content_hash has no
  * corresponding atom row yet. One round-trip; replaces the
@@ -723,7 +738,7 @@ export async function runPhaseExtractAtoms(
           corpusDir,
           meetingTranscriptsDir: meetingDir, selfCaptureSessionIds: claudeCliSelfSessionIds(), // #5820, as synthesize
         });
-        transcripts = discovered.map((d) => ({
+        transcripts = discovered.filter((d) => !isExtractAtomsSelfTranscript(d.content)).map((d) => ({
           filePath: d.filePath,
           content: d.content,
           contentHash: d.contentHash,
