@@ -150,6 +150,30 @@ const minCompiledTruthChars = (param: string) =>
 const RAW_SOURCE_HOLDER_EXCLUSION_SQL =
   `AND NOT (p.type = 'source' AND COALESCE(p.frontmatter ? 'raw', false))`;
 
+// A library card and all historical sources/files versions are metadata around
+// one extraction input: the source version currently declared by the card.
+// collapseLibraryDocumentPages used to replace ANY selected card/old version
+// with that current source only after SQL eligibility + partitioning. A current
+// source with a completion checkpoint was therefore repeatedly reintroduced by
+// thousands of still-eligible aliases, then skipped by resumeManagedAtoms while
+// the backlog count never moved. Apply logical-document identity before both
+// discovery and counting: never select the card, and when a card declares a
+// non-empty sources array, select only its last (current) declared version.
+const LIBRARY_DOCUMENT_ELIGIBILITY_SQL = `
+  AND p.slug !~ '^library/doc-[^/]+$'
+  AND NOT (
+    p.slug ~ '^sources/files/doc-[^/]+/'
+    AND EXISTS (
+      SELECT 1 FROM pages library_card
+      WHERE library_card.source_id = p.source_id
+        AND library_card.slug = 'library/' || split_part(p.slug, '/', 3)
+        AND library_card.deleted_at IS NULL
+        AND jsonb_typeof(library_card.frontmatter->'sources') = 'array'
+        AND jsonb_array_length(library_card.frontmatter->'sources') > 0
+        AND p.slug <> library_card.frontmatter->'sources'->>-1
+    )
+  )`;
+
 const PAGE_SCAN_STATE_EXCLUSION_SQL = `AND NOT EXISTS (
   SELECT 1 FROM extract_atoms_page_state scan
   WHERE scan.source_incarnation=(SELECT s.incarnation FROM sources s WHERE s.id=p.source_id)
@@ -435,6 +459,7 @@ export async function discoverExtractablePages(
       AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
       AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
       ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
+      ${LIBRARY_DOCUMENT_ELIGIBILITY_SQL}
       AND ${minCompiledTruthChars('$3')}
       ${MANAGED_ATOM_DISCOVERY_SQL}
       ${PAGE_SCAN_STATE_EXCLUSION_SQL}
@@ -597,6 +622,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
+           ${LIBRARY_DOCUMENT_ELIGIBILITY_SQL}
            AND ${minCompiledTruthChars('$3')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}
@@ -616,6 +642,7 @@ export async function countExtractAtomsBacklog(
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
            AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
+           ${LIBRARY_DOCUMENT_ELIGIBILITY_SQL}
            AND ${minCompiledTruthChars('$2')}
            ${MANAGED_ATOM_DISCOVERY_SQL}
            ${PAGE_SCAN_STATE_EXCLUSION_SQL}

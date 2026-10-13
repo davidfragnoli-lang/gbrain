@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
+  countExtractAtomsBacklog,
   discoverExtractablePages,
   runPhaseExtractAtoms as runPartitionedPhase,
 } from '../src/core/cycle/extract-atoms.ts';
@@ -192,6 +193,40 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
 
     const discovered = await discoverExtractablePages(engine, 'default');
     expect(discovered.map((d) => d.slug)).toEqual(['source/normal']);
+  });
+
+  test('completed library source is not rediscovered through its stable card', async () => {
+    const documentId = 'doc-1234567890abcdefabcd';
+    const sourceSlug = `sources/files/${documentId}/version-one`;
+    const historicalSlug = `sources/files/${documentId}/version-zero`;
+    const sourceHash = 'librarysourcehash1234567890';
+    await seedPage({
+      slug: historicalSlug,
+      type: 'source',
+      compiled_truth: 'Historical document source text. '.repeat(30),
+    });
+    await seedPage({
+      slug: sourceSlug,
+      type: 'source',
+      content_hash: sourceHash,
+      compiled_truth: 'Canonical document source text. '.repeat(30),
+    });
+    await seedPage({
+      slug: `library/${documentId}`,
+      type: 'source',
+      compiled_truth: 'Stable document card summary. '.repeat(30),
+      frontmatter: { sources: [historicalSlug, sourceSlug] },
+    });
+    await engine.putPage('atoms/2026-10-13/library-fact', {
+      type: 'atom' as never,
+      title: 'Library fact',
+      compiled_truth: 'A fact already extracted from the document.',
+      timeline: '',
+      frontmatter: { source_slug: `library/${documentId}`, source_hash: sourceHash.slice(0, 16) },
+    }, { sourceId: 'default' });
+
+    expect(await countExtractAtomsBacklog(engine, 'default')).toBe(0);
+    expect(await discoverExtractablePages(engine, 'default')).toEqual([]);
   });
 
   test('pages with NULL content_hash excluded (D9 #3 — no .slice crash)', async () => {
