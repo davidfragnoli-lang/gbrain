@@ -17,7 +17,7 @@ import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { retryManagedAtomBatch } from '../../src/core/persistence/atom-retry.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { withSubmissionAuthority } from '../../src/core/minions/submission-authority.ts';
-import { serializePageToMarkdown } from '../../src/core/markdown.ts';
+import { parseMarkdown, serializePageToMarkdown } from '../../src/core/markdown.ts';
 import { digest, sha256 } from '../../src/core/persistence/digest.ts';
 import { purgeStaleCheckpoints } from '../../src/core/op-checkpoint.ts';
 import { __setChatTransportForTests } from '../../src/core/ai/gateway.ts';
@@ -248,11 +248,18 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
       const atoms = await engine.executeRaw<{ slug: string; visibility: string; source_hash: string }>("SELECT slug,frontmatter->>'visibility' AS visibility,frontmatter->>'source_hash' AS source_hash FROM pages WHERE source_id=$1 AND type='atom'", [sourceId]);
       expect(atoms).toHaveLength(scenario === 'zero_yield' || scenario === 'malformed' ? 0 : 1);
       if (atoms.length) {
+        const originHash = transcript ? sha256(page.compiled_truth) : page.content_hash!;
         expect(atoms[0].visibility).toBe('private');
-        expect(atoms[0].source_hash).toBe(page.content_hash!.slice(0, 16));
+        expect(atoms[0].source_hash).toBe(originHash.slice(0, 16));
         expect(await engine.executeRaw('SELECT c.id FROM content_chunks c JOIN pages p ON p.id=c.page_id WHERE p.source_id=$1 AND p.slug=$2', [sourceId, atoms[0].slug])).not.toHaveLength(0);
         if (!transcript) expect(await engine.executeRaw('SELECT l.id FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id WHERE f.source_id=$1 AND t.source_id=$1 AND f.slug=$2 AND t.slug=$3', [sourceId, page.slug, atoms[0].slug])).toHaveLength(1);
-        if (root) expect(readFileSync(join(root, `${atoms[0].slug}.md`), 'utf8')).toContain('visibility: private');
+        if (root) {
+          const file = readFileSync(join(root, `${atoms[0].slug}.md`), 'utf8');
+          const parsed = parseMarkdown(file, `${atoms[0].slug}.md`);
+          expect(parsed.frontmatter.visibility).toBe('private');
+          expect(parsed.frontmatter.source_hash).toBe(atoms[0].source_hash);
+          expect(String(parsed.frontmatter.source_hash)).not.toStartWith('pending:');
+        }
       }
       if (connectorDir) {
         // Database-only, exactly as the connector's own sync publishes: no file lands in its state directory.
