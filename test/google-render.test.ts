@@ -362,6 +362,31 @@ describe('renderThreadPage', () => {
     expect(renderThreadPage(mixed)).not.toBeNull();
   });
 
+  test('pure list mail does not materialize as a page', () => {
+    const newsletter = thread([
+      msg({
+        from: 'Agent News <editor@newsletter.example.com>',
+        fromAddress: 'editor@newsletter.example.com',
+        listUnsubscribe: true,
+      }),
+    ]);
+    expect(renderThreadPage(newsletter)).toBeNull();
+  });
+
+  test('a list-mail thread with an owner reply still materializes', () => {
+    const replied = thread([
+      msg({ listUnsubscribe: true }),
+      msg({
+        id: '18c2f4a9b3d21e09',
+        from: 'Owner <a@example.com>',
+        fromAddress: 'a@example.com',
+        labelIds: ['SENT'],
+        listUnsubscribe: false,
+      }),
+    ]);
+    expect(renderThreadPage(replied)).not.toBeNull();
+  });
+
   test('signature-request thread renders with noise: signature-request', () => {
     const sig = thread([
       msg({

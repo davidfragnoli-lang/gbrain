@@ -232,7 +232,14 @@ export interface RenderedPage {
  */
 export function renderThreadPage(thread: GmailThreadData): RenderedPage | null {
   if (thread.messages.length === 0) return null;
-  const nonNoise = thread.messages.filter((m) => !isNoiseSender(m.fromAddress));
+  // List mail is self-declared bulk mail. Keep a thread only when it also has
+  // a substantive non-list message (including an owner's SENT reply). This
+  // implements the email-to-brain recipe at the page-admission boundary,
+  // rather than merely preventing newsletters from opening loops after they
+  // have already polluted the source corpus.
+  const nonNoise = thread.messages.filter((m) =>
+    m.labelIds.includes('SENT') || (!isNoiseSender(m.fromAddress) && !m.listUnsubscribe),
+  );
   if (nonNoise.length === 0) return null;
 
   const first = thread.messages[0];

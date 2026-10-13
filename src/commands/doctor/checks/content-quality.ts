@@ -13,6 +13,7 @@ import { checkUnverifiedExtractions } from './extraction-sync.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { agentFix, checkError } from '../check-fix.ts';
+import { isQuarantined } from '../../../core/quarantine.ts';
 
 async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   const { args, progress } = ctx;
@@ -170,12 +171,32 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   try {
     const { readRecentContentSanityEvents, summarizeContentSanityEvents } =
       await import('../../../core/audit/content-sanity-audit.ts');
-    const events = readRecentContentSanityEvents(7);
+    const rawEvents = readRecentContentSanityEvents(7);
+    // A quarantine event is an operator inbox item, not an irrevocable
+    // seven-day outage. `gbrain quarantine clear` (false positive) and
+    // `gbrain delete` (confirmed junk) are the supported review actions.
+    // Reconcile those append-only audit rows against current page state so a
+    // completed review acknowledges the event without editing audit history
+    // or weakening the content gate. Reject/hard-block events still have no
+    // page to inspect and therefore remain active for the full audit window.
+    const activeQuarantine = new Map<string, boolean>();
+    for (const event of rawEvents) {
+      if (event.event_type !== 'quarantine') continue;
+      const key = `${event.source_id}\0${event.slug}`;
+      if (activeQuarantine.has(key)) continue;
+      const page = await engine.getPage(event.slug, { sourceId: event.source_id });
+      activeQuarantine.set(key, !!page && isQuarantined(page.frontmatter));
+    }
+    const events = rawEvents.filter((event) =>
+      event.event_type !== 'quarantine' ||
+      activeQuarantine.get(`${event.source_id}\0${event.slug}`) === true,
+    );
+    const acknowledgedQuarantines = rawEvents.length - events.length;
     if (events.length === 0) {
       checks.push({
         name: 'content_sanity_audit_recent',
         status: 'ok',
-        message: 'No content-sanity events in last 7 days (audit JSONL is local to this host; share GBRAIN_AUDIT_DIR for multi-host visibility)',
+        message: `No unresolved content-sanity events in last 7 days${acknowledgedQuarantines > 0 ? ` (${acknowledgedQuarantines} reviewed quarantine event(s) acknowledged by current page state)` : ''} (audit JSONL is local to this host; share GBRAIN_AUDIT_DIR for multi-host visibility)`,
       });
     } else {
       const summary = summarizeContentSanityEvents(events);
@@ -207,7 +228,7 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       checks.push({
         name: 'content_sanity_audit_recent',
         status,
-        message: `${events.length} events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
+        message: `${events.length} unresolved events (hard=${hardBlocked} [hard_block=${summary.by_type.hard_block} reject=${summary.by_type.reject} quarantine=${summary.by_type.quarantine}] soft=${softBlocked} [soft_block=${summary.by_type.soft_block} flag=${summary.by_type.flag}] warn=${summary.by_type.warn})${acknowledgedQuarantines > 0 ? `, acknowledged quarantine events=${acknowledgedQuarantines}` : ''}${topPatterns ? ', patterns: ' + topPatterns : ''}${topSources ? ', sources: ' + topSources : ''}. (Local audit only — multi-host operators set GBRAIN_AUDIT_DIR.)`,
       });
     }
   } catch (err) {
