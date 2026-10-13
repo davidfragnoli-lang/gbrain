@@ -269,6 +269,7 @@ describe('archive demote (issue #1777)', () => {
     expect(DEFAULT_HARD_EXCLUDES).toContain('test/');
     expect(DEFAULT_HARD_EXCLUDES).toContain('attachments/');
     expect(DEFAULT_HARD_EXCLUDES).toContain('.raw/');
+    expect(DEFAULT_HARD_EXCLUDES).toContain('noise/');
   });
 
   test('resolveHardExcludes() never includes archive/ by default', () => {

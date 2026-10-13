@@ -68,6 +68,10 @@ export const DEFAULT_HARD_EXCLUDES: string[] = [
   'test/',
   'attachments/',
   '.raw/',
+  // Preserved source records explicitly classified as operational noise.
+  // They remain addressable through include_slug_prefixes, but never compete
+  // in ordinary search or feed search-driven enrichment.
+  'noise/',
 ];
 
 /**
