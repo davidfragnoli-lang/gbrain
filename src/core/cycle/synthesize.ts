@@ -2974,8 +2974,16 @@ async function reverseWriteRefs(
   signal?: AbortSignal,
 ): Promise<number> {
   let count = 0;
+  let storage: ReturnType<typeof loadStorageConfig> = null;
+  try {
+    storage = loadStorageConfig(brainDir);
+  } catch {
+    // Unreadable gbrain.yml keeps the historical fail-open behavior; sync
+    // remains responsible for reporting an invalid storage configuration.
+  }
   for (const { slug, source_id, first_write_at } of refs) {
     throwIfAborted(signal, '[dream] synthesize reverse-write');
+    if (storage && isDbOnly(slug, storage)) continue;
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
     const page = await engine.getPage(slug, { sourceId: source_id });

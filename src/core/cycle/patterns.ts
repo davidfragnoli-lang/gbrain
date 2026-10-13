@@ -48,6 +48,7 @@ import { normalizeModelId } from '../model-id.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { resolveCycleDate } from './cycle-date.ts';
 import { clearPatternsSourceDeaths, patternsBreakerSkip } from './dream-breaker.ts';
+import { isDbOnly, loadStorageConfig } from '../storage-config.ts';
 import { dedupePatternClaimSources, withClaimSources } from './pattern-claim-sources.ts';
 import { publishOrHold } from '../persistence/accepted-pending.ts';
 import { derivedMaintenanceTransaction, isExternalTier, type DerivationDeclaration } from '../trust/taint.ts';
@@ -822,8 +823,16 @@ async function reverseWriteRefs(
   signal?: AbortSignal,
 ): Promise<number> {
   let count = 0;
+  let storage: ReturnType<typeof loadStorageConfig> = null;
+  try {
+    storage = loadStorageConfig(brainDir);
+  } catch {
+    // Unreadable gbrain.yml keeps the historical fail-open behavior; sync
+    // remains responsible for reporting an invalid storage configuration.
+  }
   for (const { slug, source_id } of refs) {
     throwIfAborted(signal, '[dream] patterns reverse-write');
+    if (storage && isDbOnly(slug, storage)) continue;
     // v0.32.8 F6: guard against malformed source_id (would let join() break
     // out of brainDir). validateSourceId throws on `..`, `/`, etc.
     validateSourceId(source_id);
