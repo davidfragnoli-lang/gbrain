@@ -18,6 +18,9 @@ Subcommands:
 gbrain facts relink [flags]
   --source <id>          Source to repair (default: the resolved source)
   --dry-run              Show what would link; writes nothing, calls no model
+  --fence-email-index <path>  Link fence-owned facts from an exact-email proposal index;
+                             engine revalidates source, fence and unique live alias
+  --origin <s>           With --fence-email-index, require this exact fact origin
   --limit <n>            Facts to examine this run (default ${RELINK_DEFAULT_LIMIT})
   --after-id <n>         Start after this fact id (the printed continuation point)
   --since <ISO date>     Only facts created on or after this date
@@ -35,11 +38,12 @@ conflict sweep when that slot is on. Free tiers cost nothing; the model tier
 uses facts.extraction_model and stops at --max-usd.`;
 }
 
-interface ParsedArgs { opts: Omit<RelinkOptions, 'config'>; json: boolean; error?: string }
+interface ParsedArgs { opts: Omit<RelinkOptions, 'config'>; json:boolean; fenceEmailIndex?:string; factSource?:string; error?:string }
 
 function parseRelinkArgs(args: string[], sourceId: string): ParsedArgs {
   const opts: Omit<RelinkOptions, 'config'> = { sourceId, maxUsd: RELINK_DEFAULT_MAX_USD };
   let json = false;
+  let fenceEmailIndex:string|undefined; let factSource:string|undefined;
   const value = (i: number, flag: string): string => {
     const v = args[i + 1];
     if (v === undefined || v.startsWith('--')) throw new Error(`${flag} requires a value`);
@@ -54,6 +58,8 @@ function parseRelinkArgs(args: string[], sourceId: string): ParsedArgs {
       else if (a === '--retry-model') opts.retryModel = true;
       else if (a === '--include-private') opts.includePrivate = true;
       else if (a === '--no-conflict-queue') opts.conflictQueue = false;
+      else if (a === '--fence-email-index') { fenceEmailIndex=value(i,a); i++; }
+      else if (a === '--origin') { factSource=value(i,a); i++; }
       else if (a === '--source') { opts.sourceId = value(i, a); i++; }
       else if (a === '--limit' || a === '--after-id' || a === '--examples') {
         const n = Number(value(i, a));
@@ -78,9 +84,9 @@ function parseRelinkArgs(args: string[], sourceId: string): ParsedArgs {
       } else throw new Error(`unknown flag ${a}`);
     }
   } catch (err) {
-    return { opts, json, error: err instanceof Error ? err.message : String(err) };
+    return { opts, json, fenceEmailIndex, factSource, error: err instanceof Error ? err.message : String(err) };
   }
-  return { opts, json };
+  return { opts, json, fenceEmailIndex, factSource };
 }
 
 function continuation(report: RelinkReport, args: string[]): string | null {
@@ -146,6 +152,11 @@ export async function runFactsCommand(engine: BrainEngine, args: string[], confi
     return 1;
   }
   const isTty = process.stderr.isTTY === true;
+  if (parsed.fenceEmailIndex) {
+    const { runFenceEmailRelink } = await import('../core/facts/fence-email-relink.ts');
+    const report = await runFenceEmailRelink(engine,{sourceId:parsed.opts.sourceId,indexPath:parsed.fenceEmailIndex,dryRun:parsed.opts.dryRun,limit:parsed.opts.limit,factSource:parsed.factSource,config});
+    console.log(JSON.stringify(report,null,2)); return 0;
+  }
   const report = await runFactsRelink(engine, {
     ...parsed.opts, config,
     onModelStart: line => process.stderr.write(`[facts relink] ${line}\n`),

@@ -40,8 +40,8 @@ import { pageFencesNormalized } from '../fence-repair/report.ts';
 export const RELINK_OPERATION = 'relink_facts';
 
 /** One fact in a relink request: its pinned row hash and how its subject was found. */
-export interface RelinkIntentFact { id: number; hash: string; tier: string; model: string | null; note: string }
-export interface RelinkIntent { kind: 'relink_facts'; run_id: string; queue_conflict: boolean; facts: RelinkIntentFact[] }
+export interface RelinkIntentFact { id: number; hash: string; tier: string; model: string | null; note: string; target_slug?: string }
+export interface RelinkIntent { kind: 'relink_facts'; run_id: string; queue_conflict: boolean; facts: RelinkIntentFact[]; preserve_source_fence?: boolean }
 
 export interface RelinkGroupOutcome {
   linked: Array<{ id: number; row_num: number }>;
@@ -158,6 +158,23 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
   if (row.operation !== RELINK_OPERATION || intent?.kind !== 'relink_facts' || !Array.isArray(intent.facts) || row.authority.remote) {
     throw opError('permission_denied', 'Unsupported relink intent.',
       `Request ${row.request_id} is not a trusted local relink this gbrain version can publish, so nothing was written. Facts relink runs only from gbrain facts relink on the brain host.`);
+  }
+  if (intent.preserve_source_fence) {
+    const observedRevision = (await engine.readPageSnapshot(row.slug,{sourceId:row.source_id}))?.revision ?? null;
+    const validate = async(tx:BrainEngine) => { for(const f of intent.facts){const [snap]=await readFacts(tx,row.source_id,[f.id]);if(!snap||relinkFactHash(snap)!==f.hash||snap.value.entity_slug!==null||snap.value.source_markdown_slug!==row.slug||snap.value.row_num==null||!f.target_slug)throw changed('A fence-owned exact-email fact changed during preparation.')} };
+    const apply = async(tx:BrainEngine):Promise<Record<string,unknown>> => {
+      const outcome:RelinkGroupOutcome={linked:[],deduped:[],skipped:[],queued:0};
+      for(const f of intent.facts){
+        const [current]=await readFacts(tx,row.source_id,[f.id]);
+        if(!current||relinkFactHash(current)!==f.hash)throw changed('A fence-owned exact-email fact changed during apply.');
+        const moved=await tx.executeRaw(`UPDATE facts SET entity_slug=$3,context=$4 WHERE source_id=$1 AND id=$2 AND entity_slug IS NULL AND source_markdown_slug=$5 AND row_num IS NOT NULL AND expired_at IS NULL RETURNING row_num`,[row.source_id,f.id,f.target_slug,appendContextNote(current.value.context as string|null,f.note),row.slug]);
+        if(moved.length!==1)throw changed('A fence-owned exact-email fact changed during apply.');
+        outcome.linked.push({id:f.id,row_num:Number((moved[0] as {row_num:number}).row_num)});
+        await tx.executeRaw(`INSERT INTO fact_relink_attempts(source_id,fact_id,outcome,reason,tier,model,target_slug,run_id,attempted_at) VALUES($1,$2,'linked','exact_email','exact_email',NULL,$3,$4,now()) ON CONFLICT(source_id,fact_id) DO UPDATE SET outcome='linked',reason='exact_email',tier='exact_email',model=NULL,target_slug=EXCLUDED.target_slug,run_id=EXCLUDED.run_id,attempted_at=now()`,[row.source_id,f.id,f.target_slug,intent.run_id]);
+      }
+      return{status:'relinked',slug:row.slug,...outcome};
+    };
+    return {observedRevision,validate,apply};
   }
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
   if (!snapshot || snapshot.page.id !== row.page_id) {
