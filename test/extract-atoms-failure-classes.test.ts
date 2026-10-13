@@ -39,6 +39,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // These assertions pin serial stop boundaries. Concurrent scheduling is
+  // covered separately by extract-atoms-library-one-pass.test.ts.
+  await engine.setConfig('cycle.extract_atoms.concurrency', '1');
 });
 
 function okChatResult(text: string): ChatResult {

@@ -23,6 +23,12 @@ export interface AtomPageInput {
   content: string;
   contentHash: string;
   identity?: AtomPageIdentity;
+  /** Library source pages extract once while their card remains the atom owner. */
+  atomSourceSlug?: string;
+  /** Additional pages that should carry provenance edges to extracted atoms. */
+  provenanceSlugs?: string[];
+  /** Canonical subject pages named by a library card. */
+  contextPages?: string[];
 }
 
 export class AtomPageStateError extends Error {

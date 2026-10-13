@@ -135,6 +135,8 @@ const SYNTHESIS_OUTPUT_TYPES = new Set<string>(['atom', 'concept']);
 
 const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
+export const DEFAULT_EXTRACT_CONCURRENCY = 4;
+export const MAX_EXTRACT_CONCURRENCY = 8;
 /** `compiled_truth` has >= `param` characters: octet_length reads a TOASTed size from its header and a character is
  *  1-4 bytes, so only bodies of param..4x param bytes are decompressed (length() decompressed all: 1.3 s at 50k). */
 const minCompiledTruthChars = (param: string) =>
@@ -460,17 +462,94 @@ export async function discoverExtractablePages(
       compiled_truth: string;
       content_hash: string;
     }>(sql, params);
-    return rows.map((r) => ({
+    const discovered = rows.map((r) => ({
       slug: r.slug,
       content: r.compiled_truth,
       contentHash: r.content_hash,
       identity: { pageId: r.id, sourceIncarnation: r.source_incarnation, revision: r.knowledge_revision },
     }));
+    return await collapseLibraryDocumentPages(engine, sourceId, discovered);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[extract_atoms] page-discovery query failed: ${msg}`);
     return []; // fail-soft: transcript path still proceeds
   }
+}
+
+/**
+ * A library card and its versioned source page are one logical document. The
+ * source text is the only model input; the stable card remains the atom owner.
+ */
+export async function collapseLibraryDocumentPages(
+  engine: BrainEngine,
+  sourceId: string,
+  pages: AtomPageInput[],
+): Promise<AtomPageInput[]> {
+  const documentId = (slug: string) =>
+    slug.match(/^library\/(doc-[^/]+)$/)?.[1] ?? slug.match(/^sources\/files\/(doc-[^/]+)\//)?.[1];
+  const ids = [...new Set(pages.map(p => documentId(p.slug)).filter((v): v is string => Boolean(v)))];
+  if (ids.length === 0) return pages;
+  const rows = await engine.executeRaw<{
+    id: number; knowledge_revision: string; source_incarnation: string; slug: string;
+    compiled_truth: string; content_hash: string; frontmatter: Record<string, unknown>;
+  }>(`SELECT p.id, p.knowledge_revision, s.incarnation AS source_incarnation, p.slug,
+             p.compiled_truth, p.content_hash, p.frontmatter
+        FROM pages p JOIN sources s ON s.id=p.source_id
+       WHERE p.source_id=$1 AND p.deleted_at IS NULL AND p.content_hash IS NOT NULL
+         AND (p.slug = ANY($2::text[]) OR p.slug LIKE ANY($3::text[]))`,
+    [sourceId, ids.map(id => `library/${id}`), ids.map(id => `sources/files/${id}/%`)]);
+  const byId = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const id = documentId(row.slug);
+    if (id) byId.set(id, [...(byId.get(id) ?? []), row]);
+  }
+  const paired = new Map<string, AtomPageInput>();
+  for (const id of ids) {
+    const group = byId.get(id) ?? [];
+    const card = group.find(r => r.slug === `library/${id}`);
+    const candidates = group
+      .filter(r => r.slug.startsWith(`sources/files/${id}/`) && r.compiled_truth.length >= MIN_PAGE_CHARS_FOR_EXTRACTION)
+      .sort((a, b) => a.slug.localeCompare(b.slug));
+    const declaredSources = card && Array.isArray(card.frontmatter?.sources)
+      ? card.frontmatter.sources.filter((v): v is string => typeof v === 'string')
+      : [];
+    const source = [...declaredSources].reverse()
+      .map(slug => candidates.find(candidate => candidate.slug === slug)).find(Boolean)
+      ?? candidates.at(-1);
+    if (!card || !source) continue;
+    const context = card.frontmatter?.context_pages;
+    const subjects = card.frontmatter?.subjects;
+    const contextPages = [...new Set([
+      ...(Array.isArray(context) ? context : []),
+      ...(Array.isArray(subjects) ? subjects : []),
+    ].filter((v): v is string => typeof v === 'string'))];
+    paired.set(id, {
+      slug: source.slug, content: source.compiled_truth, contentHash: source.content_hash,
+      identity: { pageId: source.id, sourceIncarnation: source.source_incarnation, revision: source.knowledge_revision },
+      atomSourceSlug: card.slug,
+      provenanceSlugs: [source.slug, card.slug],
+      contextPages,
+    });
+  }
+  const out: AtomPageInput[] = [];
+  const emitted = new Set<string>();
+  for (const page of pages) {
+    const id = documentId(page.slug);
+    const replacement = id ? paired.get(id) : undefined;
+    if (!replacement) { out.push(page); continue; }
+    if (!emitted.has(id!)) { out.push(replacement); emitted.add(id!); }
+  }
+  return out;
+}
+
+async function activeLibraryMutation(engine: BrainEngine): Promise<string | null> {
+  try {
+    const [row] = await engine.executeRaw<{ name: string }>(
+      `SELECT name FROM minion_jobs
+        WHERE status='active' AND (name='sync' OR lower(name) LIKE '%ingest%')
+        ORDER BY started_at NULLS LAST, id LIMIT 1`);
+    return row?.name ?? null;
+  } catch { return null; }
 }
 
 /**
@@ -913,6 +992,7 @@ export async function runPhaseExtractAtoms(
   let maxInputChars = DEFAULT_EXTRACT_MAX_INPUT_CHARS;
   let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
   let pacingMs = 0;
+  let extractConcurrency = DEFAULT_EXTRACT_CONCURRENCY;
   try {
     extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
@@ -948,6 +1028,11 @@ export async function runPhaseExtractAtoms(
     if (configuredPacing) {
       const n = Number(configuredPacing);
       if (Number.isFinite(n) && n > 0) pacingMs = Math.min(60_000, Math.floor(n));
+    }
+    const configuredConcurrency = await engine.getConfig('cycle.extract_atoms.concurrency');
+    if (configuredConcurrency) {
+      const n = Number(configuredConcurrency);
+      if (Number.isFinite(n) && n > 0) extractConcurrency = Math.min(MAX_EXTRACT_CONCURRENCY, Math.floor(n));
     }
   } catch {
     // Keep safe defaults on any config-read failure: key-aware utility-tier
@@ -1103,8 +1188,24 @@ export async function runPhaseExtractAtoms(
   }
 
   let stoppedEarly = false;
+  const activeMutation = await activeLibraryMutation(engine);
+  if (activeMutation) {
+    return {
+      phase: 'extract_atoms', status: 'skipped', duration_ms: 0,
+      summary: `extract_atoms: deferred while ${activeMutation} is active`,
+      details: { reason: 'library_sync_or_ingest_active', active_job: activeMutation, source_id: sourceId,
+        atoms_extracted: 0, transcripts_processed: 0, pages_processed: 0, failures: [], dry_run: opts.dryRun ?? false },
+    };
+  }
+  let nextWorkIndex = 0;
+  let activeConcurrency = extractConcurrency;
+  let haltScheduling = false;
   await withBudgetTracker(budgetTracker, async () => {
-  for (const item of work) {
+  const worker = async (workerIndex: number): Promise<void> => {
+  while (true) {
+    if (haltScheduling || workerIndex >= activeConcurrency) break;
+    const item = work[nextWorkIndex++];
+    if (!item) break;
     if (opts.signal?.aborted || opts.stopSignal?.aborted) { stoppedEarly = true; break; }
     await maybeYield();
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
@@ -1206,20 +1307,39 @@ export async function runPhaseExtractAtoms(
         const provenanceLinks: LinkBatchInput[] = [];
         const sourcePage = item.kind === 'page' ? await engine.getPage(item.slug, { sourceId }) : null;
         const undatedDate = sourcePage?.created_at ? utcDate(new Date(sourcePage.created_at)) : 'undated';
+        const atomSourceSlug = item.kind === 'page' ? (item.atomSourceSlug ?? item.slug) : null;
+        const libraryOrigins = item.kind === 'page' && item.atomSourceSlug
+          ? [...new Set([item.atomSourceSlug, item.slug])]
+          : [];
+        const existingLibraryAtoms = item.kind === 'page' && item.atomSourceSlug
+          ? await existingLibraryAtomIdentities(engine, sourceId, libraryOrigins)
+          : { titles: new Set<string>(), quotes: new Set<string>() };
+        let keptExistingLibraryAtom = false;
         for (const atom of atoms) {
+          const duplicateQuoteLocation = atom.source_quote ? locateQuote(promptContent, atom.source_quote) : null;
+          const normalizedQuote = duplicateQuoteLocation
+            ? normalizeForGrounding(promptContent.slice(duplicateQuoteLocation.start, duplicateQuoteLocation.end)).norm
+            : '';
+          if (existingLibraryAtoms.titles.has(normalizedAtomTitle(atom.title)) ||
+              (normalizedQuote !== '' && existingLibraryAtoms.quotes.has(normalizedQuote))) {
+            duplicatesSkipped++;
+            keptExistingLibraryAtom = true;
+            continue;
+          }
           const srcRef = item.kind === 'transcript' ? item.filePath : item.slug;
           const slug =
             item.kind === 'page'
-              ? await resolvePageAtomSlug(engine, atom.title, item.slug, sourceId, undatedDate, pageAtomTitles)
+              ? await resolvePageAtomSlug(engine, atom.title, atomSourceSlug!, sourceId, undatedDate, pageAtomTitles)
               : atomSlug(atom.title, srcRef, undefined, undatedDate);
           const originFrontmatter =
             item.kind === 'transcript'
               ? { source_path: item.filePath }
-              : { source_slug: item.slug };
+              : { source_slug: atomSourceSlug!, ...(item.atomSourceSlug ? { source_file_slug: item.slug,
+                  context_pages: item.contextPages ?? [] } : {}) };
           // #4733 fail-closed: never let the upsert repoint an atom that is
           // bound to a DIFFERENT source page (pre-#4733 rows / hash collision).
           if (item.kind === 'page') {
-            await assertAtomImportBinding(engine, slug, sourceId, item.slug);
+            await assertAtomImportBinding(engine, slug, sourceId, atomSourceSlug!);
           }
           // #4706: pin the quote to its origin, or don't claim one. Located:
           // store the ORIGINAL characters (not the model's rendering, so
@@ -1278,13 +1398,10 @@ export async function runPhaseExtractAtoms(
             await importFromContent(engine, slug, md, { sourceId, preserveGateMarkers: true, noEmbed: !isAvailable('embedding'), writeGate: derivedGateInput(taint.trust) }).then(() => lowerDerivedPage(engine, taint, sourceId, slug)); }
           importedSlugs.push(slug);
           if (item.kind === 'page') {
-            provenanceLinks.push({
-              from_slug: item.slug,
-              to_slug: slug,
-              link_source: 'atom-provenance',
-              from_source_id: sourceId,
-              to_source_id: sourceId,
-            });
+            for (const fromSlug of [...new Set([...(item.provenanceSlugs ?? [item.slug]), ...(item.contextPages ?? [])])]) {
+              provenanceLinks.push({ from_slug: fromSlug, to_slug: slug, link_source: 'atom-provenance',
+                from_source_id: sourceId, to_source_id: sourceId });
+            }
           } else if (transcriptPageIndex && resolveTranscriptPages) {
             // A split session renders one page per part, all sharing a
             // session id; without per-part offsets the honest attribution is
@@ -1330,8 +1447,8 @@ export async function runPhaseExtractAtoms(
         // C-14: atoms are keyed by LLM-chosen titles, which drift between
         // extractions. Once this extraction is complete, retire the atoms an
         // earlier extraction of the same source produced that this one did not.
-        const retired = await retireStaleAtoms(engine, sourceId, item.kind === 'page'
-          ? { key: 'source_slug', value: item.slug } : { key: 'source_path', value: item.filePath }, hash16, importedSlugs);
+        const retired = keptExistingLibraryAtom ? [] : await retireStaleAtoms(engine, sourceId, item.kind === 'page'
+          ? { key: 'source_slug', value: atomSourceSlug! } : { key: 'source_path', value: item.filePath }, hash16, importedSlugs);
         await atomFiles?.(importedSlugs, retired);
         if (item.kind === 'page') {
           await stampAtomsScanHash(item);
@@ -1376,8 +1493,12 @@ export async function runPhaseExtractAtoms(
       // recordItemFailureCount here — a global outage says nothing about the
       // content, so it must not pre-charge the per-page tombstone counter.
       const decision = llmHalt.observe(err);
+      if (llmHalt.lastClass() === 'rate_limit') {
+        activeConcurrency = Math.max(1, Math.floor(activeConcurrency / 2));
+      }
       if (decision !== 'continue') {
         abortedGlobalError = haltedClassOf(decision);
+        haltScheduling = true;
         if (abortedGlobalError !== 'rate_limit') hardFailureCount++;
         failures.push({
           source: originLabel,
@@ -1397,6 +1518,8 @@ export async function runPhaseExtractAtoms(
       });
     }
   }
+  };
+  await Promise.all(Array.from({ length: extractConcurrency }, (_, i) => worker(i)));
   });
   estimatedSpendUsd = budgetTracker.totalSpent;
 
@@ -1480,6 +1603,8 @@ export async function runPhaseExtractAtoms(
       budget_usd: budgetCap,
       model: extractModel,
       budget_exhausted: budgetExhausted,
+      concurrency: extractConcurrency,
+      final_concurrency: activeConcurrency,
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
     },
@@ -1528,6 +1653,29 @@ async function retireStaleAtoms(
  */
 function atomSlugStem(title: string): string {
   return slugifySegment(title).slice(0, 60).replace(/-+$/g, '') || 'untitled';
+}
+
+function normalizedAtomTitle(title: string): string {
+  return title.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+async function existingLibraryAtomIdentities(
+  engine: BrainEngine, sourceId: string, slugs: string[],
+): Promise<{ titles: Set<string>; quotes: Set<string> }> {
+  if (slugs.length === 0) return { titles: new Set(), quotes: new Set() };
+  const rows = await engine.executeRaw<{ title: string; frontmatter: Record<string, unknown> }>(
+    `SELECT title, frontmatter FROM pages
+      WHERE source_id=$1 AND type='atom' AND deleted_at IS NULL
+        AND frontmatter->>'source_slug' = ANY($2::text[])`, [sourceId, slugs]);
+  const titles = new Set(rows.map(r => normalizedAtomTitle(r.title)));
+  const quotes = new Set<string>();
+  for (const row of rows) {
+    const fm = row.frontmatter ?? {};
+    if (fm.source_quote_verified === true && typeof fm.source_quote === 'string') {
+      quotes.add(normalizeForGrounding(fm.source_quote).norm);
+    }
+  }
+  return { titles, quotes };
 }
 
 /**
