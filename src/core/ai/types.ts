@@ -24,7 +24,8 @@ export type Implementation =
   | 'native-anthropic'
   | 'openai-compatible'
   | 'claude-cli'
-  | 'grok-cli';
+  | 'grok-cli'
+  | 'codex-cli';
 
 export interface EmbeddingTouchpoint {
   models: string[];

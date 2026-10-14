@@ -1479,6 +1479,8 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       );
     case 'grok-cli':
       throw new AIConfigError(`grok-cli has no embedding model. Use openai or google for embeddings.`);
+    case 'codex-cli':
+      throw new AIConfigError(`codex-cli has no embedding model. Use openai or google for embeddings.`);
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'embedding');
@@ -2412,6 +2414,10 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       const { GrokCliLanguageModel } = require('./providers/grok-cli-language-model.ts');
       return new GrokCliLanguageModel(modelId);
     }
+    case 'codex-cli': {
+      const { CodexCliLanguageModel } = require('./providers/codex-cli-language-model.ts');
+      return new CodexCliLanguageModel(modelId);
+    }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'expansion');
@@ -3333,6 +3339,10 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
     case 'grok-cli': {
       const { GrokCliLanguageModel } = require('./providers/grok-cli-language-model.ts');
       return new GrokCliLanguageModel(modelId);
+    }
+    case 'codex-cli': {
+      const { CodexCliLanguageModel } = require('./providers/codex-cli-language-model.ts');
+      return new CodexCliLanguageModel(modelId);
     }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).

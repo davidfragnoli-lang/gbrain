@@ -11,6 +11,7 @@ import { google } from './google.ts';
 import { anthropic } from './anthropic.ts';
 import { claudeCli } from './claude-cli.ts';
 import { grokCli } from './grok-cli.ts';
+import { codexCli } from './codex-cli.ts';
 import { ollama } from './ollama.ts';
 import { openrouter } from './openrouter.ts';
 import { voyage } from './voyage.ts';
@@ -39,6 +40,7 @@ const ALL: Recipe[] = [
   anthropic,
   claudeCli,
   grokCli,
+  codexCli,
   ollama,
   openrouter,
   voyage,
