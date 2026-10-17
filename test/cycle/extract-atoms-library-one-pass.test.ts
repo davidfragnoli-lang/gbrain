@@ -24,7 +24,7 @@ describe('extract_atoms library document one-pass concurrency', () => {
       const subject = `brain/projects/subject-${i}`;
       await importFromContent(engine, subject, fm(`title: Subject ${i}`, 'Canonical subject page.'), { sourceId: 'default', noEmbed: true });
       await importFromContent(engine, `library/${id}`, fm(
-        `title: Card ${i}\ndocument_id: ${id}\ncontext_pages:\n  - ${subject}\nsubjects:\n  - ${subject}`,
+        `title: Card ${i}\nvisibility: private\ndocument_id: ${id}\ncontext_pages:\n  - ${subject}\nsubjects:\n  - ${subject}`,
         `Stable card ${i}. `.repeat(50)), { sourceId: 'default', noEmbed: true });
       await importFromContent(engine, `sources/files/${id}/hash-${i}`, fm(
         `title: Source ${i}\ndocument_id: ${id}`,
@@ -67,6 +67,9 @@ describe('extract_atoms library document one-pass concurrency', () => {
     expect(first).toHaveLength(2);
     expect(first.map(r => r.frontmatter.source_slug).sort()).toEqual(docs.map(id => `library/${id}`));
     expect(first.every(r => typeof r.frontmatter.source_file_slug === 'string')).toBe(true);
+    expect(first.every(r => r.frontmatter.raw_source === r.frontmatter.source_file_slug)).toBe(true);
+    expect(first.every(r => r.frontmatter.raw_trace_exempt === undefined)).toBe(true);
+    expect(first.every(r => r.frontmatter.visibility === 'private')).toBe(true);
     expect(first.every(r => Array.isArray(r.frontmatter.context_pages))).toBe(true);
 
     await runPhaseExtractAtoms(engine, { _transcripts: [], _pages: input, _chat: chat });

@@ -88,7 +88,7 @@ import { utcDate } from './cycle-date.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
 import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, MANAGED_ATOM_DISCOVERY_SQL, type AtomOrigin } from '../persistence/atom-maintenance.ts';
-import { effectiveVisibility } from '../search/private-visibility.ts';
+import { effectiveVisibility, strictestVisibility } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
@@ -1266,8 +1266,16 @@ export async function runPhaseExtractAtoms(
     const promptContent = truncateUtf8(item.kind === 'transcript' ? corpusTextForExtraction(item.filePath, item.content) : item.content, maxInputChars);
     try {
       const origin: AtomOrigin | null = managed ? await readAtomOrigin(engine, managed, item) : null;
-      const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
+      const readVisibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
         : { kind: 'page', page: await engine.getPage(item.slug, { sourceId }) });
+      // Library one-pass reads the file but attributes source_slug to the card.
+      // A world file must not leave the atom looser than that card, and a
+      // missing card counts as private.
+      const attributedSlug = item.kind === 'page' && item.atomSourceSlug && item.atomSourceSlug !== item.slug
+        ? item.atomSourceSlug : null;
+      const visibility = attributedSlug
+        ? strictestVisibility([readVisibility, effectiveVisibility({ kind: 'page', page: await engine.getPage(attributedSlug, { sourceId }) })])
+        : readVisibility;
       throwIfAborted(opts.signal, 'extract_atoms');
       const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
       if (resumed === 'done') { duplicatesSkipped++; continue; }
@@ -1420,6 +1428,9 @@ export async function runPhaseExtractAtoms(
             {
               atom_type: atom.atom_type,
               ...originFrontmatter,
+              // Doctor raw_provenance accepts this key and ignores source_slug.
+              // The value is the text the model actually saw, not an exemption.
+              raw_source: item.kind === 'transcript' ? item.filePath : item.slug,
               // Unmanaged writes need a provisional receipt because atom rows
               // and completion are separate local mutations. Managed writes
               // are instead gated by the durable managed-atoms checkpoint:

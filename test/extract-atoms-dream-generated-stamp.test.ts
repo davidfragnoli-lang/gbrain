@@ -60,5 +60,8 @@ describe('extract_atoms stamps its atoms dream_generated (#5211, P3.8)', () => {
     const atom = (await engine.getPage(pages[0]!.slug, { sourceId: 'default' }))!;
     expect(atom.frontmatter.dream_generated).toBe(true);
     expect(String(atom.frontmatter.extracted_by)).toStartWith('extract_atoms');
+    expect(atom.frontmatter.raw_source).toBe('/tmp/dg1.txt');
+    expect(atom.frontmatter.raw_trace_exempt).toBeUndefined();
+    expect(atom.frontmatter.visibility).toBe('private');
   });
 });
