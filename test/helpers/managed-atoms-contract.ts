@@ -363,7 +363,7 @@ export async function exerciseManagedAtomReconciliation(engine: BrainEngine): Pr
   }
 }
 
-export const atomRetirementCases = ['marker_and_republish', 'edit_back', 'user_deleted', 'prefix_pin', 'generation_key_and_purge', 'partial_retry', 'partial_then_revert'] as const;
+export const atomRetirementCases = ['marker_and_republish', 'edit_back', 'user_deleted', 'prefix_pin', 'generation_key_and_purge', 'partial_retry', 'partial_then_revert', 'zero_yield_preserves'] as const;
 
 /** #5770 / ENG-O7: retirement markers, republication of retired slugs, the regeneration generation and its purge exclusion. */
 export async function exerciseManagedAtomRetirement(engine: BrainEngine, scenario: typeof atomRetirementCases[number]): Promise<void> {
@@ -437,6 +437,20 @@ export async function exerciseManagedAtomRetirement(engine: BrainEngine, scenari
         expect(existsSync(join(root, `${restored.slug}.md`))).toBe(true);
         expect((await atom('patience-compounds-over-years'))?.deleted).toBe(true);
         expect(calls).toBe(3);
+      }
+
+      if (scenario === 'zero_yield_preserves') {
+        const prior = await atomsOf();
+        expect(prior.filter(row => !row.deleted)).toHaveLength(2);
+        await edit(bodies[1], []);
+        const result = await extract();
+        expect(result.status).toBe('ok');
+        expect(calls).toBe(2);
+        expect(result.details?.atoms_extracted).toBe(0);
+        const after = await atomsOf();
+        expect(after).toEqual(prior);
+        expect(after.every(row => !row.deleted)).toBe(true);
+        expect((await discoverExtractablePages(engine, sourceId))).toEqual([]);
       }
 
       if (scenario === 'edit_back') {

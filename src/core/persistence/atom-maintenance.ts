@@ -412,7 +412,12 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
   }
   const originKey = origin.kind === 'page' ? 'source_slug' : 'source_path';
   // #6503: a partial extraction read only the head, so it retires nothing an earlier extraction produced.
-  const retirements = failure || origin.partialInputChars ? [] : reviewedRetirements ?? await engine.executeRaw<ManagedAtomRetirement>(
+  // #7013: an honest zero-yield is a completed scan of the new content, not evidence that every atom
+  // from the prior generation is now false. Preserve that generation unless a retry carries the exact
+  // retirement set an operator already reviewed. Without this guard, one valid `[]` model response
+  // turns the empty replacement set into a delete intent for every earlier atom of the origin.
+  const retirements = failure || origin.partialInputChars || (atoms.length === 0 && reviewedRetirements === undefined)
+    ? [] : reviewedRetirements ?? await engine.executeRaw<ManagedAtomRetirement>(
     `SELECT slug,id AS "pageId",knowledge_revision::text AS revision FROM pages
       WHERE source_id=$1 AND type='atom' AND deleted_at IS NULL
         AND frontmatter->>'${originKey}'=$2
